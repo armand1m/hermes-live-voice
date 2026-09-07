@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v3";
 
 const REQUEST_ID_MAX_CHARS = 128;
 const CLIENT_METADATA_MAX_CHARS = 256;

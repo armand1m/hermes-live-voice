@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkZodConsumers } from "./package-zod-consumer-smoke.mjs";
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const workDir = mkdtempSync(join(tmpdir(), "hermes-live-package-smoke-"));
@@ -180,6 +181,7 @@ try {
   }
 
   const tarball = join(workDir, pack.filename);
+  checkZodConsumers({ tarball, workDir, cacheDir });
   const install = spawnSync(npm, ["install", "--prefix", installDir, "--omit=dev", tarball], {
     encoding: "utf8",
     env: { ...process.env, npm_config_cache: cacheDir, NPM_CONFIG_CACHE: cacheDir },

@@ -14,6 +14,26 @@ This documents compatibility with Hermes Agent and community projects, not endor
 
 Other UIs need an explicit protocol v6 integration and a server-side credential relay. An OpenAI-compatible chat connection is not sufficient.
 
+## Node.js protocol schemas
+
+The package exports `ClientMessageSchema`, `ServerMessageSchema`, and related
+schemas for server-side integrations. Hermes Live v1 keeps the Zod 3 schema and
+error API. It supports the Zod 3.25.76 and Zod 4.5.4 package lines through the
+stable `zod/v3` entry point. Zod is a peer dependency so consumers can compose
+schemas and check `ZodError` with their own installed copy; normal npm installs
+resolve this dependency automatically.
+
+```ts
+import { z } from "zod/v3";
+import { ClientMessageSchema } from "hermes-live-voice";
+
+const EnvelopeSchema = z.object({ message: ClientMessageSchema });
+```
+
+Native Zod 4 schemas and errors have a different API. Updating the Zod package
+does not change Hermes Live v1's exported schemas to that API. See Zod's
+[versioning guide](https://zod.dev/v4/versioning) for its compatibility subpaths.
+
 ## Hermes Dashboard
 
 Install the package, activate Live Voice, and start Dashboard:
