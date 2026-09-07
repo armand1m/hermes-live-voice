@@ -25,6 +25,7 @@ describe("managed config", () => {
       HERMES_BASE_URL: "http://127.0.0.1:8642",
       HERMES_AGENT_API_SERVER_KEY: "secret with spaces; $(touch /tmp/nope)",
       HERMES_LIVE_PROVIDER: "mock",
+      HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS: "180000",
     } as const;
 
     const path = await writeManagedConfig(values, { home });

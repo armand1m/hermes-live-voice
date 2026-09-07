@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -165,6 +166,22 @@ def main() -> None:
     assert automatic.queue_seen == [automatic.text_prompt_queue]
 
     handler = BaseLanguageModelHandler()
+    if "--conversation-responses" in sys.argv:
+        # Exercise actual gateway payloads, including the summary fallback,
+        # against the same patch stack that the managed runtime installs.
+        for payload in json.load(sys.stdin):
+            response = SimpleNamespace(**payload, model_fields_set=set(payload))
+            runtime = runtime_config(False, ["private_session_tool"])
+            output = list(handler.process(GenerateResponseRequest(response, runtime)))
+            exact = payload["metadata"].get("hermes_live_exact_speech")
+            if exact is not None:
+                assert [type(item).__name__ for item in output] == ["LLMResponseChunk", "EndOfResponse"]
+                assert output[0].text == exact
+                assert output[0].cancel_generation == 7
+            else:
+                assert output == [("original", [])], "Summary responses must reach the model with tools disabled"
+            assert runtime.session.tools == ["private_session_tool"]
+
     exact_response = SimpleNamespace(
         metadata={
             "hermes_live_purpose": "conversation_answer",

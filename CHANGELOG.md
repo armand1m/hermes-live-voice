@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-09-07
+
+- Fix silent local voice replies after Hermes completes saved-chat work. Formatted, long, empty, and failed answers now use the summary response path instead of being rejected as invalid exact speech. Short plain-text answers still speak exactly.
+- Give saved-chat requests at least two minutes by default to finish tool execution. Add `HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS` for an explicit limit, preserve longer existing request limits, and retain cancellation without retrying a possibly accepted request.
+- Support Dashboard WebSocket auth helpers in both `hermes_cli.web_server_chat` and legacy `hermes_cli.web_server`, while failing closed on broken helpers or rejected authentication and origin checks.
+- Add gateway-to-Python speech contract regressions, including Chinese and Markdown answers, plus timeout and authorization coverage. Fresh live audio was unavailable in the release environment; see the [validation receipt](https://github.com/bielcarpi/hermes-live-voice/blob/v1.1.1/docs/provider-receipts/2026-09-07-local-voice-v1.1.1.md).
+
 ## 1.1.0 - 2026-08-31
 
 - Remove the standalone browser demo, demo flag, static-file serving path, and `browser_demo` capability.

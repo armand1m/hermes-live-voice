@@ -1,4 +1,4 @@
-import { DEFAULT_HERMES_STREAM_IDLE_TIMEOUT_MS, type AppConfig } from "../../../config.js";
+import { DEFAULT_HERMES_CHAT_TIMEOUT_MS, DEFAULT_HERMES_STREAM_IDLE_TIMEOUT_MS, type AppConfig } from "../../../config.js";
 import type { ApprovalChoice } from "../../../domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../../../domain/protocol/server-protocol.js";
 import type {
@@ -76,6 +76,7 @@ export class HermesClient implements HermesRunsPort {
   private readonly apiKey: string | undefined;
   private readonly model: string | undefined;
   private readonly timeoutMs: number;
+  private readonly chatTimeoutMs: number;
   private readonly streamIdleTimeoutMs: number;
   private readonly sessionModelsReady = new Set<string>();
 
@@ -84,6 +85,10 @@ export class HermesClient implements HermesRunsPort {
     this.apiKey = config.apiKey;
     this.model = config.model;
     this.timeoutMs = config.timeoutMs;
+    this.chatTimeoutMs = config.chatTimeoutMs ?? Math.max(DEFAULT_HERMES_CHAT_TIMEOUT_MS, config.timeoutMs);
+    if (!Number.isInteger(this.chatTimeoutMs) || this.chatTimeoutMs <= 0 || this.chatTimeoutMs > 2_147_483_647) {
+      throw new Error("Hermes chat timeout must be a positive timer-safe integer.");
+    }
     this.streamIdleTimeoutMs = validStreamIdleTimeout(
       config.streamIdleTimeoutMs ?? DEFAULT_HERMES_STREAM_IDLE_TIMEOUT_MS,
     );
@@ -217,7 +222,7 @@ export class HermesClient implements HermesRunsPort {
       body: JSON.stringify(body),
       headers: this.sessionHeaders(options.sessionKey),
       ...signalInit(options.signal),
-    });
+    }, this.chatTimeoutMs);
     if (
       !isRecord(response)
       || response.object !== "hermes.session.chat.completion"
@@ -440,12 +445,16 @@ export class HermesClient implements HermesRunsPort {
     }
   }
 
-  private async requestJson<T>(path: string, init: RequestInit & { headers?: Record<string, string> }): Promise<T> {
+  private async requestJson<T>(
+    path: string,
+    init: RequestInit & { headers?: Record<string, string> },
+    timeoutMs = this.timeoutMs,
+  ): Promise<T> {
     const publicPath = publicHermesRequestPath(path);
     const requestSignal = createRequestSignal(
       init.signal ?? undefined,
-      this.timeoutMs,
-      `Hermes request timed out after ${this.timeoutMs}ms: ${publicPath}`,
+      timeoutMs,
+      `Hermes request timed out after ${timeoutMs}ms: ${publicPath}`,
     );
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
@@ -472,7 +481,7 @@ export class HermesClient implements HermesRunsPort {
       }
     } catch (error) {
       throw requestSignal.timedOut()
-        ? new Error(`Hermes request timed out after ${this.timeoutMs}ms: ${publicPath}`)
+        ? new Error(`Hermes request timed out after ${timeoutMs}ms: ${publicPath}`)
         : error;
     } finally {
       requestSignal.cleanup();

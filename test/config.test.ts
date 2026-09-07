@@ -66,6 +66,12 @@ describe("config", () => {
     const config = loadConfig({ HERMES_LIVE_HERMES_TIMEOUT_MS: "1200" });
 
     expect(config.hermes.timeoutMs).toBe(1200);
+    expect(config.hermes.chatTimeoutMs).toBe(120_000);
+    expect(loadConfig({ HERMES_LIVE_HERMES_TIMEOUT_MS: "240000" }).hermes.chatTimeoutMs).toBe(240_000);
+    expect(loadConfig({ HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS: "45000" }).hermes.chatTimeoutMs).toBe(45_000);
+    for (const value of ["0", "-1", "1.5", "2147483648"]) {
+      expect(() => loadConfig({ HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS: value })).toThrow();
+    }
   });
 
   it("uses an explicit Hermes model only as an operator override", () => {

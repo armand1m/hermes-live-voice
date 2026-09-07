@@ -743,6 +743,71 @@ describe("HermesClient", () => {
     expect(cancelled).toBe(true);
   });
 
+  it.each([
+    [{}, 120_000],
+    [{ timeoutMs: 240_000 }, 240_000],
+    [{ chatTimeoutMs: 45_000 }, 45_000],
+  ])("lets saved-chat work outlive the ordinary request timeout: %j", async (overrides, deadline) => {
+    vi.useFakeTimers();
+    let chatSignal: AbortSignal | undefined;
+    let complete: ((response: Response) => void) | undefined;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        object: "hermes.session", session: { id: "session_slow", model: "real-model" },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        features: {
+          session_resources: true, session_chat: true, session_chat_streaming: true,
+          model_options: true, session_model_lock: true,
+        },
+      }))
+      .mockImplementationOnce((_url, init) => new Promise<Response>((resolve, reject) => {
+        chatSignal = init?.signal ?? undefined;
+        complete = resolve;
+        chatSignal?.addEventListener("abort", () => reject(chatSignal!.reason));
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = hermesClient(overrides).chatSession("session_slow", "查一下长沙的天气");
+    await vi.advanceTimersByTimeAsync(deadline - 1);
+    expect(chatSignal?.aborted).toBe(false);
+    complete!(jsonResponse({
+      object: "hermes.session.chat.completion", session_id: "session_slow",
+      message: { role: "assistant", content: "长沙今天晴。" },
+    }));
+    await expect(result).resolves.toMatchObject({ content: "长沙今天晴。" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["timeout", "cancel"])("ends stalled saved-chat work on %s without retrying it", async (reason) => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        object: "hermes.session", session: { id: "session_slow", model: "real-model" },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        features: {
+          session_resources: true, session_chat: true, session_chat_streaming: true,
+          model_options: true, session_model_lock: true,
+        },
+      }))
+      .mockImplementationOnce((_url, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = expect(hermesClient({ chatTimeoutMs: 45_000 }).chatSession(
+      "session_slow", "Check the weather", { signal: controller.signal },
+    )).rejects.toThrow(reason === "timeout"
+      ? "Hermes request timed out after 45000ms: /api/sessions/{session_id}/chat"
+      : "caller cancelled");
+    await vi.advanceTimersByTimeAsync(30_001);
+    if (reason === "cancel") controller.abort(new Error("caller cancelled"));
+    else await vi.advanceTimersByTimeAsync(14_999);
+    await result;
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("times out stalled JSON requests", async () => {
     vi.useFakeTimers();
     fetchMock.mockImplementationOnce(

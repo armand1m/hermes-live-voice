@@ -78,8 +78,27 @@ try {
     throw new Error("Hermes Dashboard rejected the Live Voice route or backend.");
   }
 
+  const authModule = (await dockerExec([
+    "python", "-c",
+    [
+      "import importlib",
+      "for name in ('hermes_cli.web_server_chat', 'hermes_cli.web_server'):",
+      "    try:",
+      "        module = importlib.import_module(name)",
+      "    except ModuleNotFoundError as exc:",
+      "        if exc.name != name: raise",
+      "        continue",
+      "    assert callable(getattr(module, '_ws_auth_ok', None)), 'Dashboard auth helper missing'",
+      "    assert callable(getattr(module, '_ws_request_is_allowed', None)), 'Dashboard boundary helper missing'",
+      "    print(name)",
+      "    break",
+      "else:",
+      "    raise RuntimeError('Dashboard WebSocket auth module missing')",
+    ].join("\n"),
+  ])).trim();
+
   console.log(
-    `Hermes compatibility smoke ok: Agent v${version}, current capabilities, and agent/Dashboard plugin v${plugin.version}.`,
+    `Hermes compatibility smoke ok: Agent v${version}, current capabilities, agent/Dashboard plugin v${plugin.version}, and auth helpers in ${authModule}.`,
   );
 } catch (error) {
   if (containerStarted) {

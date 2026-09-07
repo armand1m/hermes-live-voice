@@ -356,7 +356,9 @@ export function buildLocalConversationResponse(
     output_modalities: ["audio"],
     tools: [],
     tool_choice: "none",
-    metadata: { hermes_live_purpose: "conversation_answer" },
+    // Only exact answers carry conversation_answer: the managed runtime
+    // requires exact-speech metadata for that purpose and bypasses the LLM.
+    metadata: { hermes_live_purpose: "conversation_summary" },
   };
 }
 
