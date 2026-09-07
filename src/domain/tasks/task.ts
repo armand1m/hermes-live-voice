@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { z } from "zod";
+import { z } from "zod/v3";
 
 export const TASK_RECORD_SCHEMA_VERSION = 1 as const;
 export const MAX_TASK_TITLE_CHARS = 256;

@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, open, rename, rmdir, unlink } from "node:fs/promis
 import { hostname } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { z } from "zod";
+import { z } from "zod/v3";
 import type {
   TaskListOptions,
   TaskPruneOptions,

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { z } from "zod";
+import { z } from "zod/v3";
 
 export const MAX_COMPATIBLE_AUDIO_FRAME_BYTES = 5_900_000;
 export const MAX_COMPATIBLE_TEXT_CHARS = 1_000_000;

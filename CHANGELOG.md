@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.1.3 - 2026-09-07
+
+- Merge the pending Node 22 Docker image refresh and CodeQL action updates from dependency PRs #78 and #75.
+- Resolve Zod dependency PR #77 with the 4.5.4 package while preserving Hermes Live v1's exported Zod 3 schema and error API through `zod/v3`. Declare Zod as a compatible peer so existing integrations can share their installed Zod 3 or Zod 4 package. Normal npm installs resolve the peer automatically.
+- Add clean packed-package consumer checks for both supported Zod package lines, including TypeScript compilation, schema composition, metadata parsing, and validation-error identity. Native Zod 4 schemas remain a separate public API migration.
+
 ## 1.1.2 - 2026-09-07
 
 - Correct the upgrade steps for the local voice fix: first run `npm install --global hermes-live-voice@latest`, then `hermes-live upgrade`, then restart Hermes Dashboard. The upgrade command refreshes the plugin and services from the installed package; it does not download a newer package.

@@ -118,6 +118,12 @@ Patch and minor updates should keep `npm audit --audit-level=moderate` and `npm 
 
 Major updates to `@google/genai`, `zod`, TypeScript, Vitest, or a realtime model default are explicit compatibility work. Provider SDK and event-shape changes require fixtures and, when possible, a live handshake.
 
+Hermes Live v1 exports Zod 3 protocol schemas. Import from `zod/v3` to keep that
+public API stable across supported Zod package versions. Zod is a peer dependency
+with a Zod 4 lockfile baseline. The packed-package smoke compiles and runs
+consumers with both package versions, including schema composition and error
+identity. Native Zod 4 schemas would require a public API migration.
+
 ## Commit and pull-request checklist
 
 - [ ] The change has one clear purpose.
