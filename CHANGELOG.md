@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.1.2 - 2026-09-07
+
+- Correct the upgrade steps for the local voice fix: first run `npm install --global hermes-live-voice@latest`, then `hermes-live upgrade`, then restart Hermes Dashboard. The upgrade command refreshes the plugin and services from the installed package; it does not download a newer package.
+- Includes the v1.1.1 fixes for silent formatted/long/error replies, saved-chat timeouts, and current Hermes Dashboard authorization. Automated validation covers 749 tests, clean package installation, Linux, Windows, Docker, and Hermes v0.20.0/v0.21.0 compatibility. Fresh live audio remains unverified; see the [validation receipt](https://github.com/bielcarpi/hermes-live-voice/blob/v1.1.2/docs/provider-receipts/2026-09-07-local-voice-v1.1.1.md).
+
 ## 1.1.1 - 2026-09-07
 
 - Fix silent local voice replies after Hermes completes saved-chat work. Formatted, long, empty, and failed answers now use the summary response path instead of being rejected as invalid exact speech. Short plain-text answers still speak exactly.

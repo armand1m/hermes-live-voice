@@ -68,9 +68,17 @@ different limit is needed. Without that setting, the limit is the greater of
 120000 ms and `HERMES_LIVE_HERMES_TIMEOUT_MS`. Ordinary API requests keep their
 30000 ms default. The stream idle timeout only applies to background run streams.
 
-If work finishes in Hermes but voice stays silent on 1.1.0, run
-`hermes-live upgrade`, then restart Hermes Dashboard so it loads the updated
-plugin. The plugin supports both the legacy `web_server` authorization helpers
+If work finishes in Hermes but voice stays silent on 1.1.0, install the new
+package before refreshing the plugin and services:
+
+```sh
+npm install --global hermes-live-voice@latest
+hermes-live upgrade
+```
+
+`hermes-live upgrade` uses the installed package; it does not download updates.
+Then restart Hermes Dashboard so it loads the updated plugin.
+The plugin supports both the legacy `web_server` authorization helpers
 and their newer `web_server_chat` location. The `deny_all_then_stop` readiness
 value is the intended fallback for approvals; changing it does not fix speech.
 
