@@ -184,7 +184,7 @@ class _RedirectingConnectContext:
         return None
 
 
-def _set_hermes_auth(*, auth: bool = True, request: bool = True, calls: list[str] | None = None) -> None:
+def _set_hermes_auth(*, auth: bool = True, request: bool = True, calls: list[str] | None = None, module: str = "web_server") -> None:
     call_log = calls if calls is not None else []
 
     def auth_ok(_ws: Any) -> bool:
@@ -196,10 +196,14 @@ def _set_hermes_auth(*, auth: bool = True, request: bool = True, calls: list[str
         return request
 
     hermes_cli = types.ModuleType("hermes_cli")
-    hermes_cli.web_server = types.SimpleNamespace(
-        _ws_auth_ok=auth_ok,
-        _ws_request_is_allowed=request_is_allowed,
-    )
+    hermes_cli.__path__ = []
+    for name in ("web_server", "web_server_chat"):
+        sys.modules.pop(f"hermes_cli.{name}", None)
+    helpers = types.ModuleType(f"hermes_cli.{module}")
+    helpers._ws_auth_ok = auth_ok
+    helpers._ws_request_is_allowed = request_is_allowed
+    setattr(hermes_cli, module, helpers)
+    sys.modules[f"hermes_cli.{module}"] = helpers
     sys.modules["hermes_cli"] = hermes_cli
 
 
@@ -435,22 +439,46 @@ def test_capabilities_require_hermes_live_identity(plugin: Any) -> None:
 
 
 def test_auth_order_and_fail_closed(plugin: Any) -> None:
-    calls: list[str] = []
-    _set_hermes_auth(calls=calls)
-    assert plugin._dashboard_ws_rejection_code(object()) is None
-    assert calls == ["auth", "request"]
+    for module in ("web_server", "web_server_chat"):
+        for auth, request, expected, expected_calls in (
+            (True, True, None, ["auth", "request"]),
+            (False, True, 4401, ["auth"]),
+            (True, False, 4403, ["auth", "request"]),
+        ):
+            calls: list[str] = []
+            _set_hermes_auth(auth=auth, request=request, calls=calls, module=module)
+            assert plugin._dashboard_ws_rejection_code(object()) == expected
+            assert calls == expected_calls
 
-    calls.clear()
-    _set_hermes_auth(auth=False, calls=calls)
+    # A denying, incomplete, or broken current module must not use an
+    # accepting legacy module, including failures inside import dependencies.
+    _set_hermes_auth()
+    legacy = sys.modules["hermes_cli.web_server"]
+    _set_hermes_auth(auth=False, module="web_server_chat")
+    sys.modules["hermes_cli.web_server"] = legacy
     assert plugin._dashboard_ws_rejection_code(object()) == 4401
-    assert calls == ["auth"]
-
-    calls.clear()
-    _set_hermes_auth(request=False, calls=calls)
+    current = sys.modules["hermes_cli.web_server_chat"]
+    del current._ws_request_is_allowed
     assert plugin._dashboard_ws_rejection_code(object()) == 4403
-    assert calls == ["auth", "request"]
+
+    original_import = plugin.importlib.import_module
+    try:
+        for failure in (RuntimeError("broken module"), ModuleNotFoundError(name="auth_dependency")):
+            imports: list[str] = []
+
+            def failed_import(name: str) -> Any:
+                imports.append(name)
+                raise failure
+
+            plugin.importlib.import_module = failed_import
+            assert plugin._dashboard_ws_rejection_code(object()) == 4403
+            assert imports == ["hermes_cli.web_server_chat"]
+    finally:
+        plugin.importlib.import_module = original_import
 
     sys.modules["hermes_cli"] = types.ModuleType("hermes_cli")
+    sys.modules.pop("hermes_cli.web_server", None)
+    sys.modules.pop("hermes_cli.web_server_chat", None)
     logging_disabled = plugin.log.disabled
     plugin.log.disabled = True
     try:

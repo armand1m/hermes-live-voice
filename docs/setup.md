@@ -57,6 +57,23 @@ HERMES_LIVE_LOCAL_URL=ws://127.0.0.1:8765/v1/realtime
 
 Local endpoints must be loopback by default. A trusted network endpoint requires `HERMES_LIVE_LOCAL_ALLOW_REMOTE=true`; public endpoints must also use `wss://`. The upstream server has no authentication of its own, so do not expose it directly.
 
+Short plain-text Hermes answers are spoken exactly. Longer answers, Markdown,
+links, and error replies pass through the local model for a brief spoken summary
+with tools disabled. Speech recognition still depends on the configured upstream
+STT model; this does not add Mandarin recognition to the managed Parakeet profile.
+
+Saved-chat requests wait up to two minutes for Hermes tools and the final answer.
+Set `HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS` in the managed configuration when a
+different limit is needed. Without that setting, the limit is the greater of
+120000 ms and `HERMES_LIVE_HERMES_TIMEOUT_MS`. Ordinary API requests keep their
+30000 ms default. The stream idle timeout only applies to background run streams.
+
+If work finishes in Hermes but voice stays silent on 1.1.0, run
+`hermes-live upgrade`, then restart Hermes Dashboard so it loads the updated
+plugin. The plugin supports both the legacy `web_server` authorization helpers
+and their newer `web_server_chat` location. The `deny_all_then_stop` readiness
+value is the intended fallback for approvals; changing it does not fix speech.
+
 ## Other providers
 
 ```sh
@@ -93,6 +110,7 @@ Common settings:
 | --- | --- | --- |
 | `HERMES_BASE_URL` | `http://127.0.0.1:8642` | Hermes API Server |
 | `HERMES_MODEL` | Hermes profile default | Optional literal model override; normally leave unset |
+| `HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS` | greater of `120000` and the ordinary request timeout | Time to wait for a saved-chat answer, including tool execution |
 | `HERMES_LIVE_PROVIDER` | selected by setup | `local`, `gemini`, `openai`, or `mock` |
 | `HERMES_LIVE_LOCAL_URL` | `ws://127.0.0.1:8765/v1/realtime` | Hugging Face realtime endpoint |
 | `GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model |

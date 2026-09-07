@@ -5,6 +5,7 @@ import { z } from "zod";
 export const MAX_COMPATIBLE_AUDIO_FRAME_BYTES = 5_900_000;
 export const MAX_COMPATIBLE_TEXT_CHARS = 1_000_000;
 export const DEFAULT_HERMES_STREAM_IDLE_TIMEOUT_MS = 120_000;
+export const DEFAULT_HERMES_CHAT_TIMEOUT_MS = 120_000;
 const MAX_OUTBOUND_BASE_URL_CHARS = 2_048;
 const MAX_STATE_FILE_PATH_CHARS = 4_096;
 
@@ -89,6 +90,7 @@ const EnvSchema = z.object({
   HERMES_MODEL: z.string().trim().min(1).max(512).optional(),
   HERMES_LIVE_RUN_INSTRUCTIONS: z.string().optional(),
   HERMES_LIVE_HERMES_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).optional(),
   HERMES_LIVE_HERMES_STREAM_IDLE_TIMEOUT_MS: z.coerce
     .number()
     .int()
@@ -145,6 +147,7 @@ export interface AppConfig {
     model?: string;
     instructions?: string;
     timeoutMs: number;
+    chatTimeoutMs?: number;
     streamIdleTimeoutMs?: number;
   };
   tasks: {
@@ -218,6 +221,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ...(parsed.HERMES_MODEL ? { model: parsed.HERMES_MODEL } : {}),
       ...(parsed.HERMES_LIVE_RUN_INSTRUCTIONS ? { instructions: parsed.HERMES_LIVE_RUN_INSTRUCTIONS } : {}),
       timeoutMs: parsed.HERMES_LIVE_HERMES_TIMEOUT_MS,
+      chatTimeoutMs: parsed.HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS
+        ?? Math.max(DEFAULT_HERMES_CHAT_TIMEOUT_MS, parsed.HERMES_LIVE_HERMES_TIMEOUT_MS),
       streamIdleTimeoutMs: parsed.HERMES_LIVE_HERMES_STREAM_IDLE_TIMEOUT_MS,
     },
     tasks: {

@@ -281,7 +281,7 @@ describe("managed local voice routing", () => {
       conversation: "none",
       tools: [],
       tool_choice: "none",
-      metadata: { hermes_live_purpose: "conversation_answer" },
+      metadata: { hermes_live_purpose: "conversation_summary" },
     });
     expect(JSON.stringify(summarizedConversation).length).toBeLessThan(5_000);
     expect(String(summarizedConversation.instructions)).toContain("untrusted data");
@@ -292,7 +292,7 @@ describe("managed local voice routing", () => {
       "Use **production** only after verification.",
     ]) {
       const response = buildLocalConversationResponse({ ok: true, message: formatted });
-      expect(response.metadata).toEqual({ hermes_live_purpose: "conversation_answer" });
+      expect(response.metadata).toEqual({ hermes_live_purpose: "conversation_summary" });
       expect(response).not.toHaveProperty("metadata.hermes_live_exact_speech");
       expect(response).toMatchObject({ tools: [], tool_choice: "none" });
     }

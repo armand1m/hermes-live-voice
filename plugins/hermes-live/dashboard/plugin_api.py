@@ -8,6 +8,7 @@ connection server-side.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -621,14 +622,25 @@ async def live_websocket(ws: WebSocket) -> None:
 def _dashboard_ws_rejection_code(ws: WebSocket) -> int | None:
     """Delegate auth and request-boundary checks to Hermes, failing closed."""
 
-    try:
-        from hermes_cli import web_server
-    except Exception:
-        log.warning("Live Voice dashboard WebSocket auth helpers are unavailable")
-        return 4403
+    # Hermes moved these helpers out of web_server after v0.21.0. Fall back
+    # only when the new module is absent; a broken or rejecting current auth
+    # implementation must never fall through to legacy authorization.
+    auth_module = None
+    for module_name in ("hermes_cli.web_server_chat", "hermes_cli.web_server"):
+        try:
+            auth_module = importlib.import_module(module_name)
+            break
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name:
+                continue
+            log.warning("Live Voice dashboard WebSocket auth helpers are unavailable")
+            return 4403
+        except Exception:
+            log.warning("Live Voice dashboard WebSocket auth helpers are unavailable")
+            return 4403
 
-    auth_ok = getattr(web_server, "_ws_auth_ok", None)
-    request_is_allowed = getattr(web_server, "_ws_request_is_allowed", None)
+    auth_ok = getattr(auth_module, "_ws_auth_ok", None)
+    request_is_allowed = getattr(auth_module, "_ws_request_is_allowed", None)
     if not callable(auth_ok) or not callable(request_is_allowed):
         log.warning("Live Voice dashboard WebSocket auth helpers are incomplete")
         return 4403
