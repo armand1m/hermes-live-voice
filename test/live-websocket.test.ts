@@ -253,7 +253,8 @@ describe("live gateway WebSocket", () => {
       task_id: expect.stringMatching(/^task_[a-f0-9]{32}$/),
       status: "queued",
       message: expect.stringContaining("keep talking"),
-      spoken_response: "I've started that in the background. You can keep talking.",
+      spoken_response:
+        "Nice, I just spun up that task and started a watcher to keep an eye on it. I’ll let you know when it finishes or needs attention, and you can keep talking.",
     });
     expect(Object.keys(receipt.response)[0]).toBe("spoken_response");
     await waitUntil(() => hermes.startCalls.length === 1);
