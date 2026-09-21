@@ -4,8 +4,18 @@ const detail = document.querySelector('#detail');
 const mute = document.querySelector('#mute');
 const taskList = document.querySelector('#tasks');
 const taskCount = document.querySelector('#task-count');
-// Optional operator-supplied token stays in memory, never in HTML or storage.
-const token = new URLSearchParams(location.hash.slice(1)).get('token') || undefined;
+// The operator can bootstrap a tab with #token=... once. Keep it only in
+// sessionStorage so reloads do not require the secret again, while closing
+// the tab clears the credential. Never use localStorage or put it in HTML.
+const tokenKey = 'hermes-live-auth-token';
+const hashToken = new URLSearchParams(location.hash.slice(1)).get('token')?.trim();
+let token;
+try {
+  if (hashToken) sessionStorage.setItem(tokenKey, hashToken);
+  token = hashToken || sessionStorage.getItem(tokenKey) || undefined;
+} catch {
+  token = hashToken || undefined;
+}
 if (location.hash) history.replaceState(null, '', location.pathname + location.search);
 // The bundled page may be mounted at /voice (for example through Tailscale
 // Serve). Keep the WebSocket on that same mount instead of falling back to

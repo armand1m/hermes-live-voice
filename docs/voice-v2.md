@@ -17,9 +17,10 @@ and requestAnimationFrame targets 60 fps. Hidden tabs do not draw; reduced motio
 uses a static phase and 4 fps level updates. Hardware frame-rate measurements
 are not a release guarantee.
 
-The standalone page contains no credentials. For an authenticated direct local
-connection, supply your gateway token in `/#token=...`; it is removed from the
-address bar immediately and held only in memory. Prefer the Dashboard's existing
+The standalone page contains no credentials. For an authenticated direct
+connection, supply your gateway token in `/#token=...` once; it is removed from
+the address bar immediately and held in tab-scoped `sessionStorage` until that
+tab closes. Prefer the Dashboard's existing
 same-origin authenticated relay for shared installations. Never put the Hermes
 or cloud provider API key in the browser. Existing API routes and plugin protocol
 remain unchanged. Static assets use an exact allowlist and work independently of
