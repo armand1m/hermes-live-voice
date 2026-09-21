@@ -4,6 +4,8 @@ const detail = document.querySelector('#detail');
 const mute = document.querySelector('#mute');
 const taskList = document.querySelector('#tasks');
 const taskCount = document.querySelector('#task-count');
+const recentTaskList = document.querySelector('#recent-tasks');
+const taskHistory = document.querySelector('#task-history');
 // The operator can bootstrap a tab with #token=... once. Keep it only in
 // sessionStorage so reloads do not require the secret again, while closing
 // the tab clears the credential. Never use localStorage or put it in HTML.
@@ -41,10 +43,8 @@ client.on('session.ready', event => {
   try { sessionStorage.setItem(conversationKey, sessionId); } catch { /* storage may be blocked */ }
 });
 client.on('close', () => { status('offline', 'Disconnected'); mute.disabled = true; });
-function renderTasks(tasks = []) {
-  taskCount.textContent = tasks.length ? `${tasks.length} task${tasks.length === 1 ? '' : 's'}` : 'No tasks';
-  if (!tasks.length) { taskList.innerHTML = '<p class="tasks-empty">Tasks delegated by voice will appear here.</p>'; return; }
-  taskList.replaceChildren(...tasks.slice(0, 20).map(task => {
+function taskCards(tasks) {
+  return tasks.map(task => {
     const card = document.createElement('article'); card.className = 'task-card'; card.dataset.state = task.state;
     const title = document.createElement('strong'); title.textContent = task.title || `Task ${task.taskId.slice(0, 8)}`;
     const state = document.createElement('span'); state.className = 'task-state'; state.textContent = task.state;
@@ -54,10 +54,18 @@ function renderTasks(tasks = []) {
       const notice = document.createElement('em'); notice.textContent = 'Needs your approval in the Hermes dashboard'; card.append(notice);
     }
     return card;
-  }));
+  });
 }
-client.on('tasks.changed', ({ tasks, activeTasks }) => {
-  renderTasks(tasks);
+function renderTasks(activeTasks = [], recentTasks = []) {
+  taskCount.textContent = activeTasks.length ? `${activeTasks.length} active` : 'No active tasks';
+  if (activeTasks.length) taskList.replaceChildren(...taskCards(activeTasks));
+  else taskList.innerHTML = '<p class="tasks-empty">No background work is currently running.</p>';
+  const retained = recentTasks.slice(0, 8);
+  recentTaskList.replaceChildren(...taskCards(retained));
+  taskHistory.hidden = retained.length === 0;
+}
+client.on('tasks.changed', ({ activeTasks, recentTasks }) => {
+  renderTasks(activeTasks, recentTasks);
   if (activeTasks.length && !audio.speechActive && !audio.playbackSources.size) {
     status('waiting', 'Working in the background');
     detail.textContent = `${activeTasks.length} task${activeTasks.length === 1 ? '' : 's'} still running. You can keep talking.`;

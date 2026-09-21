@@ -5,6 +5,7 @@ const DEFAULT_MAX_INBOUND_MESSAGE_BYTES = 8_000_000;
 const DEFAULT_MAX_QUEUED_AUDIO_MS = 120_000;
 const DEFAULT_MAX_QUEUED_AUDIO_FRAMES = 8_192;
 const DEFAULT_PLAYBACK_RESUME_TIMEOUT_MS = 2_000;
+const DEFAULT_PLAYBACK_LEAD_MS = 180;
 const DEFAULT_SAMPLE_RATE = 24_000;
 const MIN_PCM_SAMPLE_RATE = 8_000;
 const MAX_PCM_SAMPLE_RATE = 192_000;
@@ -1059,6 +1060,7 @@ export class HermesLiveAudio {
       options.playbackResumeTimeoutMs,
       DEFAULT_PLAYBACK_RESUME_TIMEOUT_MS,
     );
+    this.playbackLeadMs = positiveInteger(options.playbackLeadMs, DEFAULT_PLAYBACK_LEAD_MS);
     this.mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
     this.audioContextFactory = options.audioContextFactory ?? ((config) => new AudioContext(config));
     this.audioWorkletNodeFactory = options.audioWorkletNodeFactory ??
@@ -1398,7 +1400,10 @@ export class HermesLiveAudio {
     } else {
       source.connect(this.playbackAnalyser ?? context.destination);
     }
-    const startAt = Math.max(context.currentTime + 0.02, this.playbackCursor || 0);
+    // Local TTS can briefly generate slower than realtime. Buffer the start of
+    // each response so small delivery gaps do not become audible stutters.
+    const startLead = this.playbackSources.size === 0 ? this.playbackLeadMs / 1_000 : 0.02;
+    const startAt = Math.max(context.currentTime + startLead, this.playbackCursor || 0);
     const contentIndex = frame.contentIndex;
     const itemKey = frame.itemId ? `${frame.itemId}:${contentIndex}` : "";
     if (itemKey && !this.playbackItems.has(itemKey)) {

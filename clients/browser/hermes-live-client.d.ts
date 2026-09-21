@@ -281,6 +281,7 @@ export interface HermesLiveAudioOptions {
   maxQueuedAudioMs?: number;
   maxQueuedAudioFrames?: number;
   playbackResumeTimeoutMs?: number;
+  playbackLeadMs?: number;
   mediaDevices?: Pick<MediaDevices, "getUserMedia">;
   audioContextFactory?: (options: AudioContextOptions) => AudioContext;
   audioWorkletNodeFactory?: (
