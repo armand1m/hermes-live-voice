@@ -1342,6 +1342,7 @@ describe("HermesLiveAudio", () => {
     expect(client.cancelResponse).toHaveBeenCalledOnce();
     for (let i = 0; i < 21; i++) frame(silence);
     expect(stops).toHaveBeenCalledOnce();
+    await new Promise((resolve) => setTimeout(resolve, 200));
     expect(client.endAudio).toHaveBeenCalledTimes(turnDetection === "disabled" ? 1 : 0);
     expect(audio.microphoneActive).toBe(true);
     expect(track.stop).not.toHaveBeenCalled();

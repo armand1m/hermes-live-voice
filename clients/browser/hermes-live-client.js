@@ -1152,6 +1152,7 @@ export class HermesLiveAudio {
     let context;
     let source;
     let node;
+    let turnEndTimer;
     try {
       stream = await capturePrerequisite(
         this.mediaDevices.getUserMedia({
@@ -1204,7 +1205,16 @@ export class HermesLiveAudio {
             this.emitter.emit("input.speech_stopped", activity);
             // Provider VAD already sees the silence tail. Only manual-mode
             // providers need an explicit commit, otherwise turns duplicate.
-            if (this.client.connected && this.client.session?.realtime?.audio?.turnDetection === "disabled") this.client.endAudio();
+            if (this.client.session?.realtime?.audio?.turnDetection === "disabled") {
+              clearTimeout(turnEndTimer);
+              turnEndTimer = setTimeout(() => {
+                turnEndTimer = undefined;
+                if (this.client.connected && !this.speechActive) this.client.endAudio();
+              }, 180);
+            }
+          } else if (activity.active) {
+            clearTimeout(turnEndTimer);
+            turnEndTimer = undefined;
           }
         } catch (error) {
           this.emitter.emit("error", { error: toError(error), code: "audio_send_failed" });
@@ -1219,6 +1229,7 @@ export class HermesLiveAudio {
       this.workletNode = node;
       this.setMicrophoneState("active", { sampleRate: captureRate });
     } catch (error) {
+      clearTimeout(turnEndTimer);
       await cleanupCapture({ stream, context, source, node });
       if (generation === this.captureGeneration && !this.disposed) this.setMicrophoneState("idle");
       if (error?.name !== "AbortError") throw error;
@@ -1375,7 +1386,14 @@ export class HermesLiveAudio {
     buffer.copyToChannel(frame.samples, 0);
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.playbackAnalyser ?? context.destination);
+    const gain = typeof context.createGain === "function" ? context.createGain() : undefined;
+    if (gain) {
+      gain.gain.value = 1;
+      source.connect(gain);
+      gain.connect(this.playbackAnalyser ?? context.destination);
+    } else {
+      source.connect(this.playbackAnalyser ?? context.destination);
+    }
     const startAt = Math.max(context.currentTime + 0.02, this.playbackCursor || 0);
     const contentIndex = frame.contentIndex;
     const itemKey = frame.itemId ? `${frame.itemId}:${contentIndex}` : "";
@@ -1385,6 +1403,7 @@ export class HermesLiveAudio {
     }
     const record = {
       source,
+      gain,
       context,
       itemKey,
       startAt,
@@ -1437,8 +1456,18 @@ export class HermesLiveAudio {
         this.addPlayedAudio(record.itemKey, playedSeconds * 1_000);
       }
       record.stopped = true;
+      const fadeEnd = now + 0.04;
       try {
-        record.source.stop();
+        if (record.gain?.gain) {
+          record.gain.gain.cancelScheduledValues(now);
+          record.gain.gain.setValueAtTime(record.gain.gain.value, now);
+          record.gain.gain.linearRampToValueAtTime(0, fadeEnd);
+        }
+      } catch {
+        // Gain automation is optional in injected/test audio contexts.
+      }
+      try {
+        record.source.stop(fadeEnd);
       } catch {
         // A source may already have ended between snapshot and stop.
       }
