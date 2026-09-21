@@ -336,6 +336,11 @@ export class PcmVoiceActivityDetector {
   constructor(sampleRate: number, options?: { threshold?: number; attackMs?: number; silenceMs?: number });
   process(samples: Int16Array): { level: number; active: boolean; started: boolean; stopped: boolean };
 }
+
+export class PcmNoiseSuppressor {
+  constructor(sampleRate: number, options?: { minimumGate?: number; floorMultiplier?: number; closedGain?: number });
+  process(samples: Int16Array): Int16Array;
+}
 export class HermesVoiceVisualizer {
   constructor(canvas: HTMLCanvasElement, audio: HermesLiveAudio, client: HermesLiveClient);
   dispose(): void;

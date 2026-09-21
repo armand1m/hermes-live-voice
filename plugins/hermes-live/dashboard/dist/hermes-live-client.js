@@ -1175,16 +1175,18 @@ export class HermesLiveAudio {
       });
       const captureRate = Math.round(context.sampleRate);
       const vad = new PcmVoiceActivityDetector(captureRate);
+      const noiseSuppressor = new PcmNoiseSuppressor(captureRate);
       const preroll = [];
       node.port.onmessage = (event) => {
         if (event.data?.type === "flushed") return;
         try {
-          const frame = event.data;
-          if (!this.localVad) {
-            this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
+        const frame = event.data;
+        const filtered = noiseSuppressor.process(new Int16Array(frame));
+        if (!this.localVad) {
+            this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
             return;
-          }
-          const activity = vad.process(new Int16Array(frame));
+        }
+          const activity = vad.process(filtered);
           this.inputLevel = activity.level;
           this.speechActive = activity.active;
           this.emitter.emit("input.level", activity);
@@ -1195,9 +1197,9 @@ export class HermesLiveAudio {
             preroll.length = 0;
           }
           if (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad") {
-            this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
+            this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
           } else {
-            preroll.push(frame);
+            preroll.push(filtered);
             if (preroll.length > 4) preroll.shift();
           }
           if (activity.stopped) {
@@ -2768,6 +2770,43 @@ export class PcmVoiceActivityDetector {
       if (this.silence >= this.silenceMs) { this.active = false; stopped = true; this.attack = 0; }
     }
     return { level, active: this.active, started, stopped };
+  }
+}
+
+/** Lightweight adaptive mic cleanup for steady room noise and low-frequency rumble. */
+export class PcmNoiseSuppressor {
+  constructor(sampleRate, { minimumGate = 0.008, floorMultiplier = 2.8, closedGain = 0.08 } = {}) {
+    this.sampleRate = sampleRate;
+    this.minimumGate = minimumGate;
+    this.floorMultiplier = floorMultiplier;
+    this.closedGain = closedGain;
+    this.noiseFloor = 0.004;
+    this.gain = 1;
+    this.previousInput = 0;
+    this.previousOutput = 0;
+  }
+  process(samples) {
+    const filtered = new Float32Array(samples.length);
+    let energy = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const input = samples[i] / 32768;
+      const highPassed = input - this.previousInput + 0.995 * this.previousOutput;
+      this.previousInput = input;
+      this.previousOutput = highPassed;
+      filtered[i] = highPassed;
+      energy += highPassed * highPassed;
+    }
+    const rms = Math.sqrt(energy / Math.max(1, samples.length));
+    const gate = Math.max(this.minimumGate, this.noiseFloor * this.floorMultiplier);
+    if (rms < gate * 1.4) this.noiseFloor = this.noiseFloor * 0.96 + rms * 0.04;
+    const targetGain = rms >= gate ? 1 : this.closedGain;
+    this.gain = targetGain === 1 ? 1 : this.gain * 0.75 + targetGain * 0.25;
+    const output = new Int16Array(samples.length);
+    for (let i = 0; i < filtered.length; i++) {
+      const value = Math.max(-1, Math.min(1, filtered[i] * this.gain));
+      output[i] = value < 0 ? Math.round(value * 32768) : Math.round(value * 32767);
+    }
+    return output;
   }
 }
 

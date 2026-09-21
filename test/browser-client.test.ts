@@ -2,10 +2,29 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HermesLiveAudio,
   HermesLiveClient,
+  PcmNoiseSuppressor,
   arrayBufferToBase64,
   buildGatewayWebSocketUrl,
   validateServerMessage,
 } from "../clients/browser/hermes-live-client.js";
+
+function meanAbsolute(samples: Int16Array): number {
+  return samples.reduce((total, sample) => total + Math.abs(sample), 0) / Math.max(1, samples.length);
+}
+
+describe("PcmNoiseSuppressor", () => {
+  it("attenuates steady room noise while preserving speech-level audio", () => {
+    const suppressor = new PcmNoiseSuppressor(24_000);
+    const noise = Int16Array.from({ length: 1_200 }, (_, index) => Math.sin(index * 0.11) * 120);
+    let filtered: Int16Array = noise;
+    for (let index = 0; index < 12; index++) filtered = suppressor.process(noise);
+    expect(meanAbsolute(filtered)).toBeLessThan(meanAbsolute(noise) * 0.2);
+
+    const speech = Int16Array.from({ length: 1_200 }, (_, index) => Math.sin(index * 0.08) * 7_000);
+    const cleanedSpeech = suppressor.process(speech);
+    expect(meanAbsolute(cleanedSpeech)).toBeGreaterThan(meanAbsolute(speech) * 0.75);
+  });
+});
 
 describe("HermesLiveClient", () => {
   it("negotiates protocol v6 and sends the exact task command envelopes", async () => {

@@ -7,6 +7,7 @@
 - Add a shared canvas voice field with microphone-reactive rings, thinking particles, playback AnalyserNode spectrum petals, and reduced-motion support.
 - Add synthetic PCM VAD tests, real local S2S audio contracts, ephemeral gateway-to-Hermes HTTP round trips (including the running local API), and Playwright fake-microphone browser automation to verification/CI. See [validation and configuration](docs/voice-v2.md).
 - Remember a directly supplied gateway token for the current browser tab and show delegated task states in the standalone voice console.
+- Add adaptive microphone noise gating and low-frequency cleanup before browser PCM reaches VAD or speech recognition.
 
 ## 1.1.3 - 2026-09-07
 
