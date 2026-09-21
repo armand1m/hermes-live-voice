@@ -13,7 +13,7 @@ const mountPath = location.pathname.endsWith('/')
   : location.pathname;
 const url = new URL(`${mountPath}/v1/live`, location.href); url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const client = new HermesLiveClient({ url: url.href, token, conversation: { mode: 'new' } });
-const audio = new HermesLiveAudio(client);
+const audio = new HermesLiveAudio(client, { workletUrl: `${mountPath}/mic-worklet.js` });
 const visualizer = new HermesVoiceVisualizer(document.querySelector('#field'), audio, client);
 function status(value, text) { state.dataset.state = value; state.textContent = text; }
 function error(event) { status('error', 'Voice needs attention'); detail.textContent = event.error?.message || event.message || String(event); }
