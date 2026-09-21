@@ -56,7 +56,13 @@ function renderTasks(tasks = []) {
     return card;
   }));
 }
-client.on('tasks.changed', ({ tasks }) => renderTasks(tasks));
+client.on('tasks.changed', ({ tasks, activeTasks }) => {
+  renderTasks(tasks);
+  if (activeTasks.length && !audio.speechActive && !audio.playbackSources.size) {
+    status('waiting', 'Working in the background');
+    detail.textContent = `${activeTasks.length} task${activeTasks.length === 1 ? '' : 's'} still running. You can keep talking.`;
+  }
+});
 audio.on('microphone', event => {
   mute.textContent = event.active ? 'Mute' : 'Unmute';
   mute.setAttribute('aria-pressed', String(!event.active));

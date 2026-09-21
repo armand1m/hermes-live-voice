@@ -1177,6 +1177,7 @@ export class HermesLiveAudio {
       const captureRate = Math.round(context.sampleRate);
       const vad = new PcmVoiceActivityDetector(captureRate);
       const preroll = [];
+      let providerTailFrames = 0;
       node.port.onmessage = (event) => {
         if (event.data?.type === "flushed") return;
         try {
@@ -1190,12 +1191,15 @@ export class HermesLiveAudio {
           this.speechActive = activity.active;
           this.emitter.emit("input.level", activity);
           if (activity.started) {
+            providerTailFrames = 0;
             this.interrupt("speech detected");
             this.emitter.emit("input.speech_started", activity);
             for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
             preroll.length = 0;
           }
-          if (this.client.connected && (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad")) {
+          if (activity.stopped) providerTailFrames = 8;
+          if (providerTailFrames > 0) providerTailFrames -= 1;
+          if (this.client.connected && (activity.active || activity.stopped || providerTailFrames > 0 || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad")) {
             this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
           } else {
             preroll.push(frame);
@@ -2806,6 +2810,7 @@ export class HermesVoiceVisualizer {
     this.canvas = canvas;
     this.audio = audio;
     this.thinking = false;
+    this.taskWaiting = false;
     this.phase = 0;
     this.bins = new Uint8Array(128);
     this.motion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
@@ -2813,6 +2818,7 @@ export class HermesVoiceVisualizer {
       audio.on("input.speech_stopped", () => { if (!this.responseObservedForTurn) this.thinking = true; }),
       audio.on("input.speech_started", () => { this.thinking = false; this.responseObservedForTurn = false; }),
       client.on("response.started", () => { this.thinking = true; this.responseObservedForTurn = true; }),
+      client.on("tasks.changed", ({ activeTasks }) => { this.taskWaiting = activeTasks.length > 0; }),
       ...["response.completed", "response.cancelled", "response.failed", "close"].map(type =>
         client.on(type, () => { this.thinking = false; })),
     ];
@@ -2824,7 +2830,7 @@ export class HermesVoiceVisualizer {
       const dt = Math.min(0.05, (time - (this.last || time)) / 1000);
       this.last = time;
       const speaking = audio.playbackSources.size > 0;
-      const state = speaking ? "speaking" : audio.speechActive ? "listening" : this.thinking ? "thinking" : "idle";
+      const state = speaking ? "speaking" : audio.speechActive ? "listening" : this.thinking ? "thinking" : this.taskWaiting ? "waiting" : "idle";
       canvas.dataset.state = state;
       this.speed = state === "thinking" ? Math.min(5, (this.speed || 0.3) + dt) : 0.3;
       if (!reduced) this.phase += dt * this.speed;
@@ -2836,7 +2842,7 @@ export class HermesVoiceVisualizer {
       ctx.clearRect(0, 0, w, h);
       const r = Math.min(w, h) * 0.24;
       const level = Math.min(1, audio.inputLevel * 7);
-      const color = speaking ? "174,140,255" : state === "thinking" ? "255,191,105" : "83,235,218";
+      const color = speaking ? "174,140,255" : state === "thinking" ? "255,191,105" : state === "waiting" ? "116,177,255" : "83,235,218";
       const glow = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, r * 2);
       glow.addColorStop(0, `rgba(${color},.22)`); glow.addColorStop(1, `rgba(${color},0)`);
       ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
@@ -2854,7 +2860,7 @@ export class HermesVoiceVisualizer {
         ctx.closePath(); ctx.strokeStyle = `rgba(${color},${0.8 - ring * 0.16})`;
         ctx.lineWidth = Math.max(1, w / 500); ctx.stroke();
       }
-      if (state === "thinking") for (let i = 0; i < 24; i++) {
+      if (state === "thinking" || state === "waiting") for (let i = 0; i < 24; i++) {
         const a = i * Math.PI / 12 + this.phase;
         ctx.beginPath(); ctx.arc(w/2 + Math.cos(a) * r * 1.6, h/2 + Math.sin(a) * r * 1.6, 1 + (i % 3), 0, Math.PI * 2);
         ctx.fillStyle = `rgba(${color},${0.2 + i / 32})`; ctx.fill();
