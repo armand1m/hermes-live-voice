@@ -129,6 +129,7 @@ audio.on("microphone", (event) => {
     controller.resumeRequested();
     status("armed", "Listening");
     detail.textContent = "Talk naturally. I’ll hear when you finish.";
+    syncStatusDetail();
   } else if (event.state === "idle" && controller.paused) {
     status("paused", "Listening paused");
     detail.textContent = "Resume with the microphone control.";
@@ -289,20 +290,24 @@ client.on("task.updated", ({ task, message }) => {
     scene?.toolPacketEnd(task.taskId, false);
   } else if (type === "task.cancelled" || type === "task.stopping") {
     scene?.toolPacketEnd(task.taskId, true);
+    addTaskRow(`◇ ${toolLabel(task, message)} — ${type === "task.stopping" ? "stopping" : "cancelled"}`);
   }
+  if (type === "task.started") addTaskRow(`▸ ${toolLabel(task, message)} — started`);
+  else if (type === "task.completed") addTaskRow(`✓ ${toolLabel(task, message)} — done`);
+  else if (type === "task.failed") addTaskRow(`✕ ${toolLabel(task, message)} — failed`);
+  else if (type === "task.unknown") addTaskRow(`? ${toolLabel(task, message)} — unknown`);
   renderTaskLine();
+  syncStatusDetail();
 });
 
 client.on("tasks.changed", ({ activeTasks }) => {
   controller.taskWaitingChanged(activeTasks.length > 0);
-  if (activeTasks.length && !playbackActive && controller.mode !== "listening") {
-    status("waiting", "Working in the background");
-    detail.textContent = `${activeTasks.length} task${activeTasks.length === 1 ? "" : "s"} still running. You can keep talking.`;
-  } else if (!activeTasks.length && state.dataset.state === "waiting") {
+  if (!activeTasks.length && state.dataset.state === "waiting") {
     status("armed", "Listening");
     detail.textContent = "";
   }
   renderTaskLine();
+  syncStatusDetail();
 });
 
 function renderTaskLine() {
@@ -315,7 +320,31 @@ function renderTaskLine() {
   taskLine.hidden = false;
   const first = tasks[0];
   const label = first.progress?.message || first.title || first.state;
-  taskLine.textContent = `${tasks.length > 1 ? `${tasks.length} · ` : ""}${label}`.slice(0, 64);
+  taskLine.textContent = `Running · ${tasks.length > 1 ? `${tasks.length} · ` : ""}${label}`.slice(0, 72);
+}
+
+/** Compact task-lifecycle row in both transcript views; never disturbs streaming utterances. */
+function addTaskRow(text) {
+  for (const list of [transcriptList, logTranscript]) {
+    const row = document.createElement("p");
+    row.dataset.speaker = "system";
+    row.dataset.final = "true";
+    row.textContent = text;
+    list.append(row);
+    while (list.children.length > (list === logTranscript ? 200 : 100)) list.firstChild.remove();
+  }
+}
+
+/** One place for the status detail line: listening never hides running work. */
+function syncStatusDetail() {
+  const tasks = client.activeTasks || [];
+  if (!tasks.length) return;
+  const count = `${tasks.length} task${tasks.length === 1 ? "" : "s"} running`;
+  if (audio.microphoneActive) {
+    detail.textContent = `Listening · ${count} — keep talking`;
+  } else {
+    detail.textContent = `${count}. You can keep talking.`;
+  }
 }
 
 // --- connection --------------------------------------------------------------

@@ -327,7 +327,11 @@ export class VoiceEntityScene {
   updateAccents(visual) {
     // Computation warms the palette; errors pull it toward coral. The head,
     // rings, packets and the CSS accent all ride this same mix.
-    const warm = clamp(visual.thinkingIntensity * 0.7 + visual.toolActivity * 0.3);
+    const warm = clamp(
+      visual.thinkingIntensity * 0.55
+      + visual.toolActivity * 0.2
+      + (visual.workIntensity ?? 0) * 0.45,
+    );
     const err = clamp(visual.errorIntensity);
     for (let i = 0; i < 3; i++) {
       let r = lerp(ACCENTS.primary[i], ACCENTS.secondary[i], warm);
@@ -436,7 +440,11 @@ export class VoiceEntityScene {
   }
 
   updateCortex(dt, visual) {
-    const visibility = clamp(visual.thinkingIntensity * 0.48 + visual.toolActivity * 0.14);
+    const visibility = clamp(
+      visual.thinkingIntensity * 0.48
+      + visual.toolActivity * 0.14
+      + (visual.workIntensity ?? 0) * 0.5,
+    );
     this.cortexVisibility = visibility;
     const t = this.time;
     const pos = this.cortexPos;
@@ -448,7 +456,7 @@ export class VoiceEntityScene {
       const radius = this.cortexRadii[ring];
       const axis = this.cortexAxes[ring];
       // Each ring spins slowly on its own axis; speeds rise with thought.
-      const spin = t * (0.14 + ring * 0.09) * (1 + visual.thinkingIntensity * 2.4);
+      const spin = t * (0.14 + ring * 0.09) * (1 + visual.thinkingIntensity * 2.4 + (visual.workIntensity ?? 0) * 1.2);
       for (let k = 0; k < segments; k++) {
         for (const step of [0, 1]) {
           const a = ((k + step) / segments) * TAU + spin;

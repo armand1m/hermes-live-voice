@@ -157,3 +157,28 @@ describe("TextVisemeScheduler", () => {
     expect(scheduler.active).toBeGreaterThan(0.5);
   });
 });
+
+describe("background work feedback", () => {
+  it("keeps workIntensity sustained while tasks run and clears it when they end", async () => {
+    const controller = new AgentStateController({ reducedMotion: true });
+    controller.connectionState("ready");
+    controller.microphoneState("active");
+    controller.userSpeechStarted();
+    controller.userSpeechEnded();
+
+    controller.toolStarted();
+    controller.taskWaitingChanged(true);
+    // Long after the momentary tool spike decays, sustained work remains.
+    for (let i = 0; i < 420; i += 1) controller.update(1 / 60, { speakingNow: false, micActive: true });
+    const visual = controller.readout();
+    expect(visual.workIntensity).toBeGreaterThan(0.8);
+    expect(visual.toolActivity).toBeLessThan(0.3);
+    // Work is an overlay, not a mode swap: whichever idle mode applies, the
+    // sustained work signal stays high for the whole run.
+    expect(['listening', 'waiting']).toContain(visual.mode);
+
+    controller.taskWaitingChanged(false);
+    for (let i = 0; i < 240; i += 1) controller.update(1 / 60, { speakingNow: false, micActive: true });
+    expect(controller.readout().workIntensity).toBeLessThan(0.1);
+  });
+});

@@ -418,6 +418,10 @@ export class AgentStateController {
       errorIntensity: new Spring(0, { attack: 300, release: 4.5 }),
       listening: new Spring(0, { attack: 170, release: 20 }),
       toolActivity: new Spring(0, { attack: 90, release: 10 }),
+      // Sustained background-work indicator: rises while tasks run, slowly
+      // settles when they finish. Unlike toolActivity it does not decay
+      // between progress events, so long-running work stays visible.
+      workIntensity: new Spring(0, { attack: 300, release: 30 }),
       capture: new Spring(0, { attack: 400, release: 26 }),
       dispersal: new Spring(0, { attack: 18, release: 10 }),
       // Gaze intention in head-local space, -1..1.
@@ -589,12 +593,17 @@ export class AgentStateController {
   }
 
   toolStarted() {
-    this.springs.toolActivity.set(1);
+    // Transient spike: the sustained signal is workIntensity, which stays up
+    // for the whole run; toolActivity itself only flashes on fresh activity.
+    this.springs.toolActivity.snap(1);
+    this.springs.toolActivity.set(0);
+    this.springs.workIntensity.set(1);
     this.thinkingActive = false;
   }
 
   toolActivity() {
-    this.springs.toolActivity.set(1);
+    this.springs.toolActivity.snap(1);
+    this.springs.toolActivity.set(0);
   }
 
   toolEnded(success) {
@@ -606,6 +615,8 @@ export class AgentStateController {
     this.taskWaiting = active;
     // This is the authoritative aggregate task lifecycle signal. In
     // particular, cancelled/stopping tasks do not call toolEnded in voice.js.
+    if (active) this.springs.workIntensity.set(1);
+    else this.springs.workIntensity.set(0);
     if (!active) this.springs.toolActivity.set(0);
   }
 
@@ -802,6 +813,7 @@ export class AgentStateController {
     v.errorIntensity = s.errorIntensity.value;
     v.listening = s.listening.value;
     v.toolActivity = s.toolActivity.value;
+    v.workIntensity = s.workIntensity.value;
     v.capture = s.capture.value;
     v.dispersal = s.dispersal.value;
     v.gazeX = s.gazeX.value;
