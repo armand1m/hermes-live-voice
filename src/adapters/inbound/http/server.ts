@@ -457,6 +457,7 @@ async function handleHttp(
         hermes: report.hermes,
         realtime: report.realtime,
         tasks: report.tasks,
+        context: report.context,
       },
     });
     return;
