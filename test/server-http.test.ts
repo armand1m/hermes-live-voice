@@ -348,6 +348,7 @@ describe("HTTP server", () => {
     expect(await fetch(`${server.url}/`).then((res) => res.status)).toBe(200);
     expect(await fetch(`${server.url}/hermes-live-client.js`).then((res) => res.status)).toBe(200);
     expect(await fetch(`${server.url}/mic-worklet.js`).then((res) => res.status)).toBe(200);
+    expect(await fetch(`${server.url}/diagnostics.js`).then((res) => res.status)).toBe(200);
     for (const asset of ["entity-facekit.js", "facekit-data.js", "FACEKIT-LICENSE.txt"]) {
       const response = await fetch(`${server.url}/${asset}`);
       expect(response.status).toBe(200);
@@ -355,6 +356,45 @@ describe("HTTP server", () => {
     }
     const capabilities = await fetch(`${server.url}/v1/capabilities`).then((res) => res.json());
     expect(capabilities.features).not.toHaveProperty("browser_demo");
+  });
+
+  it("serves diagnostics metrics with the same auth as other API routes", async () => {
+    const server = await startServer({
+      config: testConfig({ server: { authToken: "diag-token" } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      logger: fakeLogger(),
+    });
+    openServers.push(server);
+    const auth = { authorization: "Bearer diag-token" };
+
+    expect(await fetch(`${server.url}/v1/metrics`).then((res) => res.status)).toBe(401);
+    expect(
+      await fetch(`${server.url}/v1/metrics`, { headers: { authorization: "Bearer wrong" } }).then((res) => res.status),
+    ).toBe(401);
+    expect(
+      await fetch(`${server.url}/v1/metrics`, { method: "POST", headers: auth }).then((res) => res.status),
+    ).toBe(405);
+
+    const body = await fetch(`${server.url}/v1/metrics`, { headers: auth }).then((res) => {
+      expect(res.status).toBe(200);
+      return res.json();
+    });
+    expect(body.ts).toEqual(expect.any(Number));
+    expect(body.gatewayCpuPct).toEqual(expect.any(Number));
+    expect(body.loadAvg).toEqual([expect.any(Number), expect.any(Number), expect.any(Number)]);
+    expect(body.cores).toBeGreaterThan(0);
+    expect(body.eventLagMs).toEqual(expect.any(Number));
+    // No live sessions: no audio has been emitted yet. The optional voice-stack
+    // signal depends on this host's processes, so only its type is asserted.
+    expect(body.lastAudioOutputMsAgo).toBeNull();
+    expect(body.gatewayAudioGapP50Ms).toBeNull();
+    expect(body.gatewayAudioGapP95Ms).toBeNull();
+    expect(body.voiceStackCpuPct === null || typeof body.voiceStackCpuPct === "number").toBe(true);
+
+    // A second poll computes CPU over the elapsed interval instead of erroring.
+    const second = await fetch(`${server.url}/v1/metrics`, { headers: auth }).then((res) => res.json());
+    expect(second.gatewayCpuPct).toEqual(expect.any(Number));
   });
 
   it("returns not_ready when Hermes capabilities fail", async () => {

@@ -150,6 +150,12 @@ export class LiveGatewaySession {
   private activeProviderToolOperations = 0;
   private pendingProviderToolCalls = 0;
   private cachedProviderToolResponseBytes = 0;
+  // Audio-delivery telemetry for the /v1/metrics diagnostics endpoint.
+  private lastAudioOutputAt = 0;
+  private lastAudioSendAt = 0;
+  private readonly audioGapSamples = new Float32Array(128);
+  private audioGapLength = 0;
+  private audioGapNext = 0;
 
   constructor(
     private readonly client: ClientConnectionPort,
@@ -1833,7 +1839,42 @@ export class LiveGatewaySession {
 
   private send(message: ServerMessage): void {
     if (this.closing && message.type !== "session.error") return;
+    if (message.type === "audio.output") this.recordAudioOutput();
     this.client.sendText(serverMessage(message));
+  }
+
+  private recordAudioOutput(): void {
+    const now = Date.now();
+    if (this.lastAudioSendAt > 0) {
+      const gap = now - this.lastAudioSendAt;
+      // Inter-frame gaps only; long pauses between responses are not jitter.
+      if (gap > 0 && gap <= 10_000) {
+        this.audioGapSamples[this.audioGapNext] = gap;
+        this.audioGapNext = (this.audioGapNext + 1) % this.audioGapSamples.length;
+        if (this.audioGapLength < this.audioGapSamples.length) this.audioGapLength += 1;
+      }
+    }
+    this.lastAudioSendAt = now;
+    this.lastAudioOutputAt = now;
+  }
+
+  /**
+   * Server-side audio delivery telemetry consumed by GET /v1/metrics: how long
+   * ago this session last emitted TTS audio, and the emit cadence of recent
+   * audio frames (percentiles over a small rolling window). Compared against
+   * the client-observed arrival gaps, this separates "the server fed frames
+   * late" from "the network or browser delayed them".
+   */
+  audioDeliveryMetrics(now = Date.now()): {
+    lastOutputMsAgo: number | null;
+    gapP50Ms: number | null;
+    gapP95Ms: number | null;
+  } {
+    const lastOutputMsAgo = this.lastAudioOutputAt > 0 ? Math.max(0, now - this.lastAudioOutputAt) : null;
+    if (this.audioGapLength === 0) return { lastOutputMsAgo, gapP50Ms: null, gapP95Ms: null };
+    const sorted = Array.from(this.audioGapSamples.subarray(0, this.audioGapLength)).sort((a, b) => a - b);
+    const percentile = (quantile: number) => sorted[Math.min(sorted.length - 1, Math.floor(quantile * (sorted.length - 1)))];
+    return { lastOutputMsAgo, gapP50Ms: percentile(0.5), gapP95Ms: percentile(0.95) };
   }
 
   private handleClientMessageFailure(error: unknown, requestId?: string): void {

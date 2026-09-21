@@ -1,6 +1,7 @@
 import { HermesLiveClient, HermesLiveAudio } from "./hermes-live-client.js";
 import { AgentStateController, SpeechAnalysis, TextVisemeScheduler, VisemeEstimator } from "./entity-state.js";
 import { VoiceEntityScene } from "./entity-scene.js";
+import { createDiagnosticsOverlay } from "./diagnostics.js";
 
 const state = document.querySelector("#state");
 const detail = document.querySelector("#detail");
@@ -25,6 +26,8 @@ const conversationKey = "hermes-live-conversation-id";
 const hashParams = new URLSearchParams(location.hash.slice(1));
 const hashToken = hashParams.get("token")?.trim();
 const devMode = hashParams.has("dev") || new URLSearchParams(location.search).get("dev") === "1";
+const noDiagnostics = hashParams.has("no-diagnostics")
+  || new URLSearchParams(location.search).get("no-diagnostics") === "1";
 let token;
 try {
   if (hashToken) sessionStorage.setItem(tokenKey, hashToken);
@@ -63,6 +66,21 @@ const textVisemes = new TextVisemeScheduler();
 
 // Optional synthetic viseme source installed by the developer playground.
 let syntheticVisemes = null;
+
+// Always-on diagnostics overlay (top-right corner, recedes with the mode).
+// Opt out with ?no-diagnostics=1 / #no-diagnostics. It reads the same client
+// and audio event stream as the visual pipeline and polls the gateway's
+// /v1/metrics on the page's mount path.
+if (!noDiagnostics) {
+  const diagnostics = createDiagnosticsOverlay({
+    client,
+    audio,
+    metricsUrl: `${mountPath}/v1/metrics`,
+    getToken: () => token,
+    getFps: () => fps,
+  });
+  window.addEventListener("pagehide", () => diagnostics.dispose(), { once: true });
+}
 
 // Mouth rig targets derived from viseme weights (see entity-facekit.js).
 const mouth = { jaw: 0, wide: 0, round: 0, narrow: 0, press: 0, teeth: 0, energy: 0 };

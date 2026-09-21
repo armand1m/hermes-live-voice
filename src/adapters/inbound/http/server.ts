@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { cpus, loadavg } from "node:os";
 import type { AddressInfo } from "node:net";
 import { basename, dirname } from "node:path";
 import type { Duplex } from "node:stream";
@@ -23,6 +24,7 @@ import { FileTaskStore } from "../../outbound/task-store/file-task-store.js";
 import type { Logger } from "../../../logger.js";
 import { buildReadinessReport } from "../../../readiness.js";
 import { WebSocketClientConnection } from "./websocket-client-connection.js";
+import { createGatewayMetricsCollector, type GatewayMetricsCollector } from "./gateway-metrics.js";
 import { errorToMessage } from "../../../domain/error-message.js";
 import {
   HERMES_LIVE_PROTOCOL_VERSION,
@@ -136,6 +138,8 @@ export async function startServer({
     throw error;
   }
   const sessions = new Set<LiveGatewaySession>();
+  // Process/host signals for the browser diagnostics overlay (GET /v1/metrics).
+  const metrics = createGatewayMetricsCollector();
 
   const server = createServer(async (req, res) => {
     try {
@@ -143,6 +147,8 @@ export async function startServer({
         config,
         hermes,
         taskSupervisor,
+        sessions,
+        metrics,
         requireHermesApiKey: !providedHermes,
         requireRealtimeProviderConfig: !providedLiveModel,
       });
@@ -238,6 +244,7 @@ export async function startServer({
         // Stop accepting HTTP requests and WebSocket upgrades before waiting
         // for any client/provider cleanup.
         const httpClosing = closeHttpServer(server);
+        metrics.stop();
         // Session cleanup may take several seconds. Attach a rejection handler
         // immediately so an early server.close callback error cannot surface as
         // an unhandled rejection before the ordered aggregation below awaits it.
@@ -384,6 +391,8 @@ async function handleHttp(
     config: AppConfig;
     hermes: HermesRunsPort;
     taskSupervisor: TaskSupervisorRuntime;
+    sessions: Set<LiveGatewaySession>;
+    metrics: GatewayMetricsCollector;
     requireHermesApiKey: boolean;
     requireRealtimeProviderConfig: boolean;
   },
@@ -411,6 +420,7 @@ async function handleHttp(
     "/FACEKIT-LICENSE.txt": ["FACEKIT-LICENSE.txt", "text/plain; charset=utf-8"],
     "/entity-scene.js": ["entity-scene.js", "text/javascript; charset=utf-8"],
     "/entity-debug.js": ["entity-debug.js", "text/javascript; charset=utf-8"],
+    "/diagnostics.js": ["diagnostics.js", "text/javascript; charset=utf-8"],
   };
   const asset = browserFiles[url.pathname];
   if (asset) {
@@ -459,6 +469,45 @@ async function handleHttp(
         tasks: report.tasks,
         context: report.context,
       },
+    });
+    return;
+  }
+  if (url.pathname === "/v1/metrics") {
+    if (!isGetOrHead(req)) {
+      methodNotAllowed(req, res, "GET, HEAD");
+      return;
+    }
+    const processMetrics = await options.metrics.sample();
+    // Aggregate the audio-delivery telemetry of live sessions: the most
+    // recent audio emission and the worst recent emit cadence across them.
+    let lastAudioOutputMsAgo: number | null = null;
+    let gatewayAudioGapP50Ms: number | null = null;
+    let gatewayAudioGapP95Ms: number | null = null;
+    for (const session of options.sessions) {
+      const audio = session.audioDeliveryMetrics();
+      if (audio.lastOutputMsAgo !== null) {
+        lastAudioOutputMsAgo = lastAudioOutputMsAgo === null
+          ? audio.lastOutputMsAgo
+          : Math.min(lastAudioOutputMsAgo, audio.lastOutputMsAgo);
+      }
+      if (audio.gapP50Ms !== null) {
+        gatewayAudioGapP50Ms = Math.max(gatewayAudioGapP50Ms ?? 0, audio.gapP50Ms);
+      }
+      if (audio.gapP95Ms !== null) {
+        gatewayAudioGapP95Ms = Math.max(gatewayAudioGapP95Ms ?? 0, audio.gapP95Ms);
+      }
+    }
+    json(req, res, 200, {
+      ts: Date.now(),
+      gatewayCpuPct: processMetrics.gatewayCpuPct,
+      loadAvg: loadavg().map((value) => Math.round(value * 100) / 100),
+      cores: cpus().length,
+      lastAudioOutputMsAgo,
+      gatewayAudioGapP50Ms,
+      gatewayAudioGapP95Ms,
+      voiceStackCpuPct: processMetrics.voiceStackCpuPct,
+      voiceStackPid: processMetrics.voiceStackPid,
+      eventLagMs: processMetrics.eventLagMs,
     });
     return;
   }
@@ -591,7 +640,7 @@ function isAuthorized(req: IncomingMessage, config: AppConfig, url: URL, options
 }
 
 function requiresHttpAuth(pathname: string): boolean {
-  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations";
+  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations" || pathname === "/v1/metrics";
 }
 
 function isWebSocketOriginAllowed(req: IncomingMessage, config: AppConfig): boolean {

@@ -101,6 +101,7 @@
     "clients/browser/FACEKIT-LICENSE.txt",
     "clients/browser/entity-scene.js",
     "clients/browser/entity-debug.js",
+    "clients/browser/diagnostics.js",
     "clients/browser/index.html",
     "clients/browser/voice.js",
     "clients/browser/voice.css",

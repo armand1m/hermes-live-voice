@@ -1455,6 +1455,41 @@ describe("transport, tool-call, and notification safety", () => {
     await expect(client.messages.waitForClose()).resolves.toMatchObject({ code: 1011 });
   });
 
+  it("reports session audio delivery telemetry through /v1/metrics", async () => {
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig(),
+      hermes: new HermesHarness(),
+      provider,
+    });
+    const client = await readyClient(server.url);
+
+    const emitFrame = () => provider.emit({
+      type: "audio",
+      audio: {
+        data: Buffer.alloc(64, 1).toString("base64"),
+        mimeType: "audio/pcm;rate=24000",
+        itemId: "audio_item_metrics",
+        contentIndex: 0,
+      },
+    });
+    emitFrame();
+    await client.messages.wait("audio.output");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    emitFrame();
+    await client.messages.wait("audio.output");
+
+    const metrics = await fetch(`${server.url}/v1/metrics`).then((response) => {
+      expect(response.status).toBe(200);
+      return response.json();
+    });
+    expect(metrics.lastAudioOutputMsAgo).toEqual(expect.any(Number));
+    expect(metrics.lastAudioOutputMsAgo).toBeLessThan(5_000);
+    expect(metrics.gatewayAudioGapP50Ms).toEqual(expect.any(Number));
+    expect(metrics.gatewayAudioGapP50Ms).toBeGreaterThanOrEqual(0);
+    expect(metrics.gatewayAudioGapP95Ms).toEqual(expect.any(Number));
+  });
+
   it("fails closed when a provider emits an oversized audio frame", async () => {
     const provider = new RecordingLiveAdapter();
     const server = await startTestServer({
