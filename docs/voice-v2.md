@@ -9,13 +9,21 @@ its tab mounts. Browser microphone access requires localhost or HTTPS; allow
 microphone access. If browser autoplay is blocked, use Unmute to unlock audio.
 Permission denial is displayed, never treated as an armed listener.
 
-The canvas renders breathing ambient rings while idle, microphone-driven rings
-while listening, accelerating orbit particles while thinking, and playback
-spectrum petals while speaking. Playback goes through an AnalyserNode. Geometry
-is bounded (four 128-segment rings, 24 particles), pixel density is capped at 2,
-and requestAnimationFrame targets 60 fps. Hidden tabs do not draw; reduced motion
-uses a static phase and 4 fps level updates. Hardware frame-rate measurements
-are not a release guarantee.
+The canvas renders a procedural synthetic head: a sculpted lat/long skull shown
+simultaneously as a fresnel glass shell, decimated topology wire, travelling
+latitude contours, and a surface point cloud, with luminous iris apertures,
+folding lids, brow arcs and a viseme-driven segmented mouth. Voice events map to
+continuous visual parameters (attention, energy, thinking intensity,
+uncertainty, speech activity) through a spring-interpolated state controller, so
+the entity is visibly dormant while idle, attentive while listening, warm and
+scan-lined while thinking, outward-facing while tools run, and lip-synced to the
+actual outgoing audio while speaking (an AnalyserNode feeds smoothed
+rms/low/mid/high values into a viseme estimator). Glow layers use screen
+blending so overlapping lines cannot saturate. Pixel density is capped at 2 and
+requestAnimationFrame targets 60 fps. Hidden tabs do not draw; reduced motion
+freezes camera drift and idle wander. Hardware frame-rate measurements are not a
+release guarantee. A visual-state playground (mode chips, parameter sliders, a
+synthetic viseme driver) is available only with `?dev=1`.
 
 The standalone page contains no credentials. For an authenticated direct
 connection, supply your gateway token in `/#token=...` once; it is removed from

@@ -1,3 +1,37 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes · Live Voice</title><link rel="stylesheet" href="voice.css"></head>
-<body><main><header><span class="mark">H / LIVE</span><span>HERMES VOICE INTERFACE</span></header><section class="console"><p class="eyebrow">A channel for your thoughts</p><h1>Speak. I’m here.</h1><canvas id="field" aria-label="Voice activity visualization"></canvas><p id="state" role="status" data-state="connecting">Connecting…</p><p id="detail">Allow microphone access to listen continuously.</p><button id="mute" disabled aria-pressed="false">Mute</button></section><section class="tasks" aria-labelledby="tasks-heading"><div class="tasks-heading"><h2 id="tasks-heading">Running now</h2><span id="task-count">No active tasks</span></div><div id="tasks" role="status" aria-live="polite"><p class="tasks-empty">No background work is currently running.</p></div><details id="task-history"><summary>Recent task history</summary><div id="recent-tasks"></div></details></section><section class="history"><h2>Conversation</h2><div id="transcript" role="log" aria-live="polite"></div></section><footer>CONTINUOUS LISTENING <span>Speech interrupts the reply · Muting keeps your conversation open</span></footer></main><script type="module" src="voice.js"></script></body></html>
+<body data-mode="dormant">
+<canvas id="field" data-state="idle" aria-label="Synthetic entity visualization"></canvas>
+<div class="fallback" aria-hidden="true"><i></i><i></i><i></i></div>
+<header class="bar"><span class="mark">H / LIVE</span><span id="meta-line" class="meta">HERMES VOICE INTERFACE</span></header>
+
+<section class="state-cluster" aria-live="off">
+  <p id="state" role="status" data-state="connecting">Connecting…</p>
+  <p id="detail">Allow microphone access to listen continuously.</p>
+  <div id="meter" aria-hidden="true"><i></i></div>
+</section>
+
+<aside class="periphery" aria-label="Background work">
+  <p id="task-line" hidden></p>
+  <p class="tool-chip" id="tool-chip-0" hidden></p>
+  <p class="tool-chip" id="tool-chip-1" hidden></p>
+  <p class="tool-chip" id="tool-chip-2" hidden></p>
+  <p id="notice" role="alert" hidden></p>
+</aside>
+
+<section class="stream" aria-label="Conversation">
+  <p id="agent-line" aria-live="polite"></p>
+  <div id="transcript" role="log" aria-live="polite"></div>
+</section>
+
+<div id="log-toggle" class="log-toggle" tabindex="0">LOG</div>
+<div id="log-drawer" class="log-drawer" hidden>
+  <h2>Conversation</h2>
+  <div id="log-transcript" aria-live="off"></div>
+</div>
+
+<button id="mute" disabled aria-pressed="false">Mute</button>
+
+<footer class="foot">CONTINUOUS LISTENING <span>Speech interrupts the reply · Muting keeps your conversation open</span></footer>
+<script type="module" src="voice.js"></script>
+</body></html>

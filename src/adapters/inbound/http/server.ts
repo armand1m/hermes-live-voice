@@ -398,6 +398,11 @@ async function handleHttp(
     "/voice.css": ["voice.css", "text/css; charset=utf-8"],
     "/hermes-live-client.js": ["hermes-live-client.js", "text/javascript; charset=utf-8"],
     "/mic-worklet.js": ["mic-worklet.js", "text/javascript; charset=utf-8"],
+    "/entity-state.js": ["entity-state.js", "text/javascript; charset=utf-8"],
+    "/entity-gl.js": ["entity-gl.js", "text/javascript; charset=utf-8"],
+    "/entity-head.js": ["entity-head.js", "text/javascript; charset=utf-8"],
+    "/entity-scene.js": ["entity-scene.js", "text/javascript; charset=utf-8"],
+    "/entity-debug.js": ["entity-debug.js", "text/javascript; charset=utf-8"],
   };
   const asset = browserFiles[url.pathname];
   if (asset) {

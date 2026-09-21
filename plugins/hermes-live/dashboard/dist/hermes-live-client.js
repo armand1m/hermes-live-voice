@@ -5,6 +5,7 @@ const DEFAULT_MAX_INBOUND_MESSAGE_BYTES = 8_000_000;
 const DEFAULT_MAX_QUEUED_AUDIO_MS = 120_000;
 const DEFAULT_MAX_QUEUED_AUDIO_FRAMES = 8_192;
 const DEFAULT_PLAYBACK_RESUME_TIMEOUT_MS = 2_000;
+const DEFAULT_PLAYBACK_LEAD_MS = 180;
 const DEFAULT_SAMPLE_RATE = 24_000;
 const MIN_PCM_SAMPLE_RATE = 8_000;
 const MAX_PCM_SAMPLE_RATE = 192_000;
@@ -1059,6 +1060,7 @@ export class HermesLiveAudio {
       options.playbackResumeTimeoutMs,
       DEFAULT_PLAYBACK_RESUME_TIMEOUT_MS,
     );
+    this.playbackLeadMs = positiveInteger(options.playbackLeadMs, DEFAULT_PLAYBACK_LEAD_MS);
     this.mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
     this.audioContextFactory = options.audioContextFactory ?? ((config) => new AudioContext(config));
     this.audioWorkletNodeFactory = options.audioWorkletNodeFactory ??
@@ -1152,6 +1154,7 @@ export class HermesLiveAudio {
     let context;
     let source;
     let node;
+    let turnEndTimer;
     try {
       stream = await capturePrerequisite(
         this.mediaDevices.getUserMedia({
@@ -1177,13 +1180,14 @@ export class HermesLiveAudio {
       const vad = new PcmVoiceActivityDetector(captureRate);
       const noiseSuppressor = new PcmNoiseSuppressor(captureRate);
       const preroll = [];
+      let providerTailFrames = 0;
       node.port.onmessage = (event) => {
         if (event.data?.type === "flushed") return;
         try {
         const frame = event.data;
         const filtered = noiseSuppressor.process(new Int16Array(frame));
         if (!this.localVad) {
-            this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
+            if (this.client.connected) this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
             return;
         }
           const activity = vad.process(filtered);
@@ -1191,12 +1195,15 @@ export class HermesLiveAudio {
           this.speechActive = activity.active;
           this.emitter.emit("input.level", activity);
           if (activity.started) {
+            providerTailFrames = 0;
             this.interrupt("speech detected");
             this.emitter.emit("input.speech_started", activity);
             for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
             preroll.length = 0;
           }
-          if (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad") {
+          if (activity.stopped) providerTailFrames = 8;
+          if (providerTailFrames > 0) providerTailFrames -= 1;
+          if (this.client.connected && (activity.active || activity.stopped || providerTailFrames > 0 || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad")) {
             this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
           } else {
             preroll.push(filtered);
@@ -1206,7 +1213,16 @@ export class HermesLiveAudio {
             this.emitter.emit("input.speech_stopped", activity);
             // Provider VAD already sees the silence tail. Only manual-mode
             // providers need an explicit commit, otherwise turns duplicate.
-            if (this.client.session?.realtime?.audio?.turnDetection === "disabled") this.client.endAudio();
+            if (this.client.session?.realtime?.audio?.turnDetection === "disabled") {
+              clearTimeout(turnEndTimer);
+              turnEndTimer = setTimeout(() => {
+                turnEndTimer = undefined;
+                if (this.client.connected && !this.speechActive) this.client.endAudio();
+              }, 180);
+            }
+          } else if (activity.active) {
+            clearTimeout(turnEndTimer);
+            turnEndTimer = undefined;
           }
         } catch (error) {
           this.emitter.emit("error", { error: toError(error), code: "audio_send_failed" });
@@ -1221,6 +1237,7 @@ export class HermesLiveAudio {
       this.workletNode = node;
       this.setMicrophoneState("active", { sampleRate: captureRate });
     } catch (error) {
+      clearTimeout(turnEndTimer);
       await cleanupCapture({ stream, context, source, node });
       if (generation === this.captureGeneration && !this.disposed) this.setMicrophoneState("idle");
       if (error?.name !== "AbortError") throw error;
@@ -1377,8 +1394,18 @@ export class HermesLiveAudio {
     buffer.copyToChannel(frame.samples, 0);
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.playbackAnalyser ?? context.destination);
-    const startAt = Math.max(context.currentTime + 0.02, this.playbackCursor || 0);
+    const gain = typeof context.createGain === "function" ? context.createGain() : undefined;
+    if (gain) {
+      gain.gain.value = 1;
+      source.connect(gain);
+      gain.connect(this.playbackAnalyser ?? context.destination);
+    } else {
+      source.connect(this.playbackAnalyser ?? context.destination);
+    }
+    // Local TTS can briefly generate slower than realtime. Buffer the start of
+    // each response so small delivery gaps do not become audible stutters.
+    const startLead = this.playbackSources.size === 0 ? this.playbackLeadMs / 1_000 : 0.02;
+    const startAt = Math.max(context.currentTime + startLead, this.playbackCursor || 0);
     const contentIndex = frame.contentIndex;
     const itemKey = frame.itemId ? `${frame.itemId}:${contentIndex}` : "";
     if (itemKey && !this.playbackItems.has(itemKey)) {
@@ -1387,6 +1414,7 @@ export class HermesLiveAudio {
     }
     const record = {
       source,
+      gain,
       context,
       itemKey,
       startAt,
@@ -1439,8 +1467,18 @@ export class HermesLiveAudio {
         this.addPlayedAudio(record.itemKey, playedSeconds * 1_000);
       }
       record.stopped = true;
+      const fadeEnd = now + 0.04;
       try {
-        record.source.stop();
+        if (record.gain?.gain) {
+          record.gain.gain.cancelScheduledValues(now);
+          record.gain.gain.setValueAtTime(record.gain.gain.value, now);
+          record.gain.gain.linearRampToValueAtTime(0, fadeEnd);
+        }
+      } catch {
+        // Gain automation is optional in injected/test audio contexts.
+      }
+      try {
+        record.source.stop(fadeEnd);
       } catch {
         // A source may already have ended between snapshot and stop.
       }
@@ -2816,6 +2854,7 @@ export class HermesVoiceVisualizer {
     this.canvas = canvas;
     this.audio = audio;
     this.thinking = false;
+    this.taskWaiting = false;
     this.phase = 0;
     this.bins = new Uint8Array(128);
     this.motion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
@@ -2823,6 +2862,7 @@ export class HermesVoiceVisualizer {
       audio.on("input.speech_stopped", () => { if (!this.responseObservedForTurn) this.thinking = true; }),
       audio.on("input.speech_started", () => { this.thinking = false; this.responseObservedForTurn = false; }),
       client.on("response.started", () => { this.thinking = true; this.responseObservedForTurn = true; }),
+      client.on("tasks.changed", ({ activeTasks }) => { this.taskWaiting = activeTasks.length > 0; }),
       ...["response.completed", "response.cancelled", "response.failed", "close"].map(type =>
         client.on(type, () => { this.thinking = false; })),
     ];
@@ -2834,7 +2874,7 @@ export class HermesVoiceVisualizer {
       const dt = Math.min(0.05, (time - (this.last || time)) / 1000);
       this.last = time;
       const speaking = audio.playbackSources.size > 0;
-      const state = speaking ? "speaking" : audio.speechActive ? "listening" : this.thinking ? "thinking" : "idle";
+      const state = speaking ? "speaking" : audio.speechActive ? "listening" : this.thinking ? "thinking" : this.taskWaiting ? "waiting" : "idle";
       canvas.dataset.state = state;
       this.speed = state === "thinking" ? Math.min(5, (this.speed || 0.3) + dt) : 0.3;
       if (!reduced) this.phase += dt * this.speed;
@@ -2846,7 +2886,7 @@ export class HermesVoiceVisualizer {
       ctx.clearRect(0, 0, w, h);
       const r = Math.min(w, h) * 0.24;
       const level = Math.min(1, audio.inputLevel * 7);
-      const color = speaking ? "174,140,255" : state === "thinking" ? "255,191,105" : "83,235,218";
+      const color = speaking ? "174,140,255" : state === "thinking" ? "255,191,105" : state === "waiting" ? "116,177,255" : "83,235,218";
       const glow = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, r * 2);
       glow.addColorStop(0, `rgba(${color},.22)`); glow.addColorStop(1, `rgba(${color},0)`);
       ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
@@ -2864,7 +2904,7 @@ export class HermesVoiceVisualizer {
         ctx.closePath(); ctx.strokeStyle = `rgba(${color},${0.8 - ring * 0.16})`;
         ctx.lineWidth = Math.max(1, w / 500); ctx.stroke();
       }
-      if (state === "thinking") for (let i = 0; i < 24; i++) {
+      if (state === "thinking" || state === "waiting") for (let i = 0; i < 24; i++) {
         const a = i * Math.PI / 12 + this.phase;
         ctx.beginPath(); ctx.arc(w/2 + Math.cos(a) * r * 1.6, h/2 + Math.sin(a) * r * 1.6, 1 + (i % 3), 0, Math.PI * 2);
         ctx.fillStyle = `rgba(${color},${0.2 + i / 32})`; ctx.fill();
