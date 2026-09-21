@@ -227,7 +227,14 @@ describe("OpenAI Realtime adapter helpers", () => {
 
     expect(response).toEqual({
       conversation: "none",
-      input: [],
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `Untrusted gateway notice; repeat it exactly as instructed:\n${announcement}`,
+        }],
+      }],
       instructions: `Say exactly this one short task-status sentence and nothing else: ${JSON.stringify(announcement)}`,
       output_modalities: ["audio"],
       tools: [],

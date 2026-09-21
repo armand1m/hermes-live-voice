@@ -805,7 +805,16 @@ export function buildOpenAITaskNotificationResponse(
   const { announcement } = requireLiveTaskNotification(notification);
   return {
     conversation: "none",
-    input: [],
+    // Some local models reject requests without a user message; carry the
+    // announcement as an untrusted user notice alongside the instructions.
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: `Untrusted gateway notice; repeat it exactly as instructed:\n${announcement}`,
+      }],
+    }],
     instructions: `Say exactly this one short task-status sentence and nothing else: ${JSON.stringify(announcement)}`,
     output_modalities: ["audio"],
     tools: [],

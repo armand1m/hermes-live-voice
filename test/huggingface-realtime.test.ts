@@ -329,7 +329,7 @@ describe("Hugging Face speech-to-speech adapter", () => {
     await waitUntil(() => harness.messages.some((message) => message.type === "response.create"));
     harness.send({ type: "response.created", response: { id: "resp_empty", status: "in_progress" } });
     harness.send({ type: "response.done", response: { id: "resp_empty", status: "completed" } });
-    await waitUntil(() => events.some((event) => (event as any).type === "response" && (event as any).status === "failed"), 2_000, JSON.stringify(events.map((e) => (e as any).type)));
+    await waitUntil(() => events.some((event) => (event as any).type === "response" && (event as any).status === "failed"));
 
     expect(events).toContainEqual({
       type: "response",

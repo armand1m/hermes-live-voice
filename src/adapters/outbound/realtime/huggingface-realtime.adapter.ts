@@ -19,6 +19,7 @@ import {
   buildLocalConversationResponse,
   buildLocalExactSpeechResponse,
   buildLocalTaskQuestionResponse,
+  exactSpeechInput,
   isClearLocalWorkRequest,
   localRoutedAction,
   matchLocalStoppableTask,
@@ -301,6 +302,7 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
           kind: "conversation",
           response: {
             conversation: "none",
+            input: [exactSpeechInput(spokenReceipt)],
             instructions: `Say exactly this one short tool receipt and nothing else: ${JSON.stringify(spokenReceipt)}`,
             output_modalities: ["audio"],
             tools: [],

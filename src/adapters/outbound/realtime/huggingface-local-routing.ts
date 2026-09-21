@@ -296,6 +296,9 @@ function boundedNestedText(value: unknown, maximumChars: number): string | undef
 export function buildLocalExactSpeechResponse(spoken: string): Record<string, unknown> {
   return {
     conversation: "none",
+    // Some local models reject requests without a user message, so the exact
+    // speech rides in as an untrusted user notice alongside the instructions.
+    input: [exactSpeechInput(spoken)],
     instructions: `Say exactly this one short tool receipt and nothing else: ${JSON.stringify(spoken)}`,
     output_modalities: ["audio"],
     tools: [],
@@ -304,6 +307,17 @@ export function buildLocalExactSpeechResponse(spoken: string): Record<string, un
       hermes_live_purpose: "tool_receipt",
       hermes_live_exact_speech: spoken,
     },
+  };
+}
+
+export function exactSpeechInput(text: string): Record<string, unknown> {
+  return {
+    type: "message",
+    role: "user",
+    content: [{
+      type: "input_text",
+      text: `Untrusted gateway notice; repeat it exactly as instructed:\n${text}`,
+    }],
   };
 }
 
@@ -372,6 +386,7 @@ export function buildLocalConversationResponse(
   ) {
     return {
       conversation: "none",
+      input: [exactSpeechInput(message)],
       instructions: `Say this saved Hermes answer exactly and nothing else: ${JSON.stringify(message)}`,
       output_modalities: ["audio"],
       tools: [],
