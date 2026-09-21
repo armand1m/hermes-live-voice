@@ -919,7 +919,7 @@ describe("Hugging Face speech-to-speech adapter", () => {
     await expect(pending).rejects.toThrow(/Unknown or invalid event: session\.update/u);
   });
 
-  it("retries a transient busy managed pipeline without leaking pre-ready callbacks", async () => {
+  it.each([true, false])("retries a transient busy pipeline (managed=%s) without leaking pre-ready callbacks", async (ownsTurnRouting) => {
     const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
     servers.push(server);
     await once(server, "listening");
@@ -947,7 +947,7 @@ describe("Hugging Face speech-to-speech adapter", () => {
       {
         ...localConfig(),
         url: `ws://127.0.0.1:${address.port}/v1/realtime`,
-        ownsTurnRouting: true,
+        ownsTurnRouting,
       },
       1_000,
       1_000,

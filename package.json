@@ -91,7 +91,11 @@
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
-    ".env.example"
+    ".env.example",
+    "clients/browser/index.html",
+    "clients/browser/voice.js",
+    "clients/browser/voice.css",
+    "docs/voice-v2.md"
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -124,14 +128,16 @@
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "sync:dashboard-assets": "node scripts/sync-dashboard-assets.mjs",
-    "verify": "npm run typecheck && npm run check:scripts && npm run check:docs && npm run check:release-notes && npm run check:workflow-pins && npm run check:positioning && npm run check:browser-client && npm run check:dashboard-assets && npm run check:dashboard-plugin && npm run check:plugin && npm run check:plugin-local && npm run check:plugin-index-entry && npm run check:local-runtime && npm test && npm run build && npm run check:live-provider-cli && npm run check:cli-check && npm run check:cli-client && npm run check:gateway && npm run check:package",
-    "prepack": "npm run check:dashboard-assets && npm run build"
+    "verify": "npm run typecheck && npm run check:scripts && npm run check:docs && npm run check:release-notes && npm run check:workflow-pins && npm run check:positioning && npm run check:browser-client && npm run check:dashboard-assets && npm run check:dashboard-plugin && npm run check:plugin && npm run check:plugin-local && npm run check:plugin-index-entry && npm run check:local-runtime && npm test && npm run test:e2e && npm run build && npm run check:live-provider-cli && npm run check:cli-check && npm run check:cli-client && npm run check:gateway && npm run check:package",
+    "prepack": "npm run check:dashboard-assets && npm run build",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@google/genai": "2.22.0",
     "ws": "8.21.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^20.19.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.11",

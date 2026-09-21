@@ -85,8 +85,7 @@ export class HuggingFaceRealtimeAdapter implements LiveModelAdapter {
         return await this.connectOnce(params, remainingMs);
       } catch (error) {
         if (
-          !this.config.ownsTurnRouting
-          || !isLocalPipelineBusyError(error)
+          !isLocalPipelineBusyError(error)
           || deadline - Date.now() <= LOCAL_BUSY_RETRY_MS
         ) {
           throw error;

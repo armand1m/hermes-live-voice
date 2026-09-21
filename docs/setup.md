@@ -186,3 +186,7 @@ hermes-live setup --provider local --non-interactive --json
 ```
 
 For a config-only or remote deployment, provide `HERMES_AGENT_API_SERVER_KEY` and add `--no-service`. Useful layout flags are `--hermes-url`, `--config`, `--plugins-dir`, `--hermes-command`, `--no-enable`, and `--no-service`.
+
+## Continuous browser console
+
+Open `http://127.0.0.1:8788/` to connect and listen automatically, or open the Dashboard Live Voice tab. The only microphone control is Mute/Unmute. Local voice is the config default; select cloud providers explicitly. See [voice console configuration and automation](voice-v2.md).

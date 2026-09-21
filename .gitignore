@@ -38,3 +38,6 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+test-results/
+playwright-report/

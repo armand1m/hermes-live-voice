@@ -1314,6 +1314,42 @@ describe("HermesLiveAudio", () => {
     await audio.dispose();
   });
 
+  it.each(["disabled", "server_vad", "semantic_vad", "provider"])("continuously captures, barges in, and ends %s turns exactly once", async (turnDetection) => {
+    const client = { ...audioClient(), session: { realtime: { audio: {
+      input: { enabled: true, mimeType: "audio/pcm;rate=24000" }, turnDetection,
+    } } } };
+    const track = { stop: vi.fn() };
+    const port = { onmessage: undefined as ((event: any) => void) | undefined, postMessage: vi.fn(), close: vi.fn(),
+      addEventListener: (_type: string, listener: (event: any) => void) => queueMicrotask(() => listener({ data: { type: "flushed" } })),
+      removeEventListener: vi.fn(),
+    };
+    const audio = createAudio({ client, localVad: true,
+      mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track] }) },
+      audioWorkletNodeFactory: () => ({ port, connect: vi.fn(), disconnect: vi.fn() }),
+    });
+    const starts = vi.fn(), stops = vi.fn();
+    audio.on("input.speech_started", starts);
+    audio.on("input.speech_stopped", stops);
+    await audio.startMicrophone();
+    const silence = new Int16Array(1200);
+    const speech = Int16Array.from({ length: 1200 }, (_, i) => Math.sin(i * 0.08) * 8000);
+    const frame = (samples: Int16Array) => port.onmessage?.({ data: samples.buffer });
+    for (let i = 0; i < 10; i++) frame(silence);
+    expect(client.sendAudio).toHaveBeenCalledTimes(turnDetection === "semantic_vad" ? 10 : 0);
+    client.cancelResponse.mockClear();
+    frame(speech); frame(speech);
+    expect(starts).toHaveBeenCalledOnce();
+    expect(client.cancelResponse).toHaveBeenCalledOnce();
+    for (let i = 0; i < 21; i++) frame(silence);
+    expect(stops).toHaveBeenCalledOnce();
+    expect(client.endAudio).toHaveBeenCalledTimes(turnDetection === "disabled" ? 1 : 0);
+    expect(audio.microphoneActive).toBe(true);
+    expect(track.stop).not.toHaveBeenCalled();
+    await audio.stopMicrophone({ endTurn: false });
+    expect(track.stop).toHaveBeenCalledOnce();
+    await audio.dispose();
+  });
+
   it("stops a late microphone stream when disposed during permission", async () => {
     const permission = deferred<MediaStream>();
     const track = { stop: vi.fn() };
@@ -1894,6 +1930,7 @@ function createAudio(overrides: Record<string, unknown> = {}): HermesLiveAudio {
   const client = (overrides.client as ReturnType<typeof audioClient> | undefined) ?? audioClient();
   const { client: _client, ...options } = overrides;
   return new HermesLiveAudio(client as any, {
+    localVad: false, // Legacy raw-capture coverage; continuous VAD has its own PCM tests.
     audioContextFactory: (config) => new FakeAudioContext(config) as unknown as AudioContext,
     audioWorkletNodeFactory: () => ({}) as AudioWorkletNode,
     decodeBase64: (value) => Buffer.from(value, "base64").toString("binary"),

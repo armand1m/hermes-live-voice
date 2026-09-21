@@ -95,7 +95,7 @@ try {
     throw new Error("Packed upgrade exposed the imported Hermes key.");
   }
 
-  gateway = spawn(bin, ["serve"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  gateway = spawn(bin, ["serve"], { env, cwd: home, stdio: ["ignore", "pipe", "pipe"] });
   gateway.stdout.on("data", (chunk) => { gatewayStdout += chunk; });
   gateway.stderr.on("data", (chunk) => { gatewayStderr += chunk; });
   const readyUrl = `http://127.0.0.1:${gatewayPort}/ready`;
@@ -103,6 +103,18 @@ try {
     await waitForReady(readyUrl, 15_000);
   } catch (error) {
     throw new Error(`${error.message}\nGateway stdout:\n${gatewayStdout}\nGateway stderr:\n${gatewayStderr}`);
+  }
+  for (const [path, contentType] of [
+    ["/", "text/html"], ["/voice.js", "text/javascript"],
+    ["/voice.css", "text/css"], ["/hermes-live-client.js", "text/javascript"],
+    ["/mic-worklet.js", "text/javascript"],
+  ]) {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}${path}`);
+    const body = await response.text();
+    if (!response.ok || !response.headers.get("content-type")?.includes(contentType) || !body.length) {
+      throw new Error(`Installed browser asset unavailable from unrelated cwd: ${path}`);
+    }
+    if (body.includes(privateKey)) throw new Error("Browser asset exposed the Hermes key.");
   }
   const doctor = await run(bin, [
     "doctor",

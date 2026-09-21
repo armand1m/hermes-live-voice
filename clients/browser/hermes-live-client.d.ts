@@ -275,6 +275,7 @@ export class HermesLiveClient {
 }
 
 export interface HermesLiveAudioOptions {
+  localVad?: boolean;
   workletUrl?: string;
   sampleRate?: number;
   maxQueuedAudioMs?: number;
@@ -291,6 +292,9 @@ export interface HermesLiveAudioOptions {
 }
 
 export interface HermesLiveAudioEventMap {
+  "input.level": { level: number; active: boolean; started: boolean; stopped: boolean };
+  "input.speech_started": { level: number; active: boolean; started: boolean; stopped: boolean };
+  "input.speech_stopped": { level: number; active: boolean; started: boolean; stopped: boolean };
   microphone: { state: "idle" | "starting" | "active" | "stopping" | "disposed"; active: boolean; sampleRate?: number };
   playback: { active: boolean; queued: number; queuedMs: number };
   error: { error: Error; code: string };
@@ -306,6 +310,9 @@ export interface HermesLiveAudioEventMap {
 }
 
 export class HermesLiveAudio {
+  readonly inputLevel: number;
+  readonly speechActive: boolean;
+  readonly playbackAnalyser?: AnalyserNode;
   constructor(client: HermesLiveClient, options?: HermesLiveAudioOptions);
   readonly microphoneActive: boolean;
   readonly microphoneState: "idle" | "starting" | "active" | "stopping" | "disposed";
@@ -323,3 +330,12 @@ export function normalizeGatewayWebSocketUrl(value: string | URL): string;
 export function buildGatewayWebSocketUrl(baseUrl: string | URL, token?: string): URL;
 export function arrayBufferToBase64(value: ArrayBuffer | ArrayBufferView): string;
 export function validateServerMessage(value: unknown): HermesLiveServerMessage;
+
+export class PcmVoiceActivityDetector {
+  constructor(sampleRate: number, options?: { threshold?: number; attackMs?: number; silenceMs?: number });
+  process(samples: Int16Array): { level: number; active: boolean; started: boolean; stopped: boolean };
+}
+export class HermesVoiceVisualizer {
+  constructor(canvas: HTMLCanvasElement, audio: HermesLiveAudio, client: HermesLiveClient);
+  dispose(): void;
+}

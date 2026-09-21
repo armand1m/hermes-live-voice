@@ -57,6 +57,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      - run: npx playwright install --with-deps chromium
       - run: npm run verify
       - run: npm audit --audit-level=moderate
       - run: npm pack --dry-run

@@ -33,7 +33,7 @@ The browser never receives the installation-wide gateway bearer or Hermes API ke
 
 ### Clients
 
-Voice clients capture microphone audio, send base64 PCM frames, play provider audio, render transcript and task state, and expose separate controls for speech interruption and exact task stop. The shared browser SDK supplies protocol validation, reconnect snapshots, task/notification caches, bounded buffering, a microphone worklet, and audio playback.
+Voice clients capture microphone audio, send base64 PCM frames, play provider audio, render transcript and task state, and expose separate controls for speech interruption and exact task stop. The gateway also serves a standalone continuous browser console at `/`. Both browser surfaces use local PCM VAD with pre-roll, silence-tail turn detection, barge-in, and a playback analyser driving a shared canvas renderer. The shared browser SDK supplies protocol validation, reconnect snapshots, task/notification caches, bounded buffering, a microphone worklet, and audio playback.
 
 The terminal uses the same persistent protocol but is text-control only. It supports the durable task inbox and exact stop without adding native audio dependencies.
 

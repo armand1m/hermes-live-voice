@@ -1044,6 +1044,10 @@ export class HermesLiveAudio {
       throw new TypeError("HermesLiveAudio requires a HermesLiveClient-compatible instance.");
     }
     this.client = client;
+    this.localVad = options.localVad ?? true;
+    this.inputLevel = 0;
+    this.speechActive = false;
+    this.playbackAnalyser = undefined;
     this.workletUrl = options.workletUrl ?? "/mic-worklet.js";
     this.sampleRate = positiveInteger(options.sampleRate, DEFAULT_SAMPLE_RATE);
     this.maxQueuedAudioMs = positiveInteger(options.maxQueuedAudioMs, DEFAULT_MAX_QUEUED_AUDIO_MS);
@@ -1170,10 +1174,38 @@ export class HermesLiveAudio {
         processorOptions: { frameMs: 50 },
       });
       const captureRate = Math.round(context.sampleRate);
+      const vad = new PcmVoiceActivityDetector(captureRate);
+      const preroll = [];
       node.port.onmessage = (event) => {
         if (event.data?.type === "flushed") return;
         try {
-          this.client.sendAudio(event.data, `audio/pcm;rate=${captureRate}`);
+          const frame = event.data;
+          if (!this.localVad) {
+            this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
+            return;
+          }
+          const activity = vad.process(new Int16Array(frame));
+          this.inputLevel = activity.level;
+          this.speechActive = activity.active;
+          this.emitter.emit("input.level", activity);
+          if (activity.started) {
+            this.interrupt("speech detected");
+            this.emitter.emit("input.speech_started", activity);
+            for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
+            preroll.length = 0;
+          }
+          if (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad") {
+            this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
+          } else {
+            preroll.push(frame);
+            if (preroll.length > 4) preroll.shift();
+          }
+          if (activity.stopped) {
+            this.emitter.emit("input.speech_stopped", activity);
+            // Provider VAD already sees the silence tail. Only manual-mode
+            // providers need an explicit commit, otherwise turns duplicate.
+            if (this.client.session?.realtime?.audio?.turnDetection === "disabled") this.client.endAudio();
+          }
         } catch (error) {
           this.emitter.emit("error", { error: toError(error), code: "audio_send_failed" });
         }
@@ -1207,6 +1239,8 @@ export class HermesLiveAudio {
   async stopMicrophonePipeline(options) {
     const endTurn = options.endTurn ?? true;
     const wasActive = this.microphoneState === "active";
+    this.inputLevel = 0;
+    this.speechActive = false;
     ++this.captureGeneration;
     if (this.microphoneState !== "disposed") this.setMicrophoneState("stopping");
     this.microphoneStartCancellation?.cancel();
@@ -1225,6 +1259,8 @@ export class HermesLiveAudio {
     this.captureSource = undefined;
     this.workletNode = undefined;
     await cleanupCapture(capture);
+    this.inputLevel = 0;
+    this.speechActive = false;
     this.setMicrophoneState(this.disposed ? "disposed" : "idle");
   }
 
@@ -1339,7 +1375,7 @@ export class HermesLiveAudio {
     buffer.copyToChannel(frame.samples, 0);
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.connect(context.destination);
+    source.connect(this.playbackAnalyser ?? context.destination);
     const startAt = Math.max(context.currentTime + 0.02, this.playbackCursor || 0);
     const contentIndex = frame.contentIndex;
     const itemKey = frame.itemId ? `${frame.itemId}:${contentIndex}` : "";
@@ -1437,6 +1473,11 @@ export class HermesLiveAudio {
   ensurePlaybackContext() {
     if (!this.playbackContext || this.playbackContext.state === "closed") {
       this.playbackContext = this.audioContextFactory({});
+      this.playbackAnalyser = this.playbackContext.createAnalyser?.();
+      if (this.playbackAnalyser) {
+        this.playbackAnalyser.fftSize = 256;
+        this.playbackAnalyser.connect(this.playbackContext.destination);
+      }
       this.playbackCursor = 0;
     }
     return this.playbackContext;
@@ -2699,4 +2740,98 @@ function abortError() {
 
 function toError(value) {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+/** Streaming PCM16 VAD: attack debounce, hysteresis and a provider-safe silence tail. */
+export class PcmVoiceActivityDetector {
+  constructor(sampleRate, { threshold = 0.012, attackMs = 100, silenceMs = 1000 } = {}) {
+    this.sampleRate = sampleRate;
+    this.threshold = threshold;
+    this.attackMs = attackMs;
+    this.silenceMs = silenceMs;
+    this.active = false;
+    this.attack = 0;
+    this.silence = 0;
+  }
+  process(samples) {
+    let energy = 0;
+    for (const sample of samples) energy += (sample / 32768) ** 2;
+    const level = Math.sqrt(energy / Math.max(1, samples.length));
+    const ms = samples.length * 1000 / this.sampleRate;
+    const loud = level >= this.threshold * (this.active ? 0.65 : 1);
+    let started = false, stopped = false;
+    if (!this.active) {
+      this.attack = loud ? this.attack + ms : 0;
+      if (this.attack >= this.attackMs) { this.active = true; started = true; this.silence = 0; }
+    } else {
+      this.silence = loud ? 0 : this.silence + ms;
+      if (this.silence >= this.silenceMs) { this.active = false; stopped = true; this.attack = 0; }
+    }
+    return { level, active: this.active, started, stopped };
+  }
+}
+
+/** Bounded animation loop shared by standalone and dashboard UIs. */
+export class HermesVoiceVisualizer {
+  constructor(canvas, audio, client) {
+    this.canvas = canvas;
+    this.audio = audio;
+    this.thinking = false;
+    this.phase = 0;
+    this.bins = new Uint8Array(128);
+    this.motion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
+    this.off = [
+      audio.on("input.speech_stopped", () => { if (!this.responseObservedForTurn) this.thinking = true; }),
+      audio.on("input.speech_started", () => { this.thinking = false; this.responseObservedForTurn = false; }),
+      client.on("response.started", () => { this.thinking = true; this.responseObservedForTurn = true; }),
+      ...["response.completed", "response.cancelled", "response.failed", "close"].map(type =>
+        client.on(type, () => { this.thinking = false; })),
+    ];
+    const draw = time => {
+      this.frame = requestAnimationFrame(draw);
+      if (globalThis.document?.hidden) return;
+      const reduced = this.motion?.matches;
+      if (time - (this.last || 0) < (reduced ? 250 : 15)) return;
+      const dt = Math.min(0.05, (time - (this.last || time)) / 1000);
+      this.last = time;
+      const speaking = audio.playbackSources.size > 0;
+      const state = speaking ? "speaking" : audio.speechActive ? "listening" : this.thinking ? "thinking" : "idle";
+      canvas.dataset.state = state;
+      this.speed = state === "thinking" ? Math.min(5, (this.speed || 0.3) + dt) : 0.3;
+      if (!reduced) this.phase += dt * this.speed;
+      const w = Math.max(1, Math.round(canvas.clientWidth * Math.min(devicePixelRatio || 1, 2)));
+      const h = Math.max(1, Math.round(canvas.clientHeight * Math.min(devicePixelRatio || 1, 2)));
+      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, w, h);
+      const r = Math.min(w, h) * 0.24;
+      const level = Math.min(1, audio.inputLevel * 7);
+      const color = speaking ? "174,140,255" : state === "thinking" ? "255,191,105" : "83,235,218";
+      const glow = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, r * 2);
+      glow.addColorStop(0, `rgba(${color},.22)`); glow.addColorStop(1, `rgba(${color},0)`);
+      ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
+      audio.playbackAnalyser?.getByteFrequencyData(this.bins);
+      for (let ring = 0; ring < 4; ring++) {
+        ctx.beginPath();
+        for (let i = 0; i <= 128; i++) {
+          const angle = i / 128 * Math.PI * 2;
+          const spectrum = speaking ? this.bins[i % 128] / 255 : 0;
+          const wave = reduced ? 0 : Math.sin(angle * (speaking ? 12 : 6) + this.phase * 3 + ring) * (state === "listening" ? level * 0.16 : 0.025);
+          const radius = r * (0.7 + ring * 0.19 + spectrum * 0.36 + wave + (reduced ? 0 : Math.sin(this.phase) * 0.04));
+          const x = w/2 + Math.cos(angle) * radius, y = h/2 + Math.sin(angle) * radius;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.closePath(); ctx.strokeStyle = `rgba(${color},${0.8 - ring * 0.16})`;
+        ctx.lineWidth = Math.max(1, w / 500); ctx.stroke();
+      }
+      if (state === "thinking") for (let i = 0; i < 24; i++) {
+        const a = i * Math.PI / 12 + this.phase;
+        ctx.beginPath(); ctx.arc(w/2 + Math.cos(a) * r * 1.6, h/2 + Math.sin(a) * r * 1.6, 1 + (i % 3), 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${color},${0.2 + i / 32})`; ctx.fill();
+      }
+    };
+    this.frame = requestAnimationFrame(draw);
+  }
+  dispose() { cancelAnimationFrame(this.frame); for (const off of this.off) off(); }
 }

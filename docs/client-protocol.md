@@ -66,7 +66,7 @@ On success, the server sends `session.ready` followed by one or more bounded ini
     "audio": {
       "input": { "enabled": true, "mimeType": "audio/pcm;rate=24000", "recommendedFrameMs": 50 },
       "output": { "enabled": true, "mimeType": "audio/pcm;rate=24000" },
-      "turnDetection": "disabled"
+      "turnDetection": "server_vad"
     }
   },
   "tasks": {
@@ -127,13 +127,13 @@ PCM audio frame:
 }
 ```
 
-End a push-to-talk stream:
+End a client-detected speech turn (when provider turn detection is disabled):
 
 ```json
 { "type": "audio.end", "id": "audio_end_1" }
 ```
 
-Send `audio.end` whenever the transport stops producing microphone packets. The gateway commits buffered OpenAI audio in both client-owned and provider-VAD modes. It also prevents a late VAD event from starting a second response. Clients should still send `response.cancel` when the user interrupts playback.
+The continuous browser listener sends `audio.end` on local VAD silence only when turn detection is disabled; provider-VAD sessions receive the silence tail and finalize their own turns. Other clients send `audio.end` whenever their transport stops producing microphone packets. The gateway commits buffered OpenAI audio in both client-owned and provider-VAD modes. It also prevents a late VAD event from starting a second response. Clients should still send `response.cancel` when the user interrupts playback.
 
 For a bound session, the realtime provider calls `continue_hermes_conversation` for canonical chat turns so Hermes owns memory and history. Long or independent work uses `start_background_task`, which returns a fast receipt so voice can continue. There is deliberately no client `task.start`.
 

@@ -78,7 +78,7 @@ OPENAI_API_KEY=... \
 hermes-live provider-smoke
 ```
 
-The default uses `gpt-realtime-2`, `marin`, PCM16, and push-to-talk semantics. `gpt-realtime-1.5` remains available through `OPENAI_REALTIME_MODEL` when you want the faster non-reasoning Realtime path. Some OpenAI transport examples can lag the model guide, so record the exact accepted model in the receipt. Change model, voice, VAD, or G.711 settings only when the target account supports them.
+The default uses `gpt-realtime-2`, `marin`, PCM16, and automatic server VAD turn detection. `gpt-realtime-1.5` remains available through `OPENAI_REALTIME_MODEL` when you want the faster non-reasoning Realtime path. Some OpenAI transport examples can lag the model guide, so record the exact accepted model in the receipt. Change model, voice, VAD, or G.711 settings only when the target account supports them.
 
 ## End-to-end release check
 
@@ -99,3 +99,5 @@ Do not call a provider or model supported from a successful connection alone. Re
 - [Hugging Face speech-to-speech](https://github.com/huggingface/speech-to-speech)
 - [OpenAI Realtime](https://developers.openai.com/api/docs/guides/realtime)
 - [Gemini Live API](https://ai.google.dev/gemini-api/docs/live-api)
+
+See [continuous voice automation](voice-v2.md#automated-checks) for PCM VAD, local S2S, real Hermes HTTP reach, and Playwright browser tests.

@@ -335,7 +335,7 @@ describe("HTTP server", () => {
     });
   });
 
-  it("does not serve standalone browser UI assets from the gateway", async () => {
+  it("serves the continuous browser UI and exact asset allowlist", async () => {
     const server = await startServer({
       config: testConfig(),
       hermes: fakeHermes(),
@@ -344,9 +344,9 @@ describe("HTTP server", () => {
     });
     openServers.push(server);
 
-    expect(await fetch(`${server.url}/`).then((res) => res.status)).toBe(404);
-    expect(await fetch(`${server.url}/hermes-live-client.js`).then((res) => res.status)).toBe(404);
-    expect(await fetch(`${server.url}/mic-worklet.js`).then((res) => res.status)).toBe(404);
+    expect(await fetch(`${server.url}/`).then((res) => res.status)).toBe(200);
+    expect(await fetch(`${server.url}/hermes-live-client.js`).then((res) => res.status)).toBe(200);
+    expect(await fetch(`${server.url}/mic-worklet.js`).then((res) => res.status)).toBe(200);
     const capabilities = await fetch(`${server.url}/v1/capabilities`).then((res) => res.json());
     expect(capabilities.features).not.toHaveProperty("browser_demo");
   });

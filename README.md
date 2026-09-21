@@ -158,3 +158,5 @@ For any non-loopback gateway bind, use a strong `HERMES_LIVE_AUTH_TOKEN`, an exa
 ## License
 
 [MIT](LICENSE). This is a community project, not an official NousResearch distribution.
+
+The gateway also serves a [continuous browser voice console](docs/voice-v2.md) at `http://127.0.0.1:8788/`, with automatic microphone capture, VAD turn detection, mute/unmute and an audio-reactive canvas.

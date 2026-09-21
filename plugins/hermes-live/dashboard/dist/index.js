@@ -161,9 +161,7 @@
   }
 
   function microphoneActiveGuidance(turnDetection) {
-    return turnDetection === "disabled"
-      ? "Push to talk is active. Speak, then stop the microphone to submit this turn."
-      : "Speak naturally. You can interrupt Hermes at any time.";
+    return "Speak naturally. Pauses end your turn; speaking interrupts Hermes.";
   }
 
   function connectedSessionNotice(inputAudio, browserMicSupported, listening) {
@@ -179,7 +177,7 @@
 
   function connectedSessionGuidance(browserMicSupported) {
     return browserMicSupported
-      ? "Start the microphone or type a message below."
+      ? "Unmute or type a message below."
       : "Type a message below.";
   }
 
@@ -356,6 +354,8 @@
 
     const clientRef = useRef(null);
     const audioRef = useRef(null);
+    const canvasRef = useRef(null);
+    const visualizerRef = useRef(null);
     const ensureAudioRef = useRef(null);
     const audioUnsubscribersRef = useRef([]);
     const transcriptSequence = useRef(0);
@@ -461,6 +461,8 @@
               workletUrl: new URL("mic-worklet.js", assetBase).href,
             });
             audioRef.current = audio;
+            if (visualizerRef.current) visualizerRef.current.dispose();
+            if (canvasRef.current) visualizerRef.current = new module.HermesVoiceVisualizer(canvasRef.current, audio, client);
             audioUnsubscribersRef.current = [
               audio.on("microphone", function (event) {
                 if (active) setMicrophone(event);
@@ -556,18 +558,18 @@
               if (!active) return;
               const audio = audioRef.current;
               if (!audio) {
-                setNotice({ tone: "neutral", text: "Listening is paused. Press Start microphone when you want to resume." });
+                setNotice({ tone: "neutral", text: "Listening is paused. Press Unmute when you want to resume." });
                 return;
               }
               void audio.stopMicrophone({ endTurn: false }).then(function () {
                 if (active) setNotice({
                   tone: "neutral",
-                  text: "Listening paused by voice command. Press Start microphone when you want to resume.",
+                  text: "Listening paused by voice command. Press Unmute when you want to resume.",
                 });
               }).catch(function (error) {
                 if (active) setNotice({
                   tone: "warning",
-                  text: friendlyError(error, "The microphone pause did not finish. Press Pause microphone."),
+                  text: friendlyError(error, "The microphone pause did not finish. Press Mute."),
                 });
               });
             }),
@@ -611,6 +613,7 @@
               ));
             }),
           );
+          connect();
         })
         .catch(function (error) {
           if (!active) return;
@@ -624,6 +627,7 @@
       return function () {
         active = false;
         ensureAudioRef.current = null;
+        if (visualizerRef.current) visualizerRef.current.dispose();
         clientUnsubscribers.forEach(function (unsubscribe) { unsubscribe(); });
         detachAudioListeners();
         const audio = audioRef.current;
@@ -692,7 +696,7 @@
                   tone: "warning",
                   text: friendlyError(
                     microphoneStart.error,
-                    "Live Voice connected, but microphone access failed. Allow it and press Start microphone.",
+                    "Live Voice connected, but microphone access failed. Allow it and press Unmute.",
                   ),
                 }
               : {
@@ -938,16 +942,7 @@
             ),
             h(StatusPill, { tone: connection.tone }, connection.label),
           ),
-          h("div", {
-            className: "hlv-orb" +
-              (microphone.active ? " hlv-orb--listening" : "") +
-              (playback.active ? " hlv-orb--speaking" : ""),
-            "aria-hidden": "true",
-          },
-            h("span", { className: "hlv-orb__ring hlv-orb__ring--one" }),
-            h("span", { className: "hlv-orb__ring hlv-orb__ring--two" }),
-            h("span", { className: "hlv-orb__core" }, microphone.active ? "\u25cf" : playback.active ? "\u223F" : "H"),
-          ),
+          h("canvas", { ref: canvasRef, className: "hlv-voice-field", "aria-label": "Voice activity visualization" }),
           h("div", { className: "hlv-console__state", "aria-live": "polite" },
             h("strong", null,
               microphone.state === "starting" ? "Requesting microphone\u2026" :
@@ -1008,7 +1003,7 @@
                   onClick: stopMicrophone,
                 }, busyAction === "microphone"
                   ? "Stopping\u2026"
-                  : audioCapabilities.turnDetection === "disabled" ? "Stop & send turn" : "Stop microphone")
+                  : "Mute")
               : h(ControlButton, {
                   variant: "secondary",
                   pressed: false,
@@ -1016,14 +1011,7 @@
                   title: !browserMicSupported ? "This session does not expose browser-compatible PCM microphone input." : "",
                   icon: "\u25cf",
                   onClick: startMicrophone,
-                }, busyAction === "microphone" ? "Starting\u2026" : "Start microphone"),
-            h(ControlButton, {
-              variant: "warning",
-              disabled: !connected,
-              icon: "\u2016",
-              onClick: interruptSpeech,
-              title: "Cancel only the current assistant response.",
-            }, "Interrupt speech"),
+                }, busyAction === "microphone" ? "Starting\u2026" : "Unmute"),
           ),
           !browserMicSupported && connected ? h("p", { className: "hlv-inline-warning" },
             inputAudio.enabled === false

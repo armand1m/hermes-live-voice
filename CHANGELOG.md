@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Restore a cwd-independent browser voice console at the gateway root, automatically connect the Dashboard voice tab, and replace manual turn submission with continuous PCM VAD and mute/unmute. Preserve the authenticated Dashboard relay and existing provider/task protocol.
+- Default to offline local voice and OpenAI server VAD when explicitly selected. Retry transient single-pipeline busy errors for stock local servers as well as managed runtimes.
+- Add a shared canvas voice field with microphone-reactive rings, thinking particles, playback AnalyserNode spectrum petals, and reduced-motion support.
+- Add synthetic PCM VAD tests, real local S2S audio contracts, ephemeral gateway-to-Hermes HTTP round trips (including the running local API), and Playwright fake-microphone browser automation to verification/CI. See [validation and configuration](docs/voice-v2.md).
+
 ## 1.1.3 - 2026-09-07
 
 - Merge the pending Node 22 Docker image refresh and CodeQL action updates from dependency PRs #78 and #75.

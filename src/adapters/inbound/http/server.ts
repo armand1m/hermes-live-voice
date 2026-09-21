@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -389,6 +390,28 @@ async function handleHttp(
     return;
   }
   const url = parseRequestTarget(req.url);
+
+  // Exact allowlist, resolved against the installed module (never process.cwd).
+  const browserFiles: Record<string, [string, string]> = {
+    "/": ["index.html", "text/html; charset=utf-8"],
+    "/voice.js": ["voice.js", "text/javascript; charset=utf-8"],
+    "/voice.css": ["voice.css", "text/css; charset=utf-8"],
+    "/hermes-live-client.js": ["hermes-live-client.js", "text/javascript; charset=utf-8"],
+    "/mic-worklet.js": ["mic-worklet.js", "text/javascript; charset=utf-8"],
+  };
+  const asset = browserFiles[url.pathname];
+  if (asset) {
+    if (!isGetOrHead(req)) { methodNotAllowed(req, res, "GET, HEAD"); return; }
+    const content = await readFile(new URL(`../../../../clients/browser/${asset[0]}`, import.meta.url));
+    res.writeHead(200, {
+      "Content-Type": asset[1], "Content-Length": content.length,
+      "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+    });
+    res.end(req.method === "HEAD" ? undefined : content);
+    return;
+  }
 
   if (url.pathname === "/health") {
     if (!isGetOrHead(req)) {

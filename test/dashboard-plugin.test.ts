@@ -93,7 +93,7 @@ describe("Hermes Dashboard plugin", () => {
     expect(source).toContain("Interrupt speech");
     expect(source).toContain("Stop task");
     expect(source).toContain('client.on("input.pause_requested"');
-    expect(source).toContain('text: "Listening paused by voice command. Press Start microphone when you want to resume."');
+    expect(source).toContain('text: "Listening paused by voice command. Press Unmute when you want to resume."');
     expect(source).toContain("audio.stopMicrophone({ endTurn: false })");
     expect(source).toContain("audio.clearPlayback()");
     expect(source).toContain("audio.primePlayback()");
@@ -234,13 +234,13 @@ describe("Hermes Dashboard plugin", () => {
   it("gives accurate microphone and text-only guidance from negotiated capabilities", () => {
     const utilities = loadDashboardUtilities();
 
-    expect(utilities.microphoneActiveGuidance("disabled")).toContain("stop the microphone to submit");
+    expect(utilities.microphoneActiveGuidance("disabled")).toContain("Pauses end your turn");
     expect(utilities.microphoneActiveGuidance("semantic_vad")).toContain("Speak naturally");
     expect(utilities.connectedSessionNotice({ enabled: false }, false))
       .toBe("Live Voice is connected in text mode. Type a message to Hermes.");
     expect(utilities.connectedSessionGuidance(false)).toBe("Type a message below.");
     expect(utilities.connectedSessionNotice({ enabled: true }, true, true)).toContain("Connected and listening");
-    expect(utilities.connectedSessionGuidance(true)).toContain("Start the microphone");
+    expect(utilities.connectedSessionGuidance(true)).toContain("Unmute");
     expect(utilities.supportsBrowserPlayback({ enabled: false })).toBe(false);
     expect(utilities.supportsBrowserPlayback({ enabled: true, mimeType: "audio/pcm;rate=24000" })).toBe(true);
     expect(utilities.supportsBrowserPlayback({ enabled: true, mimeType: "audio/opus" })).toBe(false);
