@@ -100,6 +100,9 @@ export class LiveGatewaySession {
   private unsubscribeTasks?: () => void;
   private readonly pendingTaskRecords = new Map<string, TaskRecord>();
   private readonly pendingNotifications = new Map<string, TaskRecord>();
+  private progressWatcherTask?: TaskRecord;
+  private progressWatcherTimer?: ReturnType<typeof setTimeout>;
+  private progressWatcherLastAt = 0;
   private readonly claimedNotifications = new Map<string, TaskRecord>();
   private readonly notificationDeliveryAttempts = new Map<string, number>();
   private notificationFlushRunning = false;
@@ -709,7 +712,7 @@ export class LiveGatewaySession {
           ...(resourceKeys ? { resourceKeys } : {}),
           ...(this.conversation.sessionId ? { originConversationId: this.conversation.sessionId } : {}),
         }), "Background task could not be accepted safely.").then((task) => ({
-          spoken_response: "I've started that in the background. You can keep talking.",
+          spoken_response: "Nice, I just spun up that task and started a watcher to keep an eye on it. I’ll keep you posted as it reaches meaningful milestones, and you can keep talking.",
           ok: true,
           task_id: task.taskId,
           status: task.status,
@@ -1146,7 +1149,46 @@ export class LiveGatewaySession {
       this.pendingNotifications.delete(record.taskId);
       this.notificationDeliveryAttempts.delete(record.taskId);
     }
+    if (latestType === "progress" && record.status === "running") this.scheduleProgressWatcher(record);
     this.scheduleNotificationFlush();
+  }
+
+  private scheduleProgressWatcher(record: TaskRecord): void {
+    this.progressWatcherTask = structuredClone(record);
+    if (this.progressWatcherTimer !== undefined) return;
+    const wait = Math.max(0, 15_000 - (Date.now() - this.progressWatcherLastAt));
+    this.progressWatcherTimer = setTimeout(() => {
+      this.progressWatcherTimer = undefined;
+      void this.flushProgressWatcher();
+    }, wait);
+    this.progressWatcherTimer.unref?.();
+  }
+
+  private async flushProgressWatcher(): Promise<void> {
+    const record = this.progressWatcherTask;
+    if (!record || this.closing) return;
+    if (!this.liveSession?.sendTaskNotification || this.providerResponseActive || this.providerTurnResponseExpected || this.userSpeaking || this.notificationResponsePending) {
+      this.scheduleProgressWatcher(record);
+      return;
+    }
+    this.progressWatcherTask = undefined;
+    this.progressWatcherLastAt = Date.now();
+    this.notificationResponsePending = true;
+    const title = record.title.slice(0, 120);
+    const announcement = `I'm watching the background task "${title}" and will update you when it reaches a meaningful milestone.`;
+    const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
+    try {
+      await withAbortAndDeadline(
+        this.liveSession.sendTaskNotification({ context, announcement }),
+        this.abort.signal,
+        MAX_PROVIDER_IO_WAIT_MS,
+        "Realtime provider task watcher notification did not settle before the safety deadline.",
+      );
+      if (this.notificationResponsePending) this.armNotificationResponseWatchdog();
+    } catch (error) {
+      this.notificationResponsePending = false;
+      if (!this.closing) this.deps.logger.warn("failed to deliver task watcher update", { sessionId: this.id, error: errorToMessage(error) });
+    }
   }
 
   private scheduleNotificationFlush(): void {
@@ -1396,6 +1438,9 @@ export class LiveGatewaySession {
     this.unsubscribeTasks?.();
     this.unsubscribeTasks = undefined;
     this.pendingTaskRecords.clear();
+    if (this.progressWatcherTimer !== undefined) clearTimeout(this.progressWatcherTimer);
+    this.progressWatcherTimer = undefined;
+    this.progressWatcherTask = undefined;
     if (this.notificationRetryTimer !== undefined) {
       clearTimeout(this.notificationRetryTimer);
       this.notificationRetryTimer = undefined;
