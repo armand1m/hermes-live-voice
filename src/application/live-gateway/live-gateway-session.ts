@@ -199,15 +199,20 @@ export class LiveGatewaySession {
 
       const connect = this.deps.liveModel.connect({
         sessionId: this.id,
-        systemInstruction: buildSystemInstruction(
-          this.notificationToken,
-          this.deps.config.tasks.trustDeclaredReadOnly === true,
-          {
-            bound: this.conversation.mode !== "unbound",
-            voiceInputPause: this.protocolVersion >= 6,
-          },
-          this.deps.config.realtime.provider === "local",
-        ),
+        systemInstruction: [
+          buildSystemInstruction(
+            this.notificationToken,
+            this.deps.config.tasks.trustDeclaredReadOnly === true,
+            {
+              bound: this.conversation.mode !== "unbound",
+              voiceInputPause: this.protocolVersion >= 6,
+            },
+            this.deps.config.realtime.provider === "local",
+          ),
+          ...(this.deps.config.hermes.instructions
+            ? [`Personal context and behavior instructions (operator configured):\n${this.deps.config.hermes.instructions}`]
+            : []),
+        ].join("\n\n"),
         availableTools: this.availableProviderTools(),
         safetyIdentifier: safetyIdentifierForSessionKey(this.sessionKey),
         callbacks: {
