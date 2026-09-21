@@ -2,6 +2,8 @@ import { HermesLiveClient, HermesLiveAudio, HermesVoiceVisualizer } from './herm
 const state = document.querySelector('#state');
 const detail = document.querySelector('#detail');
 const mute = document.querySelector('#mute');
+const taskList = document.querySelector('#tasks');
+const taskCount = document.querySelector('#task-count');
 // Optional operator-supplied token stays in memory, never in HTML or storage.
 const token = new URLSearchParams(location.hash.slice(1)).get('token') || undefined;
 if (location.hash) history.replaceState(null, '', location.pathname + location.search);
@@ -20,6 +22,22 @@ function error(event) { status('error', 'Voice needs attention'); detail.textCon
 client.on('error', error); audio.on('error', error);
 client.on('session.error', error);
 client.on('close', () => { status('offline', 'Disconnected'); mute.disabled = true; });
+function renderTasks(tasks = []) {
+  taskCount.textContent = tasks.length ? `${tasks.length} task${tasks.length === 1 ? '' : 's'}` : 'No tasks';
+  if (!tasks.length) { taskList.innerHTML = '<p class="tasks-empty">Tasks delegated by voice will appear here.</p>'; return; }
+  taskList.replaceChildren(...tasks.slice(0, 20).map(task => {
+    const card = document.createElement('article'); card.className = 'task-card'; card.dataset.state = task.state;
+    const title = document.createElement('strong'); title.textContent = task.title || `Task ${task.taskId.slice(0, 8)}`;
+    const state = document.createElement('span'); state.className = 'task-state'; state.textContent = task.state;
+    const detail = document.createElement('p'); detail.textContent = task.progress?.message || task.result?.summary || task.error?.message || (task.state === 'running' ? 'Working…' : '');
+    card.append(title, state, detail);
+    if (task.error?.message && /approval|permission|authorize|pending/i.test(task.error.message)) {
+      const notice = document.createElement('em'); notice.textContent = 'Needs your approval in the Hermes dashboard'; card.append(notice);
+    }
+    return card;
+  }));
+}
+client.on('tasks.changed', ({ tasks }) => renderTasks(tasks));
 audio.on('microphone', event => {
   mute.textContent = event.active ? 'Mute' : 'Unmute';
   mute.setAttribute('aria-pressed', String(!event.active));
@@ -53,4 +71,7 @@ try {
   mute.disabled = false;
   await audio.startMicrophone();
 } catch (e) { error(e); mute.textContent = 'Unmute'; }
-window.addEventListener('pagehide', () => { visualizer.dispose(); void audio.dispose(); void client.disconnect(); }, { once: true });
+window.addEventListener('pagehide', (event) => {
+  if (event.persisted) return;
+  visualizer.dispose(); void audio.dispose(); void client.disconnect();
+}, { once: true });
