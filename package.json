@@ -75,6 +75,7 @@
     "assets/banner.svg",
     "assets/huggingface-realtime-entry.py",
     "assets/live-voice-dashboard.jpg",
+    "assets/models/silero_vad.onnx",
     "docs/architecture.md",
     "docs/background-tasks.md",
     "docs/client-protocol.md",
@@ -95,6 +96,9 @@
     "clients/browser/entity-state.js",
     "clients/browser/entity-gl.js",
     "clients/browser/entity-head.js",
+    "clients/browser/entity-facekit.js",
+    "clients/browser/facekit-data.js",
+    "clients/browser/FACEKIT-LICENSE.txt",
     "clients/browser/entity-scene.js",
     "clients/browser/entity-debug.js",
     "clients/browser/index.html",
@@ -154,5 +158,8 @@
   },
   "peerDependencies": {
     "zod": "^3.25.76 || ^4.5.4"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node": "^1.30.0"
   }
 }

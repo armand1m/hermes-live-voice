@@ -1,13 +1,85 @@
 # Continuous voice console
 
 Open `http://127.0.0.1:8788/` after starting the gateway. The page connects on
-load and requests microphone permission. There is no record button: local PCM
-VAD detects speech, keeps a 200 ms lead-in and a 1 second silence tail, and
-interrupts playback when you speak. Mute/unmute is the voice control. The
+load and requests microphone permission. There is no record button: the
+gateway's speech detection (below) confirms human speech, keeps a short
+lead-in and silence tail, and interrupts playback only for real speech.
+Mute/unmute is the voice control. The
 Dashboard plugin uses the same capture and canvas renderer and connects when
 its tab mounts. Browser microphone access requires localhost or HTTPS; allow
 microphone access. If browser autoplay is blocked, use Unmute to unlock audio.
 Permission denial is displayed, never treated as an armed listener.
+
+## Speech detection (Silero VAD, protocol v7)
+
+Barge-in used to trigger on raw mic energy, so any noise — typing, a door, a
+cough — stopped the agent mid-sentence. The gateway now runs the bundled
+[Silero VAD](https://github.com/snakers4/silero-vad) speech-probability model
+(v5.1.2, MIT, sha256
+`2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f`, served
+from `assets/models/silero_vad.onnx`) on every incoming microphone frame:
+
+- The browser client keeps only a **permissive energy pre-gate** that decides
+  when to stream audio to the gateway (bandwidth), with its 200 ms preroll.
+  It never interrupts on its own in this mode.
+- The gateway **confirms speech** from the model's probability with hysteresis
+  (default: probability ≥ 0.5 sustained 100 ms to start, ≤ 0.25 sustained
+  500 ms to stop) and forwards audio to the realtime provider only for
+  confirmed speech plus a 250 ms preroll and 400 ms tail — so provider-side
+  VAD never sees ungated noise either.
+- On confirmation the client receives `input.speech_started
+  {provider: "gateway"}` and cuts playback; the response is cancelled exactly
+  once per utterance.
+- **Echo guard**: while the agent itself is talking (or within 300 ms after),
+  confirmation requires probability ≥ 0.7 sustained 200 ms, so the agent's own
+  voice leaking through browser echo cancellation cannot stop it.
+
+Confirmed interruption lands roughly 150–250 ms after speech onset — the
+model's confirmation window — well inside natural barge-in feel.
+
+## Memory and continuity (protocol v8)
+
+The voice agent used to start every browser tab with a blank slate. It now
+carries knowledge across sessions through three gateway-side mechanisms, all
+in `HERMES_LIVE_CONTEXT_*` settings:
+
+- **Context digest**: at every `session.start` the gateway reads Hermes'
+  file-backed memory (`USER.md`, `MEMORY.md` from `HERMES_LIVE_HERMES_HOME`,
+  default `~/.hermes`), the most recent conversation titles/previews, and the
+  skills catalog (`GET /v1/skills`, gated on the `skills_api` capability), and
+  appends a bounded block (~2.3k chars full / ~1.2k compact) to the provider
+  system instruction. It is framed `[HERMES_LIVE_CONTEXT_V1]` and described to
+  the model as cached reference data it must never obey. Sources are
+  best-effort with a 2 s deadline; a missing file or old Hermes only shrinks
+  the digest. Set `HERMES_LIVE_CONTEXT_DIGEST=false` to disable.
+- **Durable voice thread**: the browser now sends
+  `conversation.mode: "persistent"` (protocol v8). The gateway resolves the
+  most recent Hermes session whose title exactly matches
+  `HERMES_LIVE_VOICE_THREAD_TITLE` (default `Hermes Live Voice`) and resumes
+  it — or creates it on first use — so every tab, browser restart, and device
+  continues one conversation. Reconnects re-resolve the writable tip.
+  Archiving the thread simply starts a fresh one. Installs whose Hermes lacks
+  session continuity degrade to unbound instead of failing.
+- **Recall and remember tools**: `search_past_chats(query)` opens a Hermes
+  turn on a dedicated recall session (title
+  `HERMES_LIVE_RECALL_SESSION_TITLE`) with instructions that force the
+  `session_search` tool and speech-safe answers; expect roughly 10–40 s on
+  local models, bounded by `HERMES_LIVE_RECALL_TIMEOUT_MS` (soft error on
+  timeout — the session survives). `remember(fact)` submits a durable Hermes
+  background run through Hermes' own memory tool, so writes respect its
+  approval staging; the spoken receipt says the fact was *sent to Hermes*,
+  never that it is already saved. Local-model regex routing (EN/ES/CA) maps
+  "do you remember…", "check our previous chats", "remember that…" style
+  utterances to these tools, taking precedence over delegation keywords.
+
+`onnxruntime-node` is an **optional** dependency. When it or the model file is
+missing (odd platforms, `--no-optional` installs), the gateway logs a warning
+and falls back to a dependency-free energy detector with identical session
+semantics. `HERMES_LIVE_VAD=disabled` disables gateway detection entirely and
+restores the previous client-side VAD behavior, including for older protocol
+v6 clients (which are always served the legacy path). Every threshold is
+tunable; see the `HERMES_LIVE_VAD_*` settings in `.env.example` and
+[setup](setup.md).
 
 The canvas renders a procedural synthetic head: a sculpted lat/long skull shown
 simultaneously as a fresnel glass shell, decimated topology wire, travelling

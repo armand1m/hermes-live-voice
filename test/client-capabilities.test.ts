@@ -29,6 +29,21 @@ describe("realtime client capabilities", () => {
         turnDetection: "semantic_vad",
       },
     });
+    expect(realtimeClientCapabilities(value).audio.input).not.toHaveProperty("speechDetection");
+  });
+
+  it("lets PCM sessions delegate speech detection to the gateway while G.711 stays client-side", () => {
+    const pcm = config({ provider: "openai", model: "gpt-realtime" });
+    expect(realtimeClientCapabilities(pcm, { gatewaySpeechDetection: true }).audio.input.speechDetection)
+      .toBe("gateway");
+    expect(realtimeClientCapabilities(pcm).audio.input.speechDetection).toBeUndefined();
+    expect(realtimeClientCapabilities(pcm, { gatewaySpeechDetection: false }).audio.input.speechDetection)
+      .toBeUndefined();
+
+    const g711 = config({ provider: "openai", model: "gpt-realtime" });
+    g711.openai.inputAudioFormat = "g711_ulaw";
+    expect(realtimeClientCapabilities(g711, { gatewaySpeechDetection: true }).audio.input.speechDetection)
+      .toBeUndefined();
   });
 
   it("advertises the Hugging Face OpenAI Realtime 24 kHz PCM wire contract", () => {
@@ -39,8 +54,8 @@ describe("realtime client capabilities", () => {
       provider: "local",
       model: "huggingface/speech-to-speech",
       audio: {
-      input: { enabled: true, mimeType: "audio/pcm;rate=24000", recommendedFrameMs: 40 },
-      output: { enabled: true, mimeType: "audio/pcm;rate=24000" },
+        input: { enabled: true, mimeType: "audio/pcm;rate=24000", recommendedFrameMs: 40 },
+        output: { enabled: true, mimeType: "audio/pcm;rate=24000" },
         turnDetection: "provider",
       },
     });

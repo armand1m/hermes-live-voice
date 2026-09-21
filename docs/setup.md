@@ -131,6 +131,17 @@ Common settings:
 | `HERMES_LIVE_TRUST_DECLARED_READ_ONLY` | `false` | Allow declared read-only work to share slots |
 | `OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL` | `gpt-4o-mini-transcribe` | OpenAI user transcript model, or `disabled` |
 | `OPENAI_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE` | unset | Optional lowercase ISO-639-1 language hint |
+| `HERMES_LIVE_HERMES_HOME` | `~/.hermes` | Hermes home used to read memory files for the voice context digest |
+| `HERMES_LIVE_CONTEXT_DIGEST` | `true` | Inject Hermes memory, recent chats, and skills into each voice session's system instruction |
+| `HERMES_LIVE_VOICE_THREAD_TITLE` | `Hermes Live Voice` | Exact title of the durable per-user voice conversation (protocol v8 persistent mode) |
+| `HERMES_LIVE_RECALL_SESSION_TITLE` | `Hermes Live Voice Recall` | Title of the dedicated Hermes session behind `search_past_chats` |
+| `HERMES_LIVE_RECALL_TIMEOUT_MS` | `30000` | Deadline for a past-chat recall turn before a soft error is spoken |
+| `HERMES_LIVE_VAD` | `smart` | Gateway speech detection: `smart` (bundled Silero model), `energy` (dependency-free fallback), or `disabled` (client-side VAD) |
+| `HERMES_LIVE_VAD_MODEL` | bundled `assets/models/silero_vad.onnx` | Absolute path override for the Silero VAD model |
+| `HERMES_LIVE_VAD_START_PROBABILITY` / `HERMES_LIVE_VAD_START_SUSTAIN_MS` | `0.5` / `100` | Speech-start confirmation (probability and sustain window) |
+| `HERMES_LIVE_VAD_STOP_PROBABILITY` / `HERMES_LIVE_VAD_STOP_SUSTAIN_MS` | `0.25` / `500` | Speech-stop confirmation |
+| `HERMES_LIVE_VAD_ECHO_START_PROBABILITY` / `HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS` | `0.7` / `200` | Stricter confirmation required while the agent is speaking (speaker echo guard) |
+| `HERMES_LIVE_VAD_PREROLL_MS` / `HERMES_LIVE_VAD_TAIL_MS` | `250` / `400` | Lead-in kept before confirmed speech and silence tail forwarded after it |
 
 Use [.env.example](../.env.example) for containers and `hermes-live print-config` to inspect every resolved value with secrets redacted. `HERMES_LIVE_CONFIG_FILE` selects a different managed file.
 

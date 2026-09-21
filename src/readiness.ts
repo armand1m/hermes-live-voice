@@ -1,3 +1,5 @@
+import { existsSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   assertGatewayExposureConfig,
   assertHermesApiConfig,
@@ -26,6 +28,7 @@ export interface ReadinessReport {
   hermes: ReadinessSection;
   realtime: ReadinessSection;
   tasks: ReadinessSection;
+  context: ReadinessSection;
 }
 
 export interface TaskRuntimeHealthPort {
@@ -52,6 +55,33 @@ export async function buildReadinessReport(config: AppConfig, options: BuildRead
     hermes,
     realtime,
     tasks,
+    context: checkContextConfig(config),
+  };
+}
+
+/**
+ * Voice memory context never fails readiness: a missing Hermes home or memory
+ * files only means the digest runs with fewer sections.
+ */
+function checkContextConfig(config: AppConfig): ReadinessSection {
+  const memories = join(config.context.hermesHome, "memories");
+  const memoryFile = (name: string): boolean | "unreadable" => {
+    try {
+      return statSync(join(memories, name)).isFile();
+    } catch {
+      return existsSync(memories) ? false : "unreadable";
+    }
+  };
+  return {
+    ok: true,
+    digest: config.context.digestEnabled,
+    hermesHome: config.context.hermesHome,
+    voiceThreadTitle: config.context.voiceThreadTitle,
+    recallTimeoutMs: config.context.recallTimeoutMs,
+    memoryFiles: {
+      memory: memoryFile("MEMORY.md"),
+      user: memoryFile("USER.md"),
+    },
   };
 }
 

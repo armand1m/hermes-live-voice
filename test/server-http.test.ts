@@ -196,8 +196,8 @@ describe("HTTP server", () => {
     });
     await expect(fetch(`${server.url}/v1/capabilities`).then((res) => res.json())).resolves.toMatchObject({
       object: "hermes_live.capabilities",
-      protocolVersion: 6,
-      supportedProtocolVersions: [3, 4, 5, 6],
+      protocolVersion: 8,
+      supportedProtocolVersions: [3, 4, 5, 6, 7, 8],
       realtime: {
         provider: "openai",
         model: "gpt-realtime-2",
@@ -229,6 +229,7 @@ describe("HTTP server", () => {
         maxRetained: 200,
       },
       features: {
+        gateway_speech_vad: true,
         hermes_conversations: true,
         conversation_create: true,
         conversation_resume: true,
@@ -347,6 +348,11 @@ describe("HTTP server", () => {
     expect(await fetch(`${server.url}/`).then((res) => res.status)).toBe(200);
     expect(await fetch(`${server.url}/hermes-live-client.js`).then((res) => res.status)).toBe(200);
     expect(await fetch(`${server.url}/mic-worklet.js`).then((res) => res.status)).toBe(200);
+    for (const asset of ["entity-facekit.js", "facekit-data.js", "FACEKIT-LICENSE.txt"]) {
+      const response = await fetch(`${server.url}/${asset}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-security-policy")).toContain("script-src 'self'");
+    }
     const capabilities = await fetch(`${server.url}/v1/capabilities`).then((res) => res.json());
     expect(capabilities.features).not.toHaveProperty("browser_demo");
   });
@@ -996,6 +1002,8 @@ function testConfig(
       outputAudioFormat: "pcm16",
       ...overrides.openai,
     },
+    vad: testVadConfig(),
+    context: testContextConfig(),
   };
 }
 
@@ -1003,6 +1011,30 @@ function createTaskStateFile(prefix: string): string {
   const directory = mkdtempSync(join(taskStateDirectory, prefix));
   taskStateDirectories.push(directory);
   return join(directory, "tasks-v1.json");
+}
+
+function testContextConfig(): AppConfig["context"] {
+  return {
+    hermesHome: "/nonexistent-hermes-home",
+    digestEnabled: true,
+    voiceThreadTitle: "Hermes Live Voice",
+    recallSessionTitle: "Hermes Live Voice Recall",
+    recallTimeoutMs: 30_000,
+  };
+}
+
+function testVadConfig(): AppConfig["vad"] {
+  return {
+    engine: "smart",
+    startProbability: 0.5,
+    stopProbability: 0.25,
+    startSustainMs: 100,
+    stopSustainMs: 500,
+    echoStartProbability: 0.7,
+    echoStartSustainMs: 200,
+    prerollMs: 250,
+    tailMs: 400,
+  };
 }
 
 function fakeLogger(): Logger {

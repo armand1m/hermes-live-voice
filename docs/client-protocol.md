@@ -1,12 +1,12 @@
 # Client Protocol
 
-Hermes Live protocol v6 is strict JSON over WebSocket:
+Hermes Live protocol v8 is strict JSON over WebSocket:
 
 ```txt
 ws://127.0.0.1:8788/v1/live
 ```
 
-Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. The gateway still accepts v3-v5 clients; new clients should send v6.
+Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. Protocol v7 moved speech confirmation into the gateway (Silero VAD) and added `input.speech_started`/`input.speech_stopped` with `provider: "gateway"`. Protocol v8 adds `conversation.mode: "persistent"`: the gateway resolves the durable per-user voice thread (most recent Hermes session with the configured title, else a fresh one) and reports it back as `new` or `resume`; reconnects re-resolve the tip, so every device continues the same conversation. The gateway still accepts v3-v7 clients; new clients should send v8.
 
 The TypeScript schemas in `src/domain/protocol/` and the browser validator in `clients/browser/hermes-live-client.js` are the normative contract.
 
@@ -35,7 +35,7 @@ The first client message must be:
 {
   "type": "session.start",
   "id": "start_1",
-  "protocolVersion": 6,
+  "protocolVersion": 8,
   "conversation": { "mode": "resume", "sessionId": "saved_session_id" }
 }
 ```
@@ -47,7 +47,7 @@ On success, the server sends `session.ready` followed by one or more bounded ini
 ```json
 {
   "type": "session.ready",
-  "protocolVersion": 6,
+  "protocolVersion": 8,
   "requestId": "start_1",
   "sessionId": "live_...",
   "model": "gpt-realtime-2",
@@ -64,7 +64,7 @@ On success, the server sends `session.ready` followed by one or more bounded ini
     "provider": "openai",
     "model": "gpt-realtime-2",
     "audio": {
-      "input": { "enabled": true, "mimeType": "audio/pcm;rate=24000", "recommendedFrameMs": 50 },
+      "input": { "enabled": true, "mimeType": "audio/pcm;rate=24000", "recommendedFrameMs": 50, "speechDetection": "gateway" },
       "output": { "enabled": true, "mimeType": "audio/pcm;rate=24000" },
       "turnDetection": "server_vad"
     }
@@ -133,7 +133,7 @@ End a client-detected speech turn (when provider turn detection is disabled):
 { "type": "audio.end", "id": "audio_end_1" }
 ```
 
-The continuous browser listener sends `audio.end` on local VAD silence only when turn detection is disabled; provider-VAD sessions receive the silence tail and finalize their own turns. Other clients send `audio.end` whenever their transport stops producing microphone packets. The gateway commits buffered OpenAI audio in both client-owned and provider-VAD modes. It also prevents a late VAD event from starting a second response. Clients should still send `response.cancel` when the user interrupts playback.
+The continuous browser listener sends `audio.end` on local VAD silence only when turn detection is disabled; provider-VAD sessions receive the silence tail and finalize their own turns. In gateway-detection sessions the browser instead ends the turn when the gateway confirms `input.speech_stopped {provider: "gateway"}`. Other clients send `audio.end` whenever their transport stops producing microphone packets. The gateway commits buffered OpenAI audio in both client-owned and provider-VAD modes. It also prevents a late VAD event from starting a second response. Clients outside gateway-detection mode should still send `response.cancel` when the user interrupts playback.
 
 For a bound session, the realtime provider calls `continue_hermes_conversation` for canonical chat turns so Hermes owns memory and history. Long or independent work uses `start_background_task`, which returns a fast receipt so voice can continue. There is deliberately no client `task.start`.
 
@@ -141,7 +141,7 @@ Server conversation events are:
 
 - `transcript.delta` with `speaker`, `text`, and optional `final`;
 - `audio.output` with base64 data, MIME type, and optional playback correlation;
-- `input.speech_started` for OpenAI or local VAD;
+- `input.speech_started` for OpenAI, local, or gateway VAD (the v7 gateway includes the speech probability it confirmed); `input.speech_stopped {provider: "gateway"}` after a gateway-confirmed turn ends;
 - `input.pause_requested` when the user explicitly asks the realtime model to pause listening;
 - `response.started`, `response.completed`, `response.cancelled`, and `response.failed`;
 - bounded `log` and `session.error` messages.
@@ -318,6 +318,8 @@ Cancel the current provider response without touching tasks:
 
 OpenAI uses the optional truncation metadata to keep provider conversation history aligned with what the user actually heard. Local voice cancels through the upstream generation scope without truncation. Gemini handles speech interruption through live audio activity and does not expose an equivalent direct cancel event.
 
+In protocol v7 sessions whose `session.ready` advertises `realtime.audio.input.speechDetection: "gateway"`, the gateway itself decides what is speech: it scores streamed frames with Silero VAD, forwards only confirmed speech (plus a short preroll and silence tail) to the provider, and sends `input.speech_started {provider: "gateway", probability}` when speech is confirmed — including a stricter confirmation while the agent is speaking, so its own voice on speakers cannot interrupt it. The bundled browser client cuts playback and sends `response.cancel` automatically on that event, exactly once per utterance, and ends `disabled`-mode turns on the matching `input.speech_stopped {provider: "gateway"}`. Clients that stream continuously (semantic VAD) keep doing so; the gateway still emits the confirmation events.
+
 When the user explicitly asks to pause or mute listening, a protocol v6 provider may call `pause_voice_input`. The gateway sends:
 
 ```json
@@ -392,7 +394,7 @@ Errors use:
 {
   "type": "session.error",
   "code": "unsupported_protocol_version",
-  "message": "Hermes Live protocol v2 is incompatible with supported protocols v3, v4, v5, v6. Upgrade hermes-live-voice and every connected client to the same release before reconnecting.",
+  "message": "Hermes Live protocol v2 is incompatible with supported protocols v3, v4, v5, v6, v7. Upgrade hermes-live-voice and every connected client to the same release before reconnecting.",
   "requestId": "start_1",
   "recoverable": false
 }

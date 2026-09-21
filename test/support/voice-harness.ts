@@ -10,17 +10,37 @@ import { PcmVoiceActivityDetector } from '../../clients/browser/hermes-live-clie
 
 export async function voiceHarness(hermesEnv?: Record<string, string | undefined>) {
   const observed = { audioFrames: 0, turns: 0, chats: [] as string[], requests: [] as string[], speechReplies: [] as any[] };
+  const sessions = new Map<string, { id: string; title?: string; model: string; last_active: number }>();
   const upstream = createServer(async (req, res) => {
     observed.requests.push(`${req.method} ${req.url}`);
     res.setHeader('Content-Type', 'application/json');
     const reply = (value: unknown) => res.end(JSON.stringify(value));
-    if (req.url === '/v1/capabilities') return reply({ object: 'hermes.capabilities', model: 'hermes-agent', features: Object.fromEntries(['run_submission','run_status','run_events_sse','run_stop','run_approval_response','session_resources','session_chat','session_chat_streaming','model_options','session_model_lock'].map(k => [k,true])) });
-    if (req.url === '/api/model/options') return reply({ model: 'test-llm', provider: 'test' });
-    if (req.url === '/api/sessions') return reply({ object: 'hermes.session', session: { id: 'voice-contract', model: 'test-llm' } });
-    if (req.url === '/api/sessions/voice-contract/chat') {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const route = `${req.method} ${url.pathname}`;
+    if (route === 'GET /v1/capabilities') return reply({ object: 'hermes.capabilities', model: 'hermes-agent', features: Object.fromEntries(['run_submission','run_status','run_events_sse','run_stop','run_approval_response','session_resources','session_chat','session_chat_streaming','model_options','session_model_lock','skills_api'].map(k => [k,true])) });
+    if (route === 'GET /api/model/options') return reply({ model: 'test-llm', provider: 'test' });
+    if (route === 'GET /v1/skills') {
+      return reply({ object: 'list', data: [{ name: 'release-notes', category: 'devops', description: 'Draft release notes' }] });
+    }
+    if (route === 'GET /api/sessions') {
+      const title = url.searchParams.get('title') ?? undefined;
+      const data = [...sessions.values()]
+        .filter((session) => title === undefined || session.title === title)
+        .sort((left, right) => right.last_active - left.last_active)
+        .map((session) => ({ ...session, preview: 'Voice conversation', message_count: 1 }));
+      return reply({ object: 'list', data });
+    }
+    if (route === 'POST /api/sessions') {
+      let body = ''; for await (const chunk of req) body += chunk;
+      const parsed = JSON.parse(body || '{}');
+      const session = { id: `voice-contract-${sessions.size + 1}`, ...(parsed.title ? { title: parsed.title } : {}), model: parsed.model ?? 'test-llm', last_active: Date.now() };
+      sessions.set(session.id, session);
+      return reply({ object: 'hermes.session', session: { ...session } });
+    }
+    if (req.method === 'POST' && url.pathname.startsWith('/api/sessions/') && url.pathname.endsWith('/chat')) {
       let body = ''; for await (const chunk of req) body += chunk;
       observed.chats.push(JSON.parse(body).message);
-      return reply({ object: 'hermes.session.chat.completion', session_id: 'voice-contract', message: { role: 'assistant', content: 'Hello from Hermes.' } });
+      return reply({ object: 'hermes.session.chat.completion', session_id: url.pathname.split('/')[3], message: { role: 'assistant', content: 'Hello from Hermes.' } });
     }
     res.statusCode = 404; return reply({ error: 'unexpected request' });
   });
@@ -62,6 +82,9 @@ export async function voiceHarness(hermesEnv?: Record<string, string | undefined
     HERMES_LIVE_PROVIDER: 'local', HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING: 'true',
     HERMES_LIVE_LOCAL_URL: `ws://127.0.0.1:${(speech.address() as any).port}/v1/realtime`,
     HERMES_LIVE_TASK_STATE_FILE: join(directory, 'tasks.json'),
+    // Keep the e2e digest deterministic: an empty Hermes home skips the
+    // memory-file sections instead of reading this machine's real files.
+    HERMES_LIVE_HERMES_HOME: join(directory, 'hermes-home'),
   });
   config.server.port = 0;
   let gateway: Awaited<ReturnType<typeof startServer>> | undefined;

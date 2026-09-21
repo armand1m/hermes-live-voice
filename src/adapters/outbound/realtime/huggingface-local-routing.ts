@@ -9,6 +9,8 @@ export interface LocalRoutedAction {
   name: Extract<
     LiveToolName,
     | "continue_hermes_conversation"
+    | "search_past_chats"
+    | "remember"
     | "start_background_task"
     | "list_background_tasks"
     | "follow_up_background_task"
@@ -49,6 +51,15 @@ export function isClearLocalWorkRequest(text: string): boolean {
 export function localRoutedAction(text: string): LocalRoutedAction | undefined {
   const value = boundedText(text);
   if (!value) return undefined;
+  // Recall and remember run before the delegation block: delegation verbs
+  // include "search/find/look up" and would otherwise swallow history asks.
+  if (isPastChatRecallRequest(value)) {
+    return { name: "search_past_chats", args: { query: value } };
+  }
+  const rememberedFact = rememberedFactFromUtterance(value);
+  if (rememberedFact) {
+    return { name: "remember", args: { fact: rememberedFact } };
+  }
   if ([
     /^(?:please\s+)?delegate\b/iu,
     /^(?:can|could|would|will)\s+you\s+(?:please\s+)?delegate\b/iu,
@@ -136,6 +147,45 @@ export function localRoutedAction(text: string): LocalRoutedAction | undefined {
     return { name: "list_background_tasks", args: { include_completed: true, summary_only: true } };
   }
   return undefined;
+}
+
+/** History asks that must reach search_past_chats, not work delegation. */
+function isPastChatRecallRequest(value: string): boolean {
+  return [
+    /^(?:please\s+)?(?:do|did|don'?t)\s+you\s+remember\b/iu,
+    /^(?:can|could)\s+you\s+(?:please\s+)?(?:remember|recall|check)\b[\s\S]*\b(?:past|previous|older|earlier|last)\b/iu,
+    /^(?:please\s+)?(?:search|find|look\s+(?:up|through|at|into)|check|go\s+through|dig\s+(?:up|through))\b[\s\S]*\b(?:past|previous|older|old|earlier|last|saved|our|my|the)\s+(?:chats?|conversations?|talks?|discussions?|sessions?|history)\b/iu,
+    /^(?:please\s+)?(?:search|find|look\s+(?:up|through))\b[\s\S]*\b(?:conversation|chat)\s+history\b/iu,
+    /^(?:please\s+)?(?:what|anything)\b[\s\S]*\bfrom\s+(?:our|my|the)\s+(?:past|previous|old|earlier)\s+(?:chats?|conversations?|talks?|sessions?)\b/iu,
+    /^(?:please\s+)?what\s+did\s+we\s+(?:talk\s+about|discuss|say|decide|agree\s+on)\b[\s\S]*\b(?:before|earlier|previously|in\s+(?:(?:an?other|the|my|our)\s+)?(?:previous|past)\s+(?:chat|conversation|session)|last\s+(?:week|month|time))\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:te\s+acuerdas|recuerdas|recuerda\s+lo\s+que\s+hablamos)\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:qu[eé]\s+(?:hablamos|dijimos|decidimos)|de\s+qu[eé]\s+hablamos)\b[\s\S]*\b(?:antes|anterior|anteriormente|la\s+semana\s+pasada)\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:busca|revisa)\b[\s\S]*\b(?:anteriores|pasad[oa]s?|hist[oó]rico)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:et\s+recordes|recordes\s+el\s+que\s+vam\s+parlar)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:qu[eè]\s+vam\s+parlar|qu[eè]\s+vam\s+dir|qu[eè]\s+vam\s+decidir)\b[\s\S]*\b(?:abans|anterior|la\s+setmana\s+passada)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:busca|revisa)\b[\s\S]*\b(?:anteriors|passad[ea]s?|hist[oò]ric)\b/iu,
+  ].some((pattern) => pattern.test(value));
+}
+
+/** Explicit "remember this" utterances; returns the fact to persist. */
+function rememberedFactFromUtterance(value: string): string | undefined {
+  const fact = value
+    .replace(/^(?:please,?\s+)?remember\s+(?:that\s+|this:\s*)?/iu, "")
+    .replace(/^(?:please,?\s+)?keep\s+in\s+mind\s+(?:that\s+)?/iu, "")
+    .replace(/^(?:please,?\s+)?note\s+(?:that\s+|down\s+that\s+)?/iu, "")
+    .replace(/^(?:please,?\s+)?don'?t\s+forget\s+(?:that\s+)?/iu, "")
+    .replace(/^(?:por\s+favor[,\s]+)?recuerda\s+(?:que\s+)?/iu, "")
+    .replace(/^(?:por\s+favor[,\s]+)?apunta\s+(?:que\s+)?/iu, "")
+    .replace(/^(?:por\s+favor[,\s]+)?no\s+olvides\s+(?:que\s+)?/iu, "")
+    .replace(/^(?:si\s+us\s+plau[,\s]+)?recorda\s+(?:que\s+)?/iu, "")
+    .replace(/^(?:si\s+us\s+plau[,\s]+)?apunta\s+(?:que\s+)?/iu, "")
+    .replace(/^(?:si\s+us\s+plau[,\s]+)?no\s+oblidis\s+(?:que\s+)?/iu, "")
+    .trim();
+  if (!fact || fact === value) {
+    // Not an explicit remember utterance unless a prefix was stripped.
+    return undefined;
+  }
+  return fact;
 }
 
 export function buildLocalTaskQuestionResponse(

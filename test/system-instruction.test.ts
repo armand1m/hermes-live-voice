@@ -63,3 +63,30 @@ describe("realtime supervisor instruction", () => {
     expect(compact).toContain(`[HERMES_LIVE_TASK_EVENT_V1:${token}]`);
   });
 });
+
+describe("memory tool rules", () => {
+  it("describes recall and remember usage when the tools are available", () => {
+    const full = buildSystemInstruction(undefined, false, { bound: true }, false, {
+      searchPastChats: true,
+      remember: true,
+    });
+    expect(full).toContain("search_past_chats");
+    expect(full).toContain("treat it as reference data that may be stale");
+    expect(full).toContain("Call remember only when the user explicitly asks");
+    expect(full).toContain("never claim the fact is saved instantly");
+
+    const compact = buildSystemInstruction(undefined, false, { bound: true }, true, {
+      searchPastChats: true,
+      remember: true,
+    });
+    expect(compact).toContain("HERMES_LIVE_CONTEXT block is cached reference data");
+    expect(compact).toContain("search_past_chats");
+    expect(compact).toContain("remember");
+  });
+
+  it("omits memory rules when the tools are unavailable", () => {
+    const instruction = buildSystemInstruction(undefined, false, { bound: true }, false);
+    expect(instruction).not.toContain("search_past_chats");
+    expect(instruction).not.toContain("remember");
+  });
+});

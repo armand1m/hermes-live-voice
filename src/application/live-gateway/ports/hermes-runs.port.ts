@@ -52,7 +52,15 @@ export interface ListHermesSessionsOptions {
   limit?: number;
   offset?: number;
   source?: string;
+  /** Exact-title filter; Hermes matches titles with string equality. */
+  title?: string;
   signal?: AbortSignal;
+}
+
+export interface HermesSkillSummary {
+  name: string;
+  description?: string;
+  category?: string;
 }
 
 export interface CreateHermesSessionOptions {
@@ -141,6 +149,8 @@ export interface HermesRunsPort {
   assertRunsSupported(signal?: AbortSignal): Promise<HermesCapabilities>;
   assertSessionsSupported?(signal?: AbortSignal): Promise<HermesCapabilities>;
   listSessions?(options?: ListHermesSessionsOptions): Promise<HermesSessionSummary[]>;
+  /** Available only when Hermes advertises the skills_api feature. */
+  listSkills?(options?: { signal?: AbortSignal }): Promise<HermesSkillSummary[]>;
   createSession?(options?: CreateHermesSessionOptions): Promise<HermesSessionSummary>;
   getSession?(sessionId: string, signal?: AbortSignal): Promise<HermesSessionSummary>;
   getSessionHistory?(sessionId: string, signal?: AbortSignal): Promise<HermesSessionHistory>;

@@ -27,7 +27,7 @@ describe("PcmNoiseSuppressor", () => {
 });
 
 describe("HermesLiveClient", () => {
-  it("negotiates protocol v6 and sends the exact task command envelopes", async () => {
+  it("negotiates protocol v7 and sends the exact task command envelopes", async () => {
     const client = createClient();
     const connection = client.connect();
     const socket = await nextSocket();
@@ -36,13 +36,13 @@ describe("HermesLiveClient", () => {
     expect(socket.sent[0]).toEqual({
       type: "session.start",
       id: "req_1",
-      protocolVersion: 6,
+      protocolVersion: 8,
       profileId: "demo",
       conversation: { mode: "new" },
     });
     socket.message(readyMessage("live_1"));
 
-    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 6 });
+    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 8 });
     expect(client.connected).toBe(true);
     expect(client.getSnapshot()).toMatchObject({
       connection: "ready",
@@ -78,7 +78,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     expect(socket.sent[0]).toMatchObject({
       type: "session.start",
-      protocolVersion: 6,
+      protocolVersion: 8,
       conversation: { mode: "resume", sessionId: "saved_chat" },
     });
     socket.message({
@@ -958,7 +958,7 @@ describe("HermesLiveClient", () => {
     const connection = client.connect();
     const socket = await nextSocket();
     socket.open();
-    socket.message({ type: "session.ready", protocolVersion: 6 });
+    socket.message({ type: "session.ready", protocolVersion: 8 });
 
     await expect(connection).rejects.toThrow(/requires sessionId/);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
@@ -1197,7 +1197,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     socket.message({ ...readyMessage("legacy"), protocolVersion: 2 });
 
-    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v6.*upgrade/i);
+    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v8.*upgrade/i);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
   });
 });
@@ -1367,6 +1367,53 @@ describe("HermesLiveAudio", () => {
     expect(track.stop).not.toHaveBeenCalled();
     await audio.stopMicrophone({ endTurn: false });
     expect(track.stop).toHaveBeenCalledOnce();
+    await audio.dispose();
+  });
+
+  it.each(["disabled", "server_vad"])("defers to gateway-confirmed speech for %s turns without local interrupts", async (turnDetection) => {
+    const client = { ...audioClient(), session: { realtime: { audio: {
+      input: { enabled: true, mimeType: "audio/pcm;rate=24000", speechDetection: "gateway" }, turnDetection,
+    } } } };
+    const track = { stop: vi.fn() };
+    const port = { onmessage: undefined as ((event: any) => void) | undefined, postMessage: vi.fn(), close: vi.fn(),
+      addEventListener: (_type: string, listener: (event: any) => void) => queueMicrotask(() => listener({ data: { type: "flushed" } })),
+      removeEventListener: vi.fn(),
+    };
+    const audio = createAudio({ client, localVad: true,
+      mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track] }) },
+      audioWorkletNodeFactory: () => ({ port, connect: vi.fn(), disconnect: vi.fn() }),
+    });
+    const starts = vi.fn(), stops = vi.fn();
+    audio.on("input.speech_started", starts);
+    audio.on("input.speech_stopped", stops);
+    await audio.startMicrophone();
+    const silence = new Int16Array(1200);
+    const speech = Int16Array.from({ length: 1200 }, (_, i) => Math.sin(i * 0.08) * 8000);
+    const frame = (samples: Int16Array) => port.onmessage?.({ data: samples.buffer });
+
+    // Quiet lead-in buffers as preroll; nothing is sent and nobody interrupts.
+    for (let i = 0; i < 10; i++) frame(silence);
+    expect(client.sendAudio).toHaveBeenCalledTimes(0);
+    client.cancelResponse.mockClear();
+
+    // Loud audio opens the permissive pre-gate and streams (with preroll),
+    // but the client itself never cancels the response on energy alone.
+    frame(speech); frame(speech); frame(speech);
+    expect(client.cancelResponse).not.toHaveBeenCalled();
+    expect(starts).not.toHaveBeenCalled();
+    expect(client.sendAudio.mock.calls.length).toBeGreaterThan(0);
+
+    // The gateway confirmation is the only barge-in trigger, and it is
+    // idempotent when the provider relays the same start afterwards.
+    client.emit("input.speech_started", { type: "input.speech_started", provider: "gateway", probability: 0.93 });
+    client.emit("input.speech_started", { type: "input.speech_started", provider: "gateway" });
+    expect(starts).toHaveBeenCalledOnce();
+    expect(client.cancelResponse).toHaveBeenCalledOnce();
+
+    // Provider-relayed speech events never drive audio-level emissions twice.
+    client.emit("input.speech_stopped", { type: "input.speech_stopped", provider: "gateway" });
+    expect(stops).toHaveBeenCalledOnce();
+    expect(client.endAudio).toHaveBeenCalledTimes(turnDetection === "disabled" ? 1 : 0);
     await audio.dispose();
   });
 
@@ -1778,7 +1825,7 @@ function createClient(overrides: Record<string, unknown> = {}): HermesLiveClient
 function readyMessage(sessionId: string) {
   return {
     type: "session.ready",
-    protocolVersion: 6,
+    protocolVersion: 8,
     sessionId,
     model: "mock-live",
     hermes: {},

@@ -30,6 +30,7 @@ import {
 } from "../../../domain/protocol/version.js";
 import { realtimeClientCapabilities } from "../../../application/live-gateway/client-capabilities.js";
 import { negotiateHermesApprovalCompatibility } from "../../../application/live-gateway/hermes-approval-compatibility.js";
+import { createSpeechDetectionService, type SpeechDetectionService } from "../../../application/live-gateway/vad/detection-service.js";
 import { HERMES_LIVE_SERVICE_ID } from "../../../service-identity.js";
 
 const SERVER_SESSION_CLOSE_TIMEOUT_MS = 6_000;
@@ -43,6 +44,7 @@ export interface StartServerOptions {
   hermes?: HermesRunsPort;
   liveModel?: LiveModelAdapter;
   taskSupervisor?: TaskSupervisorRuntime;
+  speechDetection?: SpeechDetectionService;
   signal?: AbortSignal;
 }
 
@@ -58,6 +60,7 @@ export async function startServer({
   hermes: providedHermes,
   liveModel: providedLiveModel,
   taskSupervisor: providedTaskSupervisor,
+  speechDetection: providedSpeechDetection,
   signal,
 }: StartServerOptions): Promise<{
   close(): Promise<void>;
@@ -72,6 +75,7 @@ export async function startServer({
   }
   const hermes = providedHermes ?? new HermesClient(config.hermes);
   const liveModel = providedLiveModel ?? createLiveModelAdapter(config);
+  const speechDetection = providedSpeechDetection ?? createSpeechDetectionService(config, logger);
   const taskSupervisor = providedTaskSupervisor ?? new TaskSupervisor({
     store: new FileTaskStore({
       directory: dirname(config.tasks.stateFile),
@@ -187,6 +191,7 @@ export async function startServer({
         liveModel,
         taskSupervisor,
         logger,
+        speechDetection,
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -401,6 +406,9 @@ async function handleHttp(
     "/entity-state.js": ["entity-state.js", "text/javascript; charset=utf-8"],
     "/entity-gl.js": ["entity-gl.js", "text/javascript; charset=utf-8"],
     "/entity-head.js": ["entity-head.js", "text/javascript; charset=utf-8"],
+    "/entity-facekit.js": ["entity-facekit.js", "text/javascript; charset=utf-8"],
+    "/facekit-data.js": ["facekit-data.js", "text/javascript; charset=utf-8"],
+    "/FACEKIT-LICENSE.txt": ["FACEKIT-LICENSE.txt", "text/plain; charset=utf-8"],
     "/entity-scene.js": ["entity-scene.js", "text/javascript; charset=utf-8"],
     "/entity-debug.js": ["entity-debug.js", "text/javascript; charset=utf-8"],
   };
@@ -486,6 +494,9 @@ async function handleHttp(
         auth_required: Boolean(options.config.server.authToken),
         server_managed_identity: !options.config.server.trustClientIdentity,
         max_sessions: options.config.server.maxSessions,
+        gateway_speech_vad: options.config.vad.engine !== "disabled",
+        context_digest: options.config.context.digestEnabled,
+        persistent_voice_thread: true,
         huggingface_local: options.config.realtime.provider === "local",
         gemini_live: options.config.realtime.provider === "gemini",
         openai_realtime: options.config.realtime.provider === "openai",

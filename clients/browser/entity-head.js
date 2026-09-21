@@ -21,7 +21,7 @@ const smoothstep = (a, b, x) => {
 const lerp = (a, b, t) => a + (b - a) * t;
 
 // Head proportions (local space, head roughly spans y ∈ [-1.15, 1.15]).
-const AXES = { x: 0.80, y: 1.04, z: 0.92 };
+const AXES = { x: 0.76, y: 1.08, z: 0.88 };
 
 /** Angular gaussian: chord-distance falloff from a canonical direction. */
 function field(dirX, dirY, dirZ, sigma) {
@@ -58,6 +58,12 @@ const FIELDS = {
 /** Sculpt displacement along the radial direction for a unit direction. */
 function sculpt(x, y, z) {
   let d = 0;
+  // Humanise the seed ellipsoid before adding features: a full cranium,
+  // tapered lower face and flatter side planes give the scan a recognisable
+  // facial silhouette even when only a few points survive the depth cue.
+  d += smoothstep(0.22, 0.82, y) * 0.035;
+  d -= smoothstep(-0.18, -0.72, y) * smoothstep(0.18, 0.72, Math.abs(x)) * 0.075;
+  d -= smoothstep(0.54, 0.92, Math.abs(x)) * smoothstep(-0.2, 0.55, z) * 0.028;
   // Skull base shape: slightly fuller occiput, flatter crown front.
   d += FIELDS.occiput(x, y, z) * 0.03;
   // Brow ridge: a horizontal band above the sockets, strongest frontally.
@@ -66,8 +72,8 @@ function sculpt(x, y, z) {
   d += band * 0.045 * front;
   d += FIELDS.glabella(x, y, z) * 0.012 * front;
   // Eye sockets sink.
-  d -= FIELDS.socketL(x, y, z) * 0.075;
-  d -= FIELDS.socketR(x, y, z) * 0.075;
+  d -= FIELDS.socketL(x, y, z) * 0.092;
+  d -= FIELDS.socketR(x, y, z) * 0.092;
   // Nose: ridge strip growing toward the tip, plus tip and wings.
   if (y > -0.3 && y < 0.16 && z > 0.35) {
     const along = (0.14 - y) / 0.44;
@@ -77,15 +83,15 @@ function sculpt(x, y, z) {
   d += FIELDS.noseWingL(x, y, z) * 0.022;
   d += FIELDS.noseWingR(x, y, z) * 0.022;
   // Cheekbones out, hollows under, mouth plate flattened.
-  d += FIELDS.cheekL(x, y, z) * 0.03;
-  d += FIELDS.cheekR(x, y, z) * 0.03;
+  d += FIELDS.cheekL(x, y, z) * 0.044;
+  d += FIELDS.cheekR(x, y, z) * 0.044;
   d -= FIELDS.hollowL(x, y, z) * 0.022;
   d -= FIELDS.hollowR(x, y, z) * 0.022;
   d -= FIELDS.mouthPlate(x, y, z) * 0.014;
   // Jaw corners, chin, temple pinch.
   d += FIELDS.jawCornerL(x, y, z) * 0.018;
   d += FIELDS.jawCornerR(x, y, z) * 0.018;
-  d += FIELDS.chin(x, y, z) * 0.052;
+  d += FIELDS.chin(x, y, z) * 0.072;
   d -= FIELDS.templeL(x, y, z) * 0.02;
   d -= FIELDS.templeR(x, y, z) * 0.02;
   return d;
@@ -308,7 +314,7 @@ export class AgentHead {
       }
     }
     const wire = [];
-    const wireRingEvery = 2, wireSectorEvery = 3;
+    const wireRingEvery = 3, wireSectorEvery = 4;
     for (let i = 1; i < RINGS; i += wireRingEvery) {
       for (let j = 0; j < SECTORS; j++) {
         wire.push(i * SECTORS + j, i * SECTORS + (j + 1) % SECTORS);
@@ -319,6 +325,13 @@ export class AgentHead {
         wire.push(i * SECTORS + j, (i + 1) * SECTORS + j);
       }
     }
+    // Sparse diagonals break the lat/long globe pattern into a faceted
+    // reconstruction mesh, like a Kinect depth solve rather than a cage.
+    for (let i = 3; i < RINGS - 2; i += 4) {
+      for (let j = (i % 2) * 2; j < SECTORS; j += 4) {
+        wire.push(i * SECTORS + j, (i + 3) * SECTORS + (j + 2) % SECTORS);
+      }
+    }
     const contour = [];
     for (let i = 1; i < RINGS; i += 2) {
       for (let j = 0; j < SECTORS; j++) {
@@ -326,9 +339,12 @@ export class AgentHead {
       }
     }
     const points = [];
-    for (let i = 2; i < RINGS - 1; i += 1) {
-      for (let j = 0; j < SECTORS; j += 2) {
-        points.push(i * SECTORS + j);
+    for (let i = 1; i < RINGS; i += 1) {
+      for (let j = 0; j < SECTORS; j++) {
+        const vi = i * SECTORS + j;
+        const front = normals[vi * 3 + 2];
+        // Dense facial samples, sparse rear-skull context.
+        if (front > 0.02 || ((i * 17 + j * 13) % 7 === 0)) points.push(vi);
       }
     }
 
@@ -371,8 +387,9 @@ export class AgentHead {
     this.basePointSize = new Float32Array(points.length);
     for (let i = 0; i < points.length; i++) {
       const feature = data[points[i] * 4];
-      this.basePointAlpha[i] = 0.1 + feature * 0.3;
-      this.basePointSize[i] = 1.0 + feature * 1.4;
+      const front = clamp(normals[points[i] * 3 + 2] * 0.7 + 0.3);
+      this.basePointAlpha[i] = 0.12 + front * 0.22 + feature * 0.3;
+      this.basePointSize[i] = 0.72 + feature * 0.72;
     }
   }
 
@@ -392,10 +409,10 @@ export class AgentHead {
       // alpha to read as a luminous surface; feature lines (brow, lids,
       // mouth) burn brighter still. Interior crossings stay under control
       // because only a decimated grid draws here.
-      this.lineColors[v * 4] = 0.55 + feature * 0.45;
-      this.lineColors[v * 4 + 1] = 0.75 + feature * 0.25;
-      this.lineColors[v * 4 + 2] = 0.72 + feature * 0.28;
-      this.lineColors[v * 4 + 3] = 0.2 + feature * 0.8 + crown * 0.04;
+      this.lineColors[v * 4] = 0.34 + feature * 0.38;
+      this.lineColors[v * 4 + 1] = 0.88 + feature * 0.12;
+      this.lineColors[v * 4 + 2] = 0.96 + feature * 0.04;
+      this.lineColors[v * 4 + 3] = 0.16 + feature * 0.7 + crown * 0.03;
     }
   }
 
@@ -513,7 +530,8 @@ export class AgentHead {
     const breathe = 1 + breath * (0.006 * Math.sin(time * 0.55 + this.bobPhase) + visual.energy * 0.008 * Math.sin(time * 2.3));
     const bob = breath * 0.012 * Math.sin(time * 0.5 + this.bobPhase);
     const lean = 0.05 * visual.listening + 0.03 * visual.attention * 0.3;
-    mat4.compose(this.model, 0, bob, lean, this.rotX, this.rotY, this.rotZ, breathe);
+    // Sit slightly high in the stage, preserving a calm caption lane below.
+    mat4.compose(this.model, 0, 0.10 + bob, lean, this.rotX, this.rotY, this.rotZ, breathe);
 
     // Temporal stutter during disruption: the entity's sense of time hitches.
     const stutter = visual.errorIntensity > 0.45 ? Math.floor(time * 11) / 11 : time;
@@ -598,8 +616,8 @@ export class AgentHead {
 
     // Surface cloud dynamics: brighter and slightly swollen when energized.
     const energy = visual.energy;
-    const glow = 0.7 + energy * 1.2 + visual.thinkingIntensity * 0.7;
-    const swell = 1 + visual.energy * 0.25;
+    const glow = 0.88 + energy * 0.75 + visual.thinkingIntensity * 0.22;
+    const swell = 1 + visual.energy * 0.12;
     const dpr = this.renderer.dprScale;
     const field = this.cloudField;
     const cloudIndices = this.cloudIndices;
@@ -610,14 +628,17 @@ export class AgentHead {
     ca[1] = accents.primary[1];
     ca[2] = accents.primary[2];
     field.begin();
-    for (let i = 0; i < cloudIndices.length; i += 2) {
+    for (let i = 0; i < cloudIndices.length; i++) {
       const vi = cloudIndices[i];
-      const alpha = Math.min(0.2, baseAlpha[i] * glow);
+      const lat = 1 - Math.acos(clamp(this.normals[vi * 3 + 1], -1, 1)) / Math.PI;
+      const scanOffset = (lat - this.sweep) * 11;
+      const scan = Math.exp(-(scanOffset ** 2)) * visual.thinkingIntensity;
+      const alpha = Math.min(0.44, baseAlpha[i] * glow + scan * 0.16);
       if (alpha < 0.008) continue;
       field.push(
         pose[vi * 3], pose[vi * 3 + 1], pose[vi * 3 + 2],
-        baseSize[i] * swell * dpr,
-        ca[0], ca[1], ca[2], alpha,
+        baseSize[i] * (swell + scan * 0.38) * dpr,
+        lerp(ca[0], 0.92, scan * 0.35), lerp(ca[1], 0.98, scan * 0.2), lerp(ca[2], 1, scan * 0.15), alpha,
         (vi % SECTORS) / SECTORS,
       );
     }
@@ -777,7 +798,7 @@ export class AgentHead {
       uDeep: [deep[0], deep[1], deep[2]],
       uRim: [rim[0], rim[1], rim[2]],
       uRimGain: 1.35 + visual.energy * 0.6,
-      uOpacity: 0.9,
+      uOpacity: 0.34,
       uTime: this.renderer.time,
       uThought: thought,
     };
@@ -785,14 +806,14 @@ export class AgentHead {
     gl.cullFace(gl.FRONT);
     gl.enable(gl.CULL_FACE);
     this.shellMesh.draw(this.shellProgram, {
-      uniforms: { ...shellUniforms, uOpacity: 0.6 },
+      uniforms: { ...shellUniforms, uOpacity: 0.18 },
     });
     gl.cullFace(gl.BACK);
     this.shellMesh.draw(this.shellProgram, { uniforms: shellUniforms });
     gl.disable(gl.CULL_FACE);
 
     // State tint: computation warms the entire topology toward amber.
-    const tintMix = Math.min(0.62, visual.thinkingIntensity * 0.62 + visual.errorIntensity * 0.4);
+    const tintMix = Math.min(0.28, visual.thinkingIntensity * 0.22 + visual.toolActivity * 0.12 + visual.errorIntensity * 0.28);
 
     // Topology wire (decimated) — the structural signature.
     renderer.additive();
@@ -808,8 +829,8 @@ export class AgentHead {
         uTintMix: tintMix,
         uSweep: this.sweep,
         uThink: visual.thinkingIntensity * 0.8,
-        uGlobalAlpha: 1.1 + visual.energy * 0.6,
-        uCap: 0.5,
+        uGlobalAlpha: 0.9 + visual.energy * 0.35,
+        uCap: 0.38,
       },
     });
 

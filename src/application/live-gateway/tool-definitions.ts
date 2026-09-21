@@ -24,6 +24,38 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "search_past_chats",
+    description:
+      "Search the user's past Hermes conversations and memory for older context (previous chats, earlier decisions, forgotten details). Slower than answering directly: reserve it for history the current conversation does not contain.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: {
+          type: "string",
+          description: "Short search phrase naming what to find, for example 'cats names' or 'server migration decision'.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "remember",
+    description:
+      "Persist one durable fact about the user for future sessions. Only use it when the user explicitly asks to remember, keep in mind, or note something. Hermes stores it and may stage it for approval.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        fact: {
+          type: "string",
+          description: "The single self-contained fact to persist, phrased so it stays true later.",
+        },
+      },
+      required: ["fact"],
+    },
+  },
+  {
     name: "start_background_task",
     description:
       "Delegate meaningful work to Hermes Agent as a durable background task. Returns quickly; the user may keep talking or disconnect while the task continues.",
@@ -147,6 +179,8 @@ export const OPENAI_HERMES_LIVE_TOOLS = HERMES_LIVE_TOOL_DEFINITIONS.map((tool) 
 
 const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   continue_hermes_conversation: "Continue the selected saved Hermes chat for one short turn.",
+  search_past_chats: "Search past Hermes chats and memory for older context.",
+  remember: "Store a durable user fact in Hermes memory.",
   start_background_task: "Start durable Hermes work while the user keeps talking or disconnects.",
   list_background_tasks: "List active and recent tasks with their exact ids.",
   get_background_task: "Get one task's exact status or retained result.",

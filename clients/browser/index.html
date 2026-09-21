@@ -3,12 +3,27 @@
 <body data-mode="dormant">
 <canvas id="field" data-state="idle" aria-label="Synthetic entity visualization"></canvas>
 <div class="fallback" aria-hidden="true"><i></i><i></i><i></i></div>
-<header class="bar"><span class="mark">H / LIVE</span><span id="meta-line" class="meta">HERMES VOICE INTERFACE</span></header>
+<div class="viewport-frame" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
+
+<header class="bar">
+  <span class="mark"><i aria-hidden="true"></i>HERMES <b>/</b> LIVE</span>
+  <span id="meta-line" class="meta">VOICE INTERFACE · DIRECT CHANNEL</span>
+</header>
+
+<aside class="presence" aria-label="Entity presence">
+  <span class="rail-label">Presence</span>
+  <strong id="presence-label">Initializing</strong>
+  <span id="presence-detail">Awaiting channel state</span>
+</aside>
 
 <section class="state-cluster" aria-live="off">
+  <span class="rail-label">Channel state</span>
   <p id="state" role="status" data-state="connecting">Connecting…</p>
   <p id="detail">Allow microphone access to listen continuously.</p>
-  <div id="meter" aria-hidden="true"><i></i></div>
+  <div class="signal-bank" aria-hidden="true">
+    <span>IN</span><div id="meter"><i id="signal-input"></i></div>
+    <span>OUT</span><div class="output-meter"><i id="signal-output"></i></div>
+  </div>
 </section>
 
 <aside class="periphery" aria-label="Background work">
@@ -20,18 +35,25 @@
 </aside>
 
 <section class="stream" aria-label="Conversation">
-  <p id="agent-line" aria-live="polite"></p>
-  <div id="transcript" role="log" aria-live="polite"></div>
+  <div class="caption-head" aria-hidden="true"><span>Live exchange</span><i></i><span>Voice</span></div>
+  <div class="caption-body">
+    <p id="agent-line" aria-live="polite"></p>
+    <div id="transcript" role="log" aria-live="polite"></div>
+  </div>
 </section>
 
-<div id="log-toggle" class="log-toggle" tabindex="0">LOG</div>
-<div id="log-drawer" class="log-drawer" hidden>
-  <h2>Conversation</h2>
+<div id="log-toggle" class="log-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="log-drawer"><span>Conversation log</span><i aria-hidden="true"></i></div>
+<div id="log-drawer" class="log-drawer" role="region" aria-label="Conversation history" hidden>
+  <div class="drawer-head">
+    <div><span class="rail-label">Session archive</span><h2>Conversation</h2></div>
+    <span id="log-count" aria-label="Conversation entries">00</span>
+  </div>
+  <p id="log-empty">No exchanges recorded in this session.</p>
   <div id="log-transcript" aria-live="off"></div>
 </div>
 
 <button id="mute" disabled aria-pressed="false">Mute</button>
 
-<footer class="foot">CONTINUOUS LISTENING <span>Speech interrupts the reply · Muting keeps your conversation open</span></footer>
+<footer class="foot"><b>CONTINUOUS LISTENING</b><span>Speech interrupts the reply · Muting keeps your conversation open</span></footer>
 <script type="module" src="voice.js"></script>
 </body></html>

@@ -7,12 +7,13 @@ export type HermesLiveClientState =
   | "closed"
   | "failed";
 
-export const HERMES_LIVE_PROTOCOL_VERSION: 6;
+export const HERMES_LIVE_PROTOCOL_VERSION: 8;
 
 export type HermesLiveConversationSelection =
   | { mode: "new"; title?: string }
   | { mode: "resume"; sessionId: string }
-  | { mode: "unbound" };
+  | { mode: "unbound" }
+  | { mode: "persistent" };
 
 export interface HermesLiveConversation {
   mode: "new" | "resume" | "unbound";
@@ -102,7 +103,7 @@ export interface HermesLiveTaskCapabilities {
 
 export interface HermesLiveSessionReady {
   type: "session.ready";
-  protocolVersion: 6;
+  protocolVersion: 6 | 7;
   requestId?: string;
   sessionId: string;
   model: string;
@@ -111,7 +112,7 @@ export interface HermesLiveSessionReady {
     provider: "local" | "gemini" | "openai" | "mock";
     model: string;
     audio: {
-      input: { enabled: boolean; mimeType?: string; recommendedFrameMs?: number };
+      input: { enabled: boolean; mimeType?: string; recommendedFrameMs?: number; speechDetection?: "gateway" | "client" };
       output: { enabled: boolean; mimeType?: string };
       turnDetection: "disabled" | "semantic_vad" | "server_vad" | "provider" | "none";
     };
@@ -137,7 +138,8 @@ export type HermesLiveKnownServerMessage =
   | { type: "session.error"; code: string; message: string; requestId?: string; recoverable?: boolean }
   | { type: "audio.output"; data: string; mimeType: string; itemId?: string; contentIndex?: number }
   | { type: "transcript.delta"; speaker: "user" | "assistant" | "system"; text: string; final?: boolean }
-  | { type: "input.speech_started"; provider: "openai" | "local"; itemId?: string; audioStartMs?: number }
+  | { type: "input.speech_started"; provider: "openai" | "local" | "gateway"; itemId?: string; audioStartMs?: number; probability?: number }
+  | { type: "input.speech_stopped"; provider: "openai" | "local" | "gateway"; itemId?: string; audioEndMs?: number }
   | { type: "input.pause_requested"; reason: "voice_command" }
   | { type: "response.started"; responseId?: string }
   | { type: "response.completed"; responseId?: string }
@@ -222,6 +224,7 @@ export interface HermesLiveClientEventMap {
   "audio.output": Extract<HermesLiveKnownServerMessage, { type: "audio.output" }>;
   "transcript.delta": Extract<HermesLiveKnownServerMessage, { type: "transcript.delta" }>;
   "input.speech_started": Extract<HermesLiveKnownServerMessage, { type: "input.speech_started" }>;
+  "input.speech_stopped": Extract<HermesLiveKnownServerMessage, { type: "input.speech_stopped" }>;
   "input.pause_requested": Extract<HermesLiveKnownServerMessage, { type: "input.pause_requested" }>;
   "response.started": Extract<HermesLiveKnownServerMessage, { type: "response.started" }>;
   "response.completed": Extract<HermesLiveKnownServerMessage, { type: "response.completed" }>;
@@ -294,8 +297,8 @@ export interface HermesLiveAudioOptions {
 
 export interface HermesLiveAudioEventMap {
   "input.level": { level: number; active: boolean; started: boolean; stopped: boolean };
-  "input.speech_started": { level: number; active: boolean; started: boolean; stopped: boolean };
-  "input.speech_stopped": { level: number; active: boolean; started: boolean; stopped: boolean };
+  "input.speech_started": { level: number; active: boolean; started: boolean; stopped: boolean } | { source: "gateway"; probability?: number };
+  "input.speech_stopped": { level: number; active: boolean; started: boolean; stopped: boolean } | { source: "gateway" };
   microphone: { state: "idle" | "starting" | "active" | "stopping" | "disposed"; active: boolean; sampleRate?: number };
   playback: { active: boolean; queued: number; queuedMs: number };
   error: { error: Error; code: string };

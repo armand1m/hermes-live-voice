@@ -22,6 +22,7 @@ COPY --from=deps /app/node_modules ./node_modules
 RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund \
     && npm cache clean --force
 COPY LICENSE ./LICENSE
+COPY assets ./assets
 COPY --from=build /app/dist ./dist
 COPY clients ./clients
 COPY docs ./docs

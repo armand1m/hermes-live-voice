@@ -4,7 +4,6 @@
 // about WebSockets or audio formats.
 
 import { Renderer, mat4, Mesh, PointField } from "./entity-gl.js";
-import { AgentHead } from "./entity-head.js";
 import { Wander } from "./entity-state.js";
 
 const clamp = (v, min = 0, max = 1) => v < min ? min : v > max ? max : v;
@@ -15,9 +14,9 @@ const TAU = Math.PI * 2;
 // (warm signal amber) that computation pulls toward. Error is a restrained
 // coral. States modulate the mix, never swap the palette.
 const ACCENTS = {
-  primary: [0.42, 0.93, 0.85],
-  secondary: [1.0, 0.72, 0.42],
-  deep: [0.22, 0.34, 0.44],
+  primary: [0.12, 0.62, 1.0],
+  secondary: [1.0, 0.72, 0.38],
+  deep: [0.08, 0.20, 0.29],
   error: [1.0, 0.52, 0.42],
   white: [0.92, 0.98, 1.0],
 };
@@ -44,10 +43,10 @@ void main() {
 }`,
 };
 
-const PARTICLE_COUNT = 720;
+const PARTICLE_COUNT = 280;
 const PULSE_COUNT = 5;
 const PACKET_COUNT = 3;
-const CORTEX_RINGS = 3;
+const CORTEX_RINGS = 2;
 
 /** Damped scalar with velocity, used for camera framing. */
 class Damper {
@@ -68,7 +67,16 @@ export class VoiceEntityScene {
     this.canvas = canvas;
     this.reducedMotion = reducedMotion;
     this.renderer = new Renderer(canvas);
-    this.head = new AgentHead(this.renderer);
+    this.head = null;
+    this.disposed = false;
+    // Geometry loading must never delay microphone startup or voice events.
+    this.ready = import("./entity-facekit.js").then(({ FaceKitHead }) => {
+      if (!this.disposed) this.head = new FaceKitHead(this.renderer);
+    }).catch((error) => {
+      if (this.disposed) return;
+      this.loadError = String(error);
+      document.body.classList.add("no-webgl");
+    });
     this.lineProgram = this.renderer.program(LINE_SHADER.vert, LINE_SHADER.frag);
 
     // Camera rig.
@@ -119,8 +127,8 @@ export class VoiceEntityScene {
     for (let i = 0; i < n; i++) {
       // Sparser near the head, drifting outward — the entity breathes in an
       // empty chamber, not a dust cloud.
-      const t = Math.pow(Math.random(), 1.9);
-      this.particleData.baseRadius[i] = lerp(1.6, 3.8, t);
+      const t = Math.pow(Math.random(), 1.35);
+      this.particleData.baseRadius[i] = lerp(1.9, 3.65, t);
       this.particleData.radius[i] = this.particleData.baseRadius[i];
       this.particleData.angle[i] = Math.random() * TAU;
       this.particleData.speed[i] = (0.05 + Math.random() * 0.16) * (Math.random() < 0.5 ? -1 : 1);
@@ -140,7 +148,7 @@ export class VoiceEntityScene {
     const total = CORTEX_RINGS * perRing;
     this.cortexPos = new Float32Array(total * 3);
     this.cortexColor = new Float32Array(total * 4);
-    this.cortexRadii = [0.34, 0.5, 0.66];
+    this.cortexRadii = [0.38, 0.58];
     this.cortexAxes = [
       { x: 0.2, y: 0.0, z: 0.98 },
       { x: 0.9, y: 0.3, z: 0.3 },
@@ -159,7 +167,7 @@ export class VoiceEntityScene {
     // Two broad mechanical rings that frame the entity like an instrument
     // mount. They precess slowly; they never spin.
     const segments = 90;
-    const rings = 2;
+    const rings = 1;
     this.gimbalPos = new Float32Array(rings * segments * 2 * 3);
     this.gimbalColor = new Float32Array(rings * segments * 2 * 4);
     this.gimbalMesh = new Mesh(this.renderer, [
@@ -169,7 +177,7 @@ export class VoiceEntityScene {
     this.gimbalMesh.set("aPos", this.gimbalPos);
     this.gimbalMesh.set("aColor", this.gimbalColor);
     this.gimbalSegments = segments;
-    this.gimbalRadii = [1.38, 1.58];
+    this.gimbalRadii = [1.48];
   }
 
   buildPulses() {
@@ -191,15 +199,18 @@ export class VoiceEntityScene {
   }
 
   buildPackets() {
-    // Tool packets: small clusters that leave the head toward a peripheral
-    // anchor while Hermes runs a tool, then return with the result.
+    // Tool packets: small clusters that leave the head toward an anchor just
+    // beside it while Hermes runs a tool, then return with the result. The
+    // anchor stays close — the tool activity reads as orbiting the entity,
+    // never leaving the stage.
     this.packetField = new PointField(this.renderer, PACKET_COUNT * 28);
     this.packets = [];
     for (let i = 0; i < PACKET_COUNT; i++) {
       this.packets.push({
         id: null, phase: "idle", t: 0, label: "",
-        anchor: [2.35, 0.3 + i * 0.5, 0.1],
-        origin: [0.7, 0.1, 0.65],
+        baseAnchor: [1.22, 0.52 + i * 0.34, 0.30],
+        anchor: [1.22, 0.52 + i * 0.34, 0.30],
+        origin: [0.55, 0.30, 0.62],
         screen: [0, 0, 0],
         success: true,
       });
@@ -285,7 +296,7 @@ export class VoiceEntityScene {
 
     this.updateAccents(visual);
     this.updateCamera(dt, visual, mouth);
-    this.head.update(dt, this.time, visual, mouth, this.accent);
+    this.head?.update(dt, this.time, visual, mouth, this.accent);
     this.updateParticles(dt, visual);
     this.updateCortex(dt, visual);
     this.updateGimbal(dt, visual);
@@ -294,7 +305,7 @@ export class VoiceEntityScene {
 
     const aspect = renderer.canvas.clientWidth / Math.max(1, renderer.canvas.clientHeight);
     const eye = renderer.eye;
-    renderer.updateCamera(eye, [0, 0.02, 0], this.cam.fov.value, aspect);
+    renderer.updateCamera(eye, [0, 0.08, 0], this.cam.fov.value, aspect);
 
     renderer.beginFrame([0, 0, 0, 0]);
 
@@ -303,7 +314,7 @@ export class VoiceEntityScene {
     glDisableDepth(this.renderer);
     this.drawCortex(visual);
     glEnableDepth(this.renderer);
-    this.head.draw(renderer, visual, this.accent);
+    this.head?.draw(renderer, visual, this.accent);
     this.drawGimbal(visual);
     this.drawPulses(visual);
     this.drawPackets(visual);
@@ -314,8 +325,9 @@ export class VoiceEntityScene {
   }
 
   updateAccents(visual) {
-    // Computation warms the palette slightly; errors pull it toward coral.
-    const warm = clamp(visual.thinkingIntensity * 0.7 + visual.toolActivity * 0.35);
+    // Computation warms the palette; errors pull it toward coral. The head,
+    // rings, packets and the CSS accent all ride this same mix.
+    const warm = clamp(visual.thinkingIntensity * 0.7 + visual.toolActivity * 0.3);
     const err = clamp(visual.errorIntensity);
     for (let i = 0; i < 3; i++) {
       let r = lerp(ACCENTS.primary[i], ACCENTS.secondary[i], warm);
@@ -336,7 +348,7 @@ export class VoiceEntityScene {
       offline: { dist: 4.6, az: 0, el: 0.10, fov: 0.70 },
       idle: { dist: 3.65, az: 0, el: 0.03, fov: 0.66 },
       listening: { dist: 3.05, az: 0, el: 0.05, fov: 0.62 },
-      thinking: { dist: 3.95, az: 0, el: 0.10, fov: 0.72 },
+      thinking: { dist: 3.55, az: 0, el: 0.06, fov: 0.67 },
       tool: { dist: 3.5, az: -0.10, el: 0.07, fov: 0.68 },
       speaking: { dist: 3.3, az: 0, el: 0.02, fov: 0.63 },
       error: { dist: 4.1, az: 0.04, el: 0.13, fov: 0.72 },
@@ -367,7 +379,9 @@ export class VoiceEntityScene {
 
     const az = cam.az.value + cam.parallaxX.value;
     const el = clamp(cam.el.value + cam.parallaxY.value, -0.5, 0.8);
-    const dist = cam.dist.value;
+    // Preserve the head silhouette on narrow portrait displays.
+    const aspect = this.canvas.clientWidth / Math.max(1, this.canvas.clientHeight);
+    const dist = cam.dist.value * Math.max(1, 0.88 / aspect);
     renderer_eye_set(this.renderer, az, el, dist);
   }
 
@@ -381,7 +395,7 @@ export class VoiceEntityScene {
     const contract = mode === "listening" ? 0.76 : mode === "thinking" ? 0.88 : mode === "speaking" ? 1.02 : 1;
     const capture = 1 - visual.capture * 0.12;
     const errorScatter = visual.errorIntensity;
-    const brightness = 0.14 + visual.energy * 0.6 + visual.listening * 0.3 + visual.thinkingIntensity * 0.25;
+    const brightness = 0.07 + visual.energy * 0.32 + visual.listening * 0.16 + visual.thinkingIntensity * 0.12;
     const speedGain = 1 + visual.energy * 1.4 + visual.thinkingIntensity * 1.1;
     const dpr = this.renderer.dprScale;
     const t = this.time;
@@ -411,8 +425,8 @@ export class VoiceEntityScene {
 
       // Mic energy breathes into the near particles.
       const micBoost = visual.listening * visual.micLevel * (1.6 - Math.min(1, r / 3.2));
-      const alpha = Math.min(0.45, brightness * (0.3 + data.phase[i] * 0.55) + micBoost * 0.4) * 0.4;
-      const warmMix = clamp(visual.thinkingIntensity * 0.8 * data.phase[i]);
+      const alpha = Math.min(0.3, brightness * (0.24 + data.phase[i] * 0.42) + micBoost * 0.22) * 0.32;
+      const warmMix = clamp(visual.thinkingIntensity * 0.18 * data.phase[i]);
       const pr = lerp(accent[0], ACCENTS.secondary[0], warmMix);
       const pg = lerp(accent[1], ACCENTS.secondary[1], warmMix);
       const pb = lerp(accent[2], ACCENTS.secondary[2], warmMix);
@@ -422,7 +436,7 @@ export class VoiceEntityScene {
   }
 
   updateCortex(dt, visual) {
-    const visibility = clamp(visual.thinkingIntensity * 0.75 + visual.toolActivity * 0.2);
+    const visibility = clamp(visual.thinkingIntensity * 0.48 + visual.toolActivity * 0.14);
     this.cortexVisibility = visibility;
     const t = this.time;
     const pos = this.cortexPos;
@@ -469,9 +483,9 @@ export class VoiceEntityScene {
     const color = this.gimbalColor;
     const segments = this.gimbalSegments;
     const accent = this.accent.primary;
-    const alpha = 0.04 + visual.thinkingIntensity * 0.08 + visual.toolActivity * 0.08 + visual.listening * 0.04;
+    const alpha = visual.thinkingIntensity * 0.055 + visual.toolActivity * 0.07;
     let v = 0;
-    for (let ring = 0; ring < 2; ring++) {
+    for (let ring = 0; ring < 1; ring++) {
       const radius = this.gimbalRadii[ring];
       // Precession: the ring plane's orientation drifts, never rotates fully.
       const precess = t * (ring === 0 ? 0.031 : -0.023);
@@ -535,8 +549,15 @@ export class VoiceEntityScene {
     const field = this.packetField;
     field.begin();
     const dpr = this.renderer.dprScale;
+    // Keep every anchor inside the visible frustum: on narrow/portrait
+    // viewports the frustum half-width shrinks, so the anchor rides inward
+    // instead of drifting off-canvas. It never collapses onto the face.
+    const aspect = this.canvas.clientWidth / Math.max(1, this.canvas.clientHeight);
+    const reach = Math.max(0.85,
+      Math.tan(this.cam.fov.value / 2) * Math.max(1.5, this.cam.dist.value - 0.3) * aspect - 0.22);
     for (const packet of this.packets) {
       if (packet.phase === "idle") continue;
+      packet.anchor[0] = Math.min(packet.baseAnchor[0], reach);
       const speed = packet.phase === "hold" ? 0 : 0.9;
       packet.t += dt * speed;
       const [ox, oy, oz] = packet.origin;
@@ -552,7 +573,7 @@ export class VoiceEntityScene {
         u = 1;
       }
       // Bezier with a slight outward bow so the path avoids the face.
-      const bow = 0.9;
+      const bow = 0.3;
       const cx = (ox + ax) / 2 + bow, cy = (oy + ay) / 2 + 0.35, cz = (oz + az) / 2;
       const iu = 1 - u;
       const px = iu * iu * ox + 2 * iu * u * cx + u * u * ax;
@@ -682,11 +703,8 @@ export class VoiceEntityScene {
   }
 
   dispose() {
-    this.head.shellMesh.dispose();
-    this.head.lineMesh.dispose();
-    this.head.cloudField.dispose();
-    this.head.irisField.dispose();
-    this.head.featureMesh.dispose();
+    this.disposed = true;
+    this.head?.dispose();
     this.particleField.dispose();
     this.packetField.dispose();
     this.cortexMesh.dispose();

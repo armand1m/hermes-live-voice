@@ -379,6 +379,11 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
           kind: "conversation",
           response: buildLocalConversationResponse(response),
         });
+      } else if (routedAction.name === "search_past_chats") {
+        this.schedule({
+          kind: "conversation",
+          response: buildLocalConversationResponse(response),
+        });
       } else {
         this.fail(new Error(`Managed local action ${routedAction.name} returned no spoken response.`));
       }
@@ -684,7 +689,7 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
 
   private routedAction(text: string): LocalRoutedAction | undefined {
     const explicit = localRoutedAction(text);
-    if (explicit) return this.canRouteAction(explicit) ? explicit : undefined;
+    if (explicit && this.canRouteAction(explicit)) return explicit;
     const referencedStop: LocalRoutedAction | undefined = this.referencedTaskId
       && /^(?:please\s+)?(?:stop|cancel)\s+(?:it|that|that\s+one|that\s+task)\b/iu.test(text.trim())
       ? { name: "stop_background_task", args: { task_id: this.referencedTaskId } }

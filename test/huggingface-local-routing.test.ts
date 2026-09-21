@@ -298,3 +298,49 @@ describe("managed local voice routing", () => {
     }
   });
 });
+
+describe("memory routing precedence", () => {
+  it("routes explicit past-chat asks to search_past_chats instead of delegation", () => {
+    const utterances = [
+      "Do you remember my cats names?",
+      "Search our past chats for the restaurant we liked",
+      "Can you check previous conversations about the server migration?",
+      "Look through my saved chats for the wifi password",
+      "What did we talk about last week?",
+      "What did we decide in the previous chat?",
+      "Te acuerdas del nombre de mis gatos?",
+      "Busca en las conversaciones anteriores el restaurante",
+      "Et recordes el que vam parlar la setmana passada?",
+    ];
+    for (const utterance of utterances) {
+      expect(localRoutedAction(utterance)).toMatchObject({ name: "search_past_chats" });
+    }
+  });
+
+  it("keeps current-chat questions and generic searches out of recall", () => {
+    expect(localRoutedAction("What did we decide yesterday?")).toBeUndefined();
+    expect(localRoutedAction("Search the repo for the failing test")).toBeUndefined();
+    expect(localRoutedAction("What are you working on?")).toMatchObject({ name: "list_background_tasks" });
+  });
+
+  it("routes explicit remember utterances with the fact stripped", () => {
+    expect(localRoutedAction("Remember that I like tea with milk")).toMatchObject({
+      name: "remember",
+      args: { fact: "I like tea with milk" },
+    });
+    expect(localRoutedAction("Please keep in mind that the studio door sticks")).toMatchObject({
+      name: "remember",
+      args: { fact: "the studio door sticks" },
+    });
+    expect(localRoutedAction("Don't forget the plumber comes Tuesday")).toMatchObject({
+      name: "remember",
+      args: { fact: "the plumber comes Tuesday" },
+    });
+    expect(localRoutedAction("Recuerda que mi vuelo sale a las seis")).toMatchObject({
+      name: "remember",
+      args: { fact: "mi vuelo sale a las seis" },
+    });
+    // Recall question, not an imperative memory write.
+    expect(localRoutedAction("Do you remember the flight time?")).toMatchObject({ name: "search_past_chats" });
+  });
+});

@@ -54,7 +54,8 @@ Deterministic fixtures cover Hermes Agent 0.20.0 (`v2026.8.3`). Scheduled CI als
 
 ## What it does
 
-- Continuous microphone mode with voice activity detection and barge-in
+- Continuous microphone mode with gateway-side Silero speech detection and echo-guarded barge-in
+- Persistent voice memory: Hermes memory/skills digest per session, a durable cross-device voice thread, and `search_past_chats`/`remember` tools
 - New or resumed Hermes chats with their existing memory and history
 - Background work that continues through voice disconnects
 - Live, sanitized task progress and tool activity
@@ -159,4 +160,4 @@ For any non-loopback gateway bind, use a strong `HERMES_LIVE_AUTH_TOKEN`, an exa
 
 [MIT](LICENSE). This is a community project, not an official NousResearch distribution.
 
-The gateway also serves a [continuous browser voice console](docs/voice-v2.md) at `http://127.0.0.1:8788/`, with automatic microphone capture, VAD turn detection, mute/unmute and an audio-reactive canvas.
+The gateway also serves a [continuous browser voice console](docs/voice-v2.md) at `http://127.0.0.1:8788/`, with automatic microphone capture, gateway-confirmed speech detection, mute/unmute and an audio-reactive canvas.

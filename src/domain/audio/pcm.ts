@@ -114,7 +114,43 @@ export function resamplePcm16Base64(data: string, sourceRate: number, targetRate
   return output.toString("base64");
 }
 
-function decodePcm16Base64(data: string): Int16Array {
+/** Resamples PCM16 samples to normalized [-1, 1] floats at the target rate. */
+export function resamplePcm16Samples(samples: Int16Array, sourceRate: number, targetRate: number): Float32Array {
+  validatePcmSampleRate(sourceRate, "Source PCM sample rate");
+  validatePcmSampleRate(targetRate, "Target PCM sample rate");
+  if (samples.length === 0) {
+    return new Float32Array(0);
+  }
+  if (sourceRate === targetRate) {
+    const passthrough = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i += 1) {
+      passthrough[i] = samples[i] / 32_768;
+    }
+    return passthrough;
+  }
+
+  const outputLength = Math.max(1, Math.round((samples.length * targetRate) / sourceRate));
+  const outputBytes = outputLength * Float32Array.BYTES_PER_ELEMENT;
+  if (!Number.isSafeInteger(outputBytes) || outputBytes > MAX_RESAMPLED_PCM16_BYTES) {
+    throw new Error(`Resampled PCM16 audio exceeds the ${MAX_RESAMPLED_PCM16_BYTES}-byte allocation limit.`);
+  }
+  const output = new Float32Array(outputLength);
+  const scale = sourceRate / targetRate;
+
+  for (let i = 0; i < outputLength; i += 1) {
+    const sourcePosition = i * scale;
+    const leftIndex = Math.min(samples.length - 1, Math.floor(sourcePosition));
+    const rightIndex = Math.min(samples.length - 1, leftIndex + 1);
+    const mix = sourcePosition - leftIndex;
+    const left = (samples[leftIndex] ?? 0) / 32_768;
+    const right = (samples[rightIndex] ?? left) / 32_768;
+    output[i] = left * (1 - mix) + right * mix;
+  }
+
+  return output;
+}
+
+export function decodePcm16Base64(data: string): Int16Array {
   const bytes = Buffer.from(data, "base64");
   if (bytes.length % 2 !== 0) {
     throw new Error("PCM16 audio must contain an even number of bytes.");

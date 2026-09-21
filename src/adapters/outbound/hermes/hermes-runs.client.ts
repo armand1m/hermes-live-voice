@@ -15,6 +15,7 @@ import type {
   HermesSessionHistory,
   HermesSessionMessage,
   HermesSessionSummary,
+  HermesSkillSummary,
   ListHermesSessionsOptions,
   StartRunParams,
   StartRunResult,
@@ -130,6 +131,9 @@ export class HermesClient implements HermesRunsPort {
     if (options.source !== undefined) {
       query.set("source", boundedSafeText(options.source, 64, "Hermes session source"));
     }
+    if (options.title !== undefined) {
+      query.set("title", boundedSafeText(options.title, MAX_HERMES_SESSION_TITLE_CHARS, "Hermes session title filter"));
+    }
     const response = await this.requestJson<unknown>(`/api/sessions?${query.toString()}`, {
       method: "GET",
       ...signalInit(options.signal),
@@ -141,6 +145,20 @@ export class HermesClient implements HermesRunsPort {
       throw new Error("Hermes returned too many sessions.");
     }
     return response.data.map((value) => parseHermesSessionSummary(value));
+  }
+
+  async listSkills(options: { signal?: AbortSignal } = {}): Promise<HermesSkillSummary[]> {
+    const response = await this.requestJson<unknown>("/v1/skills", {
+      method: "GET",
+      ...signalInit(options.signal),
+    });
+    if (!isRecord(response) || response.object !== "list" || !Array.isArray(response.data)) {
+      throw new Error("Hermes returned an invalid skills list.");
+    }
+    if (response.data.length > 200) {
+      throw new Error("Hermes returned too many skills.");
+    }
+    return response.data.map((value) => parseHermesSkillSummary(value));
   }
 
   async createSession(options: CreateHermesSessionOptions = {}): Promise<HermesSessionSummary> {
@@ -653,6 +671,26 @@ function safeParseHermesRunUsage(value: unknown): HermesRunUsage | undefined {
     : { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: totalTokens };
 }
 
+function parseHermesSkillSummary(value: unknown): HermesSkillSummary {
+  if (!isRecord(value) || typeof value.name !== "string" || value.name.length === 0 || value.name.length > 128) {
+    throw new Error("Hermes returned an invalid skill summary.");
+  }
+  const skill: HermesSkillSummary = { name: value.name };
+  if (value.description !== undefined && value.description !== null) {
+    if (typeof value.description !== "string" || value.description.length > 500) {
+      throw new Error("Hermes returned an invalid skill description.");
+    }
+    if (value.description.length > 0) skill.description = value.description;
+  }
+  if (value.category !== undefined && value.category !== null) {
+    if (typeof value.category !== "string" || value.category.length > 64) {
+      throw new Error("Hermes returned an invalid skill category.");
+    }
+    if (value.category.length > 0) skill.category = value.category;
+  }
+  return skill;
+}
+
 function parseHermesSessionSummary(value: unknown, expectedId?: string): HermesSessionSummary {
   if (!isRecord(value) || !isBoundedHermesIdentifier(value.id)) {
     throw new Error("Hermes returned an invalid session summary.");
@@ -867,7 +905,7 @@ function isBoundedHermesIdentifier(value: unknown): value is string {
 }
 
 function publicHermesRequestPath(path: string): string {
-  if (["/health", "/v1/capabilities", "/v1/runs", "/api/model/options"].includes(path)) return path;
+  if (["/health", "/v1/capabilities", "/v1/runs", "/v1/skills", "/api/model/options"].includes(path)) return path;
   if (/^\/api\/sessions(?:\?.*)?$/u.test(path)) return "/api/sessions";
   if (/^\/api\/sessions\/[^/]+\/messages$/u.test(path)) return "/api/sessions/{session_id}/messages";
   if (/^\/api\/sessions\/[^/]+\/chat$/u.test(path)) return "/api/sessions/{session_id}/chat";

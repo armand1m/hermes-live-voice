@@ -197,6 +197,7 @@ describe("setup", () => {
         hermes: hermesReady ? { ok: true, baseUrl: "http://127.0.0.1:8642" } : { ok: false, error: "offline" },
         realtime: { ok: true },
         tasks: { ok: true },
+        context: { ok: true },
       };
     };
 

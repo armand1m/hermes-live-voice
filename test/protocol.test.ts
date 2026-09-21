@@ -14,9 +14,9 @@ import {
 
 const NOW = 1_784_131_200_000;
 
-describe("protocol v6", () => {
+describe("protocol v8", () => {
   it("binds current sessions to a new, resumed, or unbound Hermes conversation", () => {
-    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(6);
+    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(8);
     expect(
       parseClientMessage({
         type: "session.start",
@@ -39,6 +39,18 @@ describe("protocol v6", () => {
     })).toThrow(/requires Hermes Live protocol v4/i);
     expect(() => parseClientMessage({
       type: "session.start",
+      protocolVersion: 7,
+      conversation: { mode: "persistent" },
+    })).toThrow(/Persistent voice conversations require Hermes Live protocol v8/u);
+    const persistentStart = parseClientMessage({
+      type: "session.start",
+      protocolVersion: 8,
+      conversation: { mode: "persistent" },
+    });
+    if (persistentStart.type !== "session.start") throw new Error("Expected session.start");
+    expect(persistentStart.conversation).toEqual({ mode: "persistent" });
+    expect(() => parseClientMessage({
+      type: "session.start",
       protocolVersion: 6,
       conversation: { mode: "resume" },
     })).toThrow(/requires sessionId/i);
@@ -47,12 +59,14 @@ describe("protocol v6", () => {
   it("keeps v3 compatible and rejects v2 with an actionable error", () => {
     expect(() => assertHermesLiveProtocolVersion(3)).not.toThrow();
     expect(() => assertHermesLiveProtocolVersion(6)).not.toThrow();
+    expect(() => assertHermesLiveProtocolVersion(7)).not.toThrow();
+    expect(() => assertHermesLiveProtocolVersion(8)).not.toThrow();
     const message = parseClientMessage({ type: "session.start", protocolVersion: 2 });
     expect(message.type).toBe("session.start");
     if (message.type !== "session.start") throw new Error("Expected session.start");
     expect(message.protocolVersion).toBe(2);
     expect(() => assertHermesLiveProtocolVersion(message.protocolVersion)).toThrow(
-      /protocol v2 is incompatible with supported protocols v3, v4, v5, v6.*Upgrade hermes-live-voice/i,
+      /protocol v2 is incompatible with supported protocols v3, v4, v5, v6, v7, v8.*Upgrade hermes-live-voice/i,
     );
     expect(incompatibleProtocolVersionMessage(2)).toContain("before reconnecting");
   });
@@ -306,6 +320,8 @@ describe("protocol v6", () => {
   it("exposes only gateway tools to OpenAI Realtime", () => {
     expect(OPENAI_HERMES_LIVE_TOOLS.map((tool) => tool.name)).toEqual([
       "continue_hermes_conversation",
+      "search_past_chats",
+      "remember",
       "start_background_task",
       "list_background_tasks",
       "get_background_task",
@@ -321,6 +337,8 @@ describe("protocol v6", () => {
   it("uses Gemini SDK function declaration schema shape", () => {
     expect(HERMES_LIVE_TOOL_DECLARATIONS.map((tool) => tool.name)).toEqual([
       "continue_hermes_conversation",
+      "search_past_chats",
+      "remember",
       "start_background_task",
       "list_background_tasks",
       "get_background_task",

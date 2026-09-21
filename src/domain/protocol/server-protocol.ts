@@ -54,6 +54,7 @@ export const RealtimeClientCapabilitiesSchema = z
             enabled: z.boolean(),
             mimeType: z.string().min(1).max(PUBLIC_MIME_TYPE_MAX_CHARS).optional(),
             recommendedFrameMs: z.number().int().positive().max(1_000).optional(),
+            speechDetection: z.enum(["gateway", "client"]).optional(),
           })
           .strict(),
         output: z
@@ -213,7 +214,7 @@ const TaskEventBase = {
 const SessionReadyMessageSchema = z
   .object({
     type: z.literal("session.ready"),
-    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6)]),
+    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8)]),
     requestId: RequestIdSchema.optional(),
     sessionId: PublicIdSchema,
     model: z.string().min(1).max(PUBLIC_MODEL_MAX_CHARS),
@@ -261,9 +262,19 @@ const TranscriptDeltaMessageSchema = z
 const InputSpeechStartedMessageSchema = z
   .object({
     type: z.literal("input.speech_started"),
-    provider: z.enum(["openai", "local"]),
+    provider: z.enum(["openai", "local", "gateway"]),
     itemId: PublicIdSchema.optional(),
     audioStartMs: z.number().finite().nonnegative().max(60 * 60 * 1_000).optional(),
+    probability: z.number().finite().min(0).max(1).optional(),
+  })
+  .strict();
+
+const InputSpeechStoppedMessageSchema = z
+  .object({
+    type: z.literal("input.speech_stopped"),
+    provider: z.enum(["openai", "local", "gateway"]),
+    itemId: PublicIdSchema.optional(),
+    audioEndMs: z.number().finite().nonnegative().max(60 * 60 * 1_000).optional(),
   })
   .strict();
 
@@ -403,6 +414,7 @@ export const ServerMessageSchema = z.union([
   AudioOutputMessageSchema,
   TranscriptDeltaMessageSchema,
   InputSpeechStartedMessageSchema,
+  InputSpeechStoppedMessageSchema,
   InputPauseRequestedMessageSchema,
   ResponseStartedMessageSchema,
   ResponseCompletedMessageSchema,

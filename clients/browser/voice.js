@@ -1,5 +1,5 @@
 import { HermesLiveClient, HermesLiveAudio } from "./hermes-live-client.js";
-import { AgentStateController, SpeechAnalysis, VisemeEstimator } from "./entity-state.js";
+import { AgentStateController, SpeechAnalysis, TextVisemeScheduler, VisemeEstimator } from "./entity-state.js";
 import { VoiceEntityScene } from "./entity-scene.js";
 
 const state = document.querySelector("#state");
@@ -12,6 +12,10 @@ const agentLine = document.querySelector("#agent-line");
 const metaLine = document.querySelector("#meta-line");
 const notice = document.querySelector("#notice");
 const taskLine = document.querySelector("#task-line");
+const presenceLabel = document.querySelector("#presence-label");
+const presenceDetail = document.querySelector("#presence-detail");
+const inputSignal = document.querySelector("#signal-input");
+const outputSignal = document.querySelector("#signal-output");
 
 // The operator can bootstrap a tab with #token=... once. Keep it only in
 // sessionStorage so reloads do not require the secret again, while closing
@@ -22,12 +26,9 @@ const hashParams = new URLSearchParams(location.hash.slice(1));
 const hashToken = hashParams.get("token")?.trim();
 const devMode = hashParams.has("dev") || new URLSearchParams(location.search).get("dev") === "1";
 let token;
-let rememberedConversation;
 try {
   if (hashToken) sessionStorage.setItem(tokenKey, hashToken);
   token = hashToken || sessionStorage.getItem(tokenKey) || undefined;
-  const sessionId = sessionStorage.getItem(conversationKey)?.trim();
-  if (sessionId) rememberedConversation = { mode: "resume", sessionId };
 } catch {
   token = hashToken || undefined;
 }
@@ -41,7 +42,9 @@ const mountPath = location.pathname.endsWith("/")
   : location.pathname;
 const url = new URL(`${mountPath}/v1/live`, location.href);
 url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-const client = new HermesLiveClient({ url: url.href, token, conversation: rememberedConversation || { mode: "new" } });
+// Persistent mode lets the gateway resolve the durable per-user voice thread,
+// so every tab, browser restart, and device continues the same conversation.
+const client = new HermesLiveClient({ url: url.href, token, conversation: { mode: "persistent" } });
 const audio = new HermesLiveAudio(client, { workletUrl: `${mountPath}/mic-worklet.js` });
 
 // ---------------------------------------------------------------------------
@@ -54,12 +57,18 @@ const reducedMotion = Boolean(reducedMotionQuery?.matches);
 const controller = new AgentStateController({ reducedMotion });
 const analysis = new SpeechAnalysis(() => audio.playbackAnalyser);
 const visemes = new VisemeEstimator();
+// Text-synchronized lipsync: the words being revealed feed a viseme queue
+// whose playback is amplitude-gated by the real audio envelope.
+const textVisemes = new TextVisemeScheduler();
 
 // Optional synthetic viseme source installed by the developer playground.
 let syntheticVisemes = null;
 
-// Mouth rig targets derived from viseme weights (see entity-head.js).
+// Mouth rig targets derived from viseme weights (see entity-facekit.js).
 const mouth = { jaw: 0, wide: 0, round: 0, narrow: 0, press: 0, teeth: 0, energy: 0 };
+const VISEME_KEYS = ["closed", "open", "wide", "round", "narrow", "teeth"];
+// In-place blend of audio and text visemes (no per-frame allocation).
+const blended = { closed: 1, open: 0, wide: 0, round: 0, narrow: 0, teeth: 0 };
 
 let scene = null;
 let webglFailed = false;
@@ -92,8 +101,9 @@ client.on("session.error", showError);
 client.on("session.ready", (event) => {
   controller.connectionState("ready");
   const sessionId = event.conversation?.sessionId;
-  if (!sessionId) return;
-  try { sessionStorage.setItem(conversationKey, sessionId); } catch { /* storage may be blocked */ }
+  if (sessionId) {
+    try { sessionStorage.setItem(conversationKey, sessionId); } catch { /* storage may be blocked */ }
+  }
   const provider = event.realtime?.provider;
   const model = event.realtime?.model || event.model;
   baseMeta = [provider, model].filter(Boolean).join(" · ");
@@ -124,6 +134,7 @@ audio.on("microphone", (event) => {
     detail.textContent = "Resume with the microphone control.";
   } else if (event.state === "idle") {
     status("muted", "Microphone muted");
+    detail.textContent = "Unmute when you’re ready to continue.";
   }
 });
 
@@ -166,25 +177,40 @@ audio.on("playback", (event) => {
 // --- transcript (kinetic, but the accumulation contract is unchanged) -------
 const logTranscript = document.querySelector("#log-transcript");
 let current;
+let currentLog;
 client.on("transcript.delta", (event) => {
   if (!current || current.dataset.speaker !== event.speaker || current.dataset.final === "true") {
     current = document.createElement("p");
     current.dataset.speaker = event.speaker;
     transcriptList.append(current);
+    currentLog = document.createElement("p");
+    currentLog.dataset.speaker = event.speaker;
+    logTranscript.append(currentLog);
+    while (logTranscript.children.length > 200) logTranscript.firstChild.remove();
     while (transcriptList.children.length > 100) transcriptList.firstChild.remove();
     revealIndex = 0;
     revealedText = "";
+    lipsyncCursor = 0;
     agentLine.textContent = "";
+    // A new utterance invalidates any queued lipsync articulation.
+    textVisemes.reset();
   }
   // Final provider transcripts are authoritative, not an additional delta.
   current.textContent = event.final ? event.text : current.textContent + event.text;
   current.dataset.final = String(Boolean(event.final));
-  if (event.final && logTranscript) {
-    // The full-history drawer keeps finished lines only.
-    const logged = current.cloneNode(false);
-    logTranscript.append(logged);
-    while (logTranscript.children.length > 200) logTranscript.firstChild.remove();
+  // One history row follows interim text through its authoritative final.
+  currentLog.textContent = current.textContent;
+  currentLog.dataset.final = current.dataset.final;
+  // Textual cues add expression, without claiming to measure emotion.
+  if (event.final && event.speaker === "assistant") {
+    if (/\b(sorry|unfortunately|failed|unable)\b/i.test(event.text)) controller.pulseExpression("concerned", 2.8);
+    else if (/\b(done|completed|fixed|successfully|glad)\b/i.test(event.text)) controller.pulseExpression("satisfied", 2.4);
+    else if (/\b(uncertain|not sure|might|perhaps)\b/i.test(event.text)) controller.pulseExpression("uncertain", 2.4);
+    else if (event.text.trim().endsWith("?")) controller.pulseExpression("curious", 2.0);
   }
+  document.querySelector("#log-empty")?.setAttribute("hidden", "");
+  const count = document.querySelector("#log-count");
+  if (count) count.textContent = String(logTranscript.children.length).padStart(2, "0");
   if (event.speaker === "user") controller.transcribing();
   current.scrollIntoView({ block: "nearest" });
 });
@@ -211,6 +237,24 @@ function updateAgentReveal(visual) {
     revealedText = text;
     agentLine.textContent = text;
   }
+}
+
+// Lipsync owns its own cursor over the utterance, paced like real speech
+// (roughly 11–20 characters per second, nudged by the speech envelope). The
+// UI reveal above is a quick kinetic cascade — far faster than the voice —
+// so feeding the mouth from it would articulate whole sentences in a blink.
+let lipsyncCursor = 0;
+function feedLipsync(dt, visual) {
+  if (!current || current.dataset.speaker !== "assistant") return;
+  const full = current.textContent;
+  if (lipsyncCursor > full.length) lipsyncCursor = full.length;
+  if (visual.speechActivity <= 0.02) return;
+  const cps = 11 + 9 * Math.min(1, Math.max(0, visual.speechActivity));
+  const next = lipsyncCursor + dt * cps;
+  if (Math.floor(next) > Math.floor(lipsyncCursor)) {
+    textVisemes.feed(full.slice(Math.floor(lipsyncCursor), Math.floor(next)));
+  }
+  lipsyncCursor = next;
 }
 
 // --- tasks / tools -----------------------------------------------------------
@@ -294,9 +338,22 @@ let lastAccentCss = "";
 let fps = 60;
 let debugFrame = null;
 let baseMeta = "";
+let lastPresence = "";
+const presenceCopy = {
+  dormant: ["Establishing connection", "Preparing your voice session."],
+  offline: ["Connection offline", "Your conversation remains visible."],
+  idle: ["Ready when you are", "Talk naturally. You can interrupt a reply."],
+  listening: ["I’m listening", "Your speech is being captured in real time."],
+  thinking: ["Making sense of it", "Preparing a response from your conversation."],
+  tool: ["Working with Hermes", "Your agents are at work. You can keep talking."],
+  waiting: ["Hermes is on it", "Background tasks are running. You can keep talking."],
+  speaking: ["Speaking with you", "Speak at any time to interrupt."],
+  paused: ["Listening paused", "Unmute when you’re ready to continue."],
+  error: ["Voice needs attention", "Check the connection notice for details."],
+};
 
 function frame(now) {
-  requestAnimationFrame(frame);
+  frameHandle = requestAnimationFrame(frame);
   if (document.hidden) return;
   const dt = Math.min(0.05, (now - (frame.last || now)) / 1000);
   frame.last = now;
@@ -308,15 +365,34 @@ function frame(now) {
   controller.speechRaw = analysis.rms;
   controller.update(dt, { speakingNow, micActive: audio.microphoneActive });
   const visual = controller.readout();
+  const presenceMode = visual.mode === "idle" && !audio.microphoneActive ? "paused" : visual.mode;
+  if (presenceMode !== lastPresence) {
+    lastPresence = presenceMode;
+    const copy = presenceCopy[presenceMode] || presenceCopy.idle;
+    if (presenceLabel) presenceLabel.textContent = copy[0];
+    if (presenceDetail) presenceDetail.textContent = copy[1];
+    if (client.connected && presenceMode !== "error") {
+      if (state.dataset.state === "error") state.dataset.state = audio.microphoneActive ? "armed" : "muted";
+      state.textContent = copy[0];
+      detail.textContent = copy[1];
+    }
+  }
 
-  // Visemes: real outgoing-audio analysis, or the synthetic debug driver.
+  // Visemes: real outgoing-audio analysis, overridden by the synthetic debug
+  // driver, articulation-corrected by the text scheduler when it is actively
+  // tracking revealed speech. Text shapes the mouth; audio paces it.
   const w = syntheticVisemes ? syntheticVisemes() : visemes.update(analysis, dt);
-  mouth.jaw = w.open * 0.88 + w.round * 0.4 + w.narrow * 0.12;
-  mouth.wide = Math.max(0, w.wide * 0.9 + w.teeth * 0.2 - w.round * 0.3);
-  mouth.round = w.round + w.narrow * 0.55;
-  mouth.narrow = w.narrow;
-  mouth.press = w.teeth * 0.5 + w.closed * 0.35;
-  mouth.teeth = w.teeth;
+  const tw = textVisemes.update(dt, analysis.rms);
+  const textMix = syntheticVisemes ? 0 : textVisemes.active;
+  for (const key of VISEME_KEYS) {
+    blended[key] = w[key] + (tw[key] - w[key]) * textMix;
+  }
+  mouth.jaw = blended.open * 0.88 + blended.round * 0.4 + blended.narrow * 0.12;
+  mouth.wide = Math.max(0, blended.wide * 0.9 + blended.teeth * 0.2 - blended.round * 0.3);
+  mouth.round = blended.round + blended.narrow * 0.55;
+  mouth.narrow = blended.narrow;
+  mouth.press = blended.teeth * 0.5 + blended.closed * 0.35;
+  mouth.teeth = blended.teeth;
   mouth.energy = analysis.rms;
 
   // Contract surface for assistive tech and e2e: canvas[data-state].
@@ -349,15 +425,23 @@ function frame(now) {
         chip.textContent = packet.label;
         chip.hidden = false;
       }
-      chip.style.transform = `translate(${Math.round(packet.screen[0])}px, ${Math.round(packet.screen[1])}px)`;
+      // Clamp into the viewport so labels stay readable beside the head on
+      // any aspect ratio. The reserved width tracks the CSS chip max-width,
+      // which shrinks on narrow viewports (240px desktop, 145px mobile).
+      const chipBudget = Math.min(250, Math.max(120, window.innerWidth * 0.45));
+      const chipX = Math.min(Math.max(4, packet.screen[0]), window.innerWidth - chipBudget);
+      const chipY = Math.min(Math.max(4, packet.screen[1]), window.innerHeight - 44);
+      chip.style.transform = `translate(${Math.round(chipX)}px, ${Math.round(chipY)}px)`;
     }
   }
 
   // Microphone level meter (transform only — no layout).
   meter.style.transform = `scaleX(${Math.min(1, visual.micLevel * (visual.listening > 0.3 ? 1 : 0.25)).toFixed(3)})`;
+  if (inputSignal) inputSignal.style.transform = `scaleX(${Math.min(1, visual.micLevel).toFixed(3)})`;
+  if (outputSignal) outputSignal.style.transform = `scaleX(${Math.min(1, analysis.rms).toFixed(3)})`;
 
   // Latency readout while the entity reasons.
-  if (visual.mode === "thinking") {
+  {
     const { perceive, respond } = visual.latency;
     const parts = [];
     if (perceive !== null) parts.push(`perceive ${perceive}ms`);
@@ -367,6 +451,7 @@ function frame(now) {
   }
 
   updateAgentReveal(visual);
+  feedLipsync(dt, visual);
   debugFrame?.(dt);
 }
 
@@ -403,17 +488,13 @@ async function boot() {
     mute.disabled = false;
     await audio.startMicrophone();
   } catch (e) {
-    // A deleted or expired saved chat should not strand the standalone console.
-    // Clear only the remembered conversation and start a fresh one once.
-    if (rememberedConversation) {
-      try { sessionStorage.removeItem(conversationKey); } catch { /* storage may be blocked */ }
-      rememberedConversation = undefined;
-      try {
-        await client.connect({ conversation: { mode: "new" } });
-        mute.disabled = false;
-        await audio.startMicrophone();
-      } catch (retryError) { showError(retryError); mute.textContent = "Unmute"; }
-    } else { showError(e); mute.textContent = "Unmute"; }
+    // A deleted or expired thread should not strand the standalone console:
+    // the gateway re-resolves the durable thread, so retry once before erroring.
+    try {
+      await client.connect({ conversation: { mode: "persistent" } });
+      mute.disabled = false;
+      await audio.startMicrophone();
+    } catch (retryError) { showError(retryError); mute.textContent = "Unmute"; }
   }
 }
 
@@ -437,14 +518,22 @@ if (reducedMotionQuery) {
 
 const logToggle = document.querySelector("#log-toggle");
 const logDrawer = document.querySelector("#log-drawer");
-logToggle?.addEventListener("click", () => {
-  logDrawer.hidden = !logDrawer.hidden;
-  logToggle.classList.toggle("active", !logDrawer.hidden);
+function setLogOpen(open) {
+  logDrawer.hidden = !open;
+  logToggle.classList.toggle("active", open);
+  logToggle.setAttribute("aria-expanded", String(open));
+}
+logToggle?.addEventListener("click", () => setLogOpen(logDrawer.hidden));
+logToggle?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    setLogOpen(logDrawer.hidden);
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && logDrawer && !logDrawer.hidden) {
-    logDrawer.hidden = true;
-    logToggle.classList.remove("active");
+    setLogOpen(false);
+    logToggle.focus();
   }
 });
 
@@ -456,5 +545,5 @@ window.addEventListener("pagehide", (event) => {
   void client.disconnect();
 }, { once: true });
 
-const frameHandle = requestAnimationFrame(frame);
+let frameHandle = requestAnimationFrame(frame);
 void boot();

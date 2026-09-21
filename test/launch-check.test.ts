@@ -65,6 +65,7 @@ describe("launch-check", () => {
         hermes: { ok: true },
         realtime: { ok: true },
         tasks: { ok: true },
+        context: { ok: true },
       }),
       pluginStatus: async () => ({
         source: "/pkg/plugins/hermes-live",
@@ -123,6 +124,7 @@ describe("launch-check", () => {
         hermes: { ok: true },
         realtime: { ok: true },
         tasks: { ok: true },
+        context: { ok: true },
       }),
       pluginStatus: async () => ({
         source: "/pkg/plugins/hermes-live",
@@ -165,6 +167,7 @@ describe("launch-check", () => {
         hermes: { ok: true },
         realtime: { ok: true },
         tasks: { ok: true },
+        context: { ok: true },
       }),
       pluginStatus: async () => ({
         source: "/pkg/plugins/hermes-live",

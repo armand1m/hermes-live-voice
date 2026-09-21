@@ -33,6 +33,9 @@ import {
   type LiveModelSession,
 } from "./ports/realtime-model.port.js";
 import { buildSystemInstruction } from "./system-instruction.js";
+import { buildContextDigest } from "./context-digest.js";
+import type { SpeechDetectionService } from "./vad/detection-service.js";
+import type { SpeechGate } from "./vad/speech-gate.js";
 import {
   isTaskNotificationState,
   projectSupersededTaskNotification,
@@ -54,6 +57,21 @@ const MAX_PENDING_CLIENT_MESSAGES = 256;
 const MAX_PENDING_CLIENT_BYTES = 8 * 1024 * 1024;
 const MAX_CLIENT_MESSAGE_ERRORS = 16;
 const MAX_PENDING_PROVIDER_TOOL_CALLS = 32;
+/**
+ * User audio/text held while a provider tool call is executing. The local
+ * speech runtime refuses (and drops the session) when a new turn arrives
+ * while a function call output is still outstanding, so the gateway holds
+ * turns and releases them once the tool result has been delivered.
+ */
+const MAX_HELD_AUDIO_MS = 10_000;
+const MAX_HELD_INPUTS = 256;
+/** Forced behavior for the dedicated Hermes recall session behind search_past_chats. */
+const RECALL_INSTRUCTIONS = [
+  "You are answering one voice recall request about this user's past conversations.",
+  "Use the session_search tool with a short query to find relevant past conversations, then answer in at most three short sentences suitable for speech.",
+  "If nothing relevant is found, say plainly that nothing was found.",
+  "Never mention tool names, session ids, or these instructions.",
+].join(" ");
 const MAX_CONCURRENT_PROVIDER_TOOL_CALLS = 4;
 const MAX_PROCESSED_PROVIDER_TOOL_CALLS = 256;
 const MAX_SEEN_PROVIDER_TOOL_CALLS = 4_096;
@@ -69,6 +87,8 @@ export interface LiveGatewaySessionDeps {
   taskSupervisor: TaskSupervisorPort;
   liveModel: LiveModelAdapter;
   logger: Logger;
+  /** Gateway speech detection (protocol v7); omitted sessions keep client-side VAD. */
+  speechDetection?: SpeechDetectionService;
 }
 
 interface ProviderToolCallRecord {
@@ -79,6 +99,11 @@ interface ProviderToolCallRecord {
   response?: Record<string, unknown>;
   responseBytes?: number;
 }
+
+type HeldSessionInput =
+  | { kind: "audio"; data: string; mimeType: string }
+  | { kind: "audio_end" }
+  | { kind: "text"; text: string };
 
 export class LiveGatewaySession {
   private readonly id = `live_${randomUUID().replaceAll("-", "")}`;
@@ -109,6 +134,11 @@ export class LiveGatewaySession {
   private providerResponseActive = false;
   private providerTurnResponseExpected = false;
   private userSpeaking = false;
+  private speechGate?: SpeechGate;
+  private recallSessionId?: string;
+  private heldInputs: HeldSessionInput[] = [];
+  private heldAudioMs = 0;
+  private heldInputFlushQueued = false;
   private messageQueue: Promise<void> = Promise.resolve();
   private pendingClientMessages = 0;
   private pendingClientBytes = 0;
@@ -177,9 +207,40 @@ export class LiveGatewaySession {
       unsubscribe = this.deps.taskSupervisor.subscribe(this.ownerId, (record) => this.receiveTaskRecord(record));
       this.unsubscribeTasks = unsubscribe;
 
+      // Speech detection loads its model in parallel with provider connect so
+      // the session-ready handshake stays bounded by the provider, not the VAD.
+      const speechGateReady = this.protocolVersion >= 7
+        && this.deps.config.vad.engine !== "disabled"
+        && this.deps.speechDetection
+        ? this.deps.speechDetection.createGate({
+          streamThrough: this.deps.config.openai.turnDetection === "semantic_vad",
+          onSpeechExpired: () => this.handleConfirmedSpeechStopped(),
+        }).catch((error: unknown) => {
+          this.deps.logger.warn("gateway speech detection unavailable, using client VAD", {
+            sessionId: this.id,
+            error: errorToMessage(error),
+          });
+          return undefined;
+        })
+        : undefined;
+
       const capabilities = await this.deps.hermes.assertRunsSupported(this.abort.signal);
+      // The digest and conversation resolution are independent; both must be
+      // ready before the provider connect builds the system instruction.
+      const digestReady = buildContextDigest({
+        config: this.deps.config,
+        hermes: this.deps.hermes,
+        logger: this.deps.logger,
+        capabilities,
+        signal: this.abort.signal,
+        compact: this.deps.config.realtime.provider === "local",
+      });
+      const conversationReady = this.protocolVersion >= 4
+        ? this.resolveConversation(message.conversation ?? { mode: "unbound" })
+        : Promise.resolve();
+      const [digest] = await Promise.all([digestReady, conversationReady]);
       if (this.protocolVersion >= 4) {
-        this.conversation = await this.resolveConversation(message.conversation ?? { mode: "unbound" });
+        this.conversation = await conversationReady as PublicConversation;
       }
       startupPhase = "realtime";
       const providerEvents: LiveModelEvent[] = [];
@@ -197,6 +258,7 @@ export class LiveGatewaySession {
       // promise before startup cleanup can attach its await.
       void providerOpen.catch(() => undefined);
 
+      const availableTools = this.availableProviderTools();
       const connect = this.deps.liveModel.connect({
         sessionId: this.id,
         systemInstruction: [
@@ -208,12 +270,17 @@ export class LiveGatewaySession {
               voiceInputPause: this.protocolVersion >= 6,
             },
             this.deps.config.realtime.provider === "local",
+            {
+              searchPastChats: availableTools.includes("search_past_chats"),
+              remember: availableTools.includes("remember"),
+            },
           ),
           ...(this.deps.config.hermes.instructions
             ? [`Personal context and behavior instructions (operator configured):\n${this.deps.config.hermes.instructions}`]
             : []),
+          ...(digest.text ? [digest.text] : []),
         ].join("\n\n"),
-        availableTools: this.availableProviderTools(),
+        availableTools,
         safetyIdentifier: safetyIdentifierForSessionKey(this.sessionKey),
         callbacks: {
           onOpen: () => {
@@ -296,6 +363,7 @@ export class LiveGatewaySession {
         this.deps.taskSupervisor.listActive(this.ownerId),
         this.deps.taskSupervisor.listUnreadNotifications(this.ownerId),
       ]);
+      this.speechGate = speechGateReady ? await speechGateReady : undefined;
       const initialTasks = mergeTaskRecords([
         ...activeTasks,
         ...unreadTasks,
@@ -311,7 +379,9 @@ export class LiveGatewaySession {
         sessionId: this.id,
         model: this.deps.config.realtime.model,
         hermes: publicHermesCapabilities(capabilities),
-        realtime: realtimeClientCapabilities(this.deps.config),
+        realtime: realtimeClientCapabilities(this.deps.config, {
+          gatewaySpeechDetection: this.speechGate !== undefined,
+        }),
         tasks: {
           scope: "owner",
           sequence: "per_task",
@@ -488,6 +558,14 @@ export class LiveGatewaySession {
     switch (message.type) {
       case "audio.input":
         validateAudioFrame(message.data, message.mimeType, this.deps.config.server.maxAudioBytes);
+        if (this.shouldHoldSessionInput()) {
+          this.holdAudioInput(message.data, message.mimeType);
+          return;
+        }
+        if (this.speechGate && isPcmMimeType(message.mimeType)) {
+          await this.handleGatedAudioInput(message);
+          return;
+        }
         this.userSpeaking = true;
         await this.forwardRealtimeClientInput(
           "audio",
@@ -495,6 +573,10 @@ export class LiveGatewaySession {
         );
         return;
       case "audio.end":
+        if (this.shouldHoldSessionInput()) {
+          this.heldInputs.push({ kind: "audio_end" });
+          return;
+        }
         this.userSpeaking = false;
         await this.forwardRealtimeClientInput("audio turn", async () => {
           if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
@@ -502,6 +584,10 @@ export class LiveGatewaySession {
         return;
       case "text.input":
         validateText(message.text, this.deps.config.server.maxTextChars, "Text input");
+        if (this.shouldHoldSessionInput()) {
+          this.holdTextInput(message.text);
+          return;
+        }
         this.userSpeaking = false;
         await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(message.text), true);
         return;
@@ -609,9 +695,26 @@ export class LiveGatewaySession {
     const getSession = this.deps.hermes.getSession;
     const getSessionHistory = this.deps.hermes.getSessionHistory;
     if (!assertSessionsSupported || !createSession || !getSession || !getSessionHistory) {
+      if (selection.mode === "persistent") {
+        this.deps.logger.warn("hermes session continuity unavailable; persistent voice thread degraded to unbound", {
+          sessionId: this.id,
+        });
+        return { mode: "unbound" };
+      }
       throw new Error("Hermes session continuity is unavailable in this installation.");
     }
-    await assertSessionsSupported.call(this.deps.hermes, this.abort.signal);
+    try {
+      await assertSessionsSupported.call(this.deps.hermes, this.abort.signal);
+    } catch (error) {
+      if (selection.mode === "persistent") {
+        this.deps.logger.warn("hermes session continuity unavailable; persistent voice thread degraded to unbound", {
+          sessionId: this.id,
+          error: errorToMessage(error),
+        });
+        return { mode: "unbound" };
+      }
+      throw error;
+    }
 
     if (selection.mode === "new") {
       const session = await createSession.call(this.deps.hermes, {
@@ -621,9 +724,76 @@ export class LiveGatewaySession {
       return publicConversation("new", session);
     }
 
+    if (selection.mode === "persistent") {
+      // Serialize so simultaneous devices cannot both race past a missing
+      // thread lookup (a duplicate title is still benign: the newest wins
+      // on the next resolution).
+      return this.serializeConversationOperation(
+        () => this.resolvePersistentConversation(),
+      );
+    }
+
     const history = await getSessionHistory.call(this.deps.hermes, selection.sessionId!, this.abort.signal);
     const session = await getSession.call(this.deps.hermes, history.sessionId, this.abort.signal);
     return publicConversation("resume", session);
+  }
+
+  /**
+   * The durable per-owner voice thread: the most recent Hermes session whose
+   * title exactly matches the configured voice thread title, or a fresh one.
+   */
+  private async resolvePersistentConversation(): Promise<PublicConversation> {
+    const title = this.deps.config.context.voiceThreadTitle;
+    const newestId = await this.findSessionIdByTitle(title);
+
+    if (newestId) {
+      try {
+        const history = await this.deps.hermes.getSessionHistory!.call(this.deps.hermes, newestId, this.abort.signal);
+        const session = await this.deps.hermes.getSession!.call(this.deps.hermes, history.sessionId, this.abort.signal);
+        return publicConversation("resume", session);
+      } catch (error) {
+        this.deps.logger.warn("persistent voice thread failed to resume; creating a fresh thread", {
+          sessionId: this.id,
+          threadSessionId: newestId,
+          error: errorToMessage(error),
+        });
+      }
+    }
+
+    const session = await this.deps.hermes.createSession!.call(this.deps.hermes, {
+      title,
+      signal: this.abort.signal,
+    });
+    return publicConversation("new", session);
+  }
+
+  /** Newest session id whose title matches exactly, or undefined. */
+  private async findSessionIdByTitle(title: string): Promise<string | undefined> {
+    const listSessions = this.deps.hermes.listSessions;
+    const existing = listSessions
+      ? await listSessions.call(this.deps.hermes, { title, limit: 5, signal: this.abort.signal }).catch(() => undefined)
+      : undefined;
+    const newest = existing?.reduce<HermesSessionSummary | undefined>(
+      (latest, session) => (latest === undefined || (session.lastActive ?? 0) >= (latest.lastActive ?? 0) ? session : latest),
+      undefined,
+    );
+    return newest?.id;
+  }
+
+  /** Lazily created dedicated recall session behind search_past_chats. */
+  private async recallSession(): Promise<string> {
+    if (this.recallSessionId) return this.recallSessionId;
+    const title = this.deps.config.context.recallSessionTitle;
+    let sessionId = await this.findSessionIdByTitle(title);
+    if (!sessionId) {
+      const created = await this.deps.hermes.createSession!.call(this.deps.hermes, {
+        title,
+        signal: this.abort.signal,
+      });
+      sessionId = created.id;
+    }
+    this.recallSessionId = sessionId;
+    return sessionId;
   }
 
   private serializeConversationOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -638,12 +808,20 @@ export class LiveGatewaySession {
       "list_background_tasks",
       "get_background_task",
       "stop_background_task",
+      "remember",
     ];
     if (this.protocolVersion >= 4 && this.deps.taskSupervisor.followUp) {
       tools.push("follow_up_background_task");
     }
     if (this.protocolVersion >= 4 && this.conversation.mode !== "unbound" && this.deps.hermes.chatSession) {
       tools.unshift("continue_hermes_conversation");
+    }
+    if (
+      this.deps.hermes.chatSession
+      && this.deps.hermes.listSessions
+      && this.deps.hermes.createSession
+    ) {
+      tools.push("search_past_chats");
     }
     if (this.protocolVersion >= 6) tools.push("pause_voice_input");
     return tools;
@@ -683,6 +861,64 @@ export class LiveGatewaySession {
             ...(result.usage ? { usage: result.usage } : {}),
           };
         });
+      }
+      case "search_past_chats": {
+        const query = stringArg(call, "query");
+        if (!query) throw new Error("search_past_chats requires query.");
+        validateText(query, this.deps.config.server.maxTextChars, "Past chat search query");
+        const chatSession = this.deps.hermes.chatSession;
+        if (!chatSession || !this.deps.hermes.listSessions || !this.deps.hermes.createSession) {
+          return Promise.resolve({ ok: false, error: "This Hermes installation cannot search past conversations." });
+        }
+        return this.serializeConversationOperation(async () => {
+          const recallSessionId = await this.recallSession();
+          try {
+            const result = await Promise.race([
+              chatSession.call(this.deps.hermes, recallSessionId, query, {
+                signal: this.abort.signal,
+                sessionKey: this.sessionKey!,
+                instructions: RECALL_INSTRUCTIONS,
+              }),
+              new Promise<never>((_resolve, reject) => setTimeout(
+                () => reject(new Error("recall timeout")),
+                this.deps.config.context.recallTimeoutMs,
+              ).unref?.()),
+            ]);
+            return {
+              ok: true,
+              query,
+              message: result.content.slice(0, 4_000),
+            };
+          } catch (error) {
+            if (this.closing) throw error;
+            this.deps.logger.warn("past chat search failed", {
+              sessionId: this.id,
+              error: errorToMessage(error),
+            });
+            return { ok: false, error: "Past conversation search is unavailable right now." };
+          }
+        });
+      }
+      case "remember": {
+        const fact = stringArg(call, "fact");
+        if (!fact) throw new Error("remember requires fact.");
+        validateText(fact, this.deps.config.server.maxTextChars, "Remembered fact");
+        return this.runTaskOperation(
+          () => this.deps.taskSupervisor.submit({
+            ownerIdentity: this.sessionKey!,
+            sessionKey: this.sessionKey!,
+            input: `Remember persistently in long-term memory: ${fact}`,
+            title: `Remember: ${fact.slice(0, 80)}`,
+            executionMode: "exclusive",
+            ...(this.conversation.sessionId ? { originConversationId: this.conversation.sessionId } : {}),
+          }),
+          "Memory write could not be accepted safely.",
+        ).then((task) => ({
+          spoken_response: "I've sent that to Hermes to remember.",
+          ok: true,
+          task_id: task.taskId,
+          status: task.status,
+        }));
       }
       case "start_background_task": {
         const message = stringArg(call, "message");
@@ -940,6 +1176,7 @@ export class LiveGatewaySession {
       record.responseBytes = undefined;
       this.send({ type: "log", level: "info", message: "Realtime provider cancelled a tool call" });
     }
+    this.maybeReleaseHeldInputs();
   }
 
   private async deliverProviderToolResponse(
@@ -988,6 +1225,7 @@ export class LiveGatewaySession {
         });
       }).finally(() => {
         this.activeProviderToolOperations -= 1;
+        this.maybeReleaseHeldInputs();
         this.drainProviderToolOperations();
       });
     }
@@ -996,6 +1234,144 @@ export class LiveGatewaySession {
   private failProviderToolQueueOverflow(): void {
     this.fail("realtime_tool_queue_overflow", new Error("Realtime provider exceeded the safe tool-call limit."), false);
     void this.closeClientAfterCleanup(1011, "realtime tool queue overflow");
+  }
+
+  /**
+   * Speech-confirmed audio path (protocol v7): the gate decides which frames
+   * reach the provider and when the client learns about confirmed speech, so
+   * noise never interrupts a response and the provider VAD stays protected.
+   */
+  private async handleGatedAudioInput(message: Extract<ClientMessage, { type: "audio.input" }>): Promise<void> {
+    const gate = this.speechGate!;
+    gate.setDownlinkActive(this.providerResponseActive || this.providerTurnResponseExpected);
+    const decision = await gate.ingest({ data: message.data, mimeType: message.mimeType });
+    if (this.closing) return;
+    if (decision.started) {
+      this.userSpeaking = true;
+      this.send({
+        type: "input.speech_started",
+        provider: "gateway",
+        ...(decision.probability === undefined ? {} : { probability: decision.probability }),
+      });
+    }
+    for (const frame of decision.forward) {
+      if (this.closing) return;
+      await this.forwardRealtimeClientInput(
+        "audio",
+        () => this.liveSession!.sendRealtimeAudio({ data: frame.data, mimeType: frame.mimeType }),
+      );
+    }
+    if (decision.stopped) {
+      this.handleConfirmedSpeechStopped();
+    }
+  }
+
+  private handleConfirmedSpeechStopped(): void {
+    if (this.closing) return;
+    this.userSpeaking = false;
+    this.send({ type: "input.speech_stopped", provider: "gateway" });
+    this.scheduleNotificationFlush();
+  }
+
+  /**
+   * True while any provider tool call has not yet delivered its output: the
+   * local speech runtime fails a new turn in that window ("Cannot generate a
+   * response while function call outputs are pending") and drops the session,
+   * so the gateway holds user turns until the tool result lands.
+   */
+  private providerToolResponsePending(): boolean {
+    for (const record of this.providerToolCalls.values()) {
+      if (!record.cancelled && record.responseDelivery !== "sent") return true;
+    }
+    return false;
+  }
+
+  private shouldHoldSessionInput(): boolean {
+    return this.heldInputFlushQueued || this.heldInputs.length > 0 || this.providerToolResponsePending();
+  }
+
+  private holdAudioInput(data: string, mimeType: string): void {
+    const samples = Buffer.from(data, "base64").length / 2;
+    const frameMs = samples * 1_000 / requirePcmSampleRate(mimeType);
+    this.heldInputs.push({ kind: "audio", data, mimeType });
+    this.heldAudioMs += frameMs;
+    this.userSpeaking = true;
+    while (
+      this.heldInputs.length > 1
+      && (this.heldAudioMs > MAX_HELD_AUDIO_MS || this.heldInputs.length > MAX_HELD_INPUTS)
+    ) {
+      const dropped = this.heldInputs.shift();
+      if (!dropped || dropped.kind !== "audio") break;
+      const droppedSamples = Buffer.from(dropped.data, "base64").length / 2;
+      this.heldAudioMs = Math.max(0, this.heldAudioMs - droppedSamples * 1_000 / requirePcmSampleRate(dropped.mimeType));
+    }
+  }
+
+  private holdTextInput(text: string): void {
+    this.heldInputs.push({ kind: "text", text });
+    while (this.heldInputs.length > MAX_HELD_INPUTS && this.heldInputs.length > 1) {
+      const dropped = this.heldInputs.shift();
+      if (!dropped || dropped.kind !== "audio") break;
+      const droppedSamples = Buffer.from(dropped.data, "base64").length / 2;
+      this.heldAudioMs = Math.max(0, this.heldAudioMs - droppedSamples * 1_000 / requirePcmSampleRate(dropped.mimeType));
+    }
+  }
+
+  private maybeReleaseHeldInputs(): void {
+    if (this.closing || this.heldInputs.length === 0 || this.heldInputFlushQueued) return;
+    if (this.providerToolResponsePending()) return;
+    this.heldInputFlushQueued = true;
+    const drain = async () => {
+      if (this.closing) {
+        this.heldInputs = [];
+        this.heldAudioMs = 0;
+        return;
+      }
+      const held = this.heldInputs;
+      this.heldInputs = [];
+      this.heldAudioMs = 0;
+      try {
+      for (const input of held) {
+        if (this.closing) return;
+        if (input.kind === "text") {
+          await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(input.text), true);
+          continue;
+        }
+        if (input.kind === "audio_end") {
+          this.userSpeaking = false;
+          await this.forwardRealtimeClientInput("audio turn", async () => {
+            if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
+          });
+          continue;
+        }
+        if (this.speechGate && isPcmMimeType(input.mimeType)) {
+          await this.handleGatedAudioInput({ type: "audio.input", data: input.data, mimeType: input.mimeType });
+        } else {
+          await this.forwardRealtimeClientInput(
+            "audio",
+            () => this.liveSession!.sendRealtimeAudio({ data: input.data, mimeType: input.mimeType }),
+          );
+        }
+      }
+      } catch (error) {
+        if (!this.closing) {
+          this.deps.logger.error("held session input flush failed", {
+            sessionId: this.id,
+            error: errorToMessage(error),
+          });
+          this.fail("held_input_flush_failed", new Error("Held session input could not be delivered."), false);
+          void this.closeClientAfterCleanup(1011, "held input flush failed");
+        }
+      }
+    };
+    // Serialized with client frames so held audio never interleaves with live audio.
+    this.messageQueue = this.messageQueue.then(() => drain().finally(() => {
+      this.heldInputFlushQueued = false;
+      // Frames that arrived while draining were held; release them too.
+      this.maybeReleaseHeldInputs();
+    }), () => {
+      this.heldInputFlushQueued = false;
+    });
   }
 
   private failExpiredProviderToolCallReplay(): void {
@@ -1066,7 +1442,7 @@ export class LiveGatewaySession {
       return;
     }
     if (event.type === "input_speech_started") {
-      this.userSpeaking = true;
+      if (!this.speechGate) this.userSpeaking = true;
       const itemId = publicProviderIdentifier(event.itemId);
       const audioStartMs = publicAudioStartMs(event.audioStartMs);
       this.send({
@@ -1396,6 +1772,11 @@ export class LiveGatewaySession {
     this.unsubscribeTasks?.();
     this.unsubscribeTasks = undefined;
     this.pendingTaskRecords.clear();
+    this.speechGate?.reset();
+    this.speechGate = undefined;
+    this.heldInputs = [];
+    this.heldAudioMs = 0;
+    this.heldInputFlushQueued = false;
     if (this.notificationRetryTimer !== undefined) {
       clearTimeout(this.notificationRetryTimer);
       this.notificationRetryTimer = undefined;

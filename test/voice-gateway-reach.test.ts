@@ -39,7 +39,11 @@ async function roundTrip(env?: Record<string, string | undefined>) {
     expect(harness.observed.speechReplies[0].metadata.hermes_live_purpose).toMatch(/^conversation_(answer|summary)$/);
     if (!env) {
       expect(harness.observed.chats).toEqual(['Hello. Please say hello back.']);
-      expect(harness.observed.requests).toContain('POST /api/sessions/voice-contract/chat');
+      // The durable voice thread is created (POST) then chatted through, and
+      // the context digest pulls the sessions list plus the skills catalog.
+      expect(harness.observed.requests.some((request) => /^POST \/api\/sessions\/voice-contract-\d+\/chat$/u.test(request))).toBe(true);
+      expect(harness.observed.requests.some((request) => request === 'POST /api/sessions')).toBe(true);
+      expect(harness.observed.requests).toContain('GET /v1/skills');
     } else {
       // Errors also have spoken receipts: require successful agent output.
       const reply = harness.observed.speechReplies[0];

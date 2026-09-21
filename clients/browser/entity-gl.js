@@ -147,10 +147,12 @@ export class PointField {
     this.gl = gl;
     this.capacity = capacity;
     this.count = 0;
-    this.centers = new Float32Array(capacity * 3);
-    this.sizes = new Float32Array(capacity);
-    this.colors = new Float32Array(capacity * 4);
-    this.phases = new Float32Array(capacity);
+    // Mesh attributes are ordinary per-vertex buffers (no instancing), so
+    // every sprite value must be repeated for each of the quad's 4 vertices.
+    this.centers = new Float32Array(capacity * 4 * 3);
+    this.sizes = new Float32Array(capacity * 4);
+    this.colors = new Float32Array(capacity * 4 * 4);
+    this.phases = new Float32Array(capacity * 4);
     // Four corners (±1, ±1) per sprite: 8 floats each.
     const corners = new Float32Array(capacity * 8);
     const indices = new Uint16Array(capacity * 6);
@@ -172,7 +174,7 @@ export class PointField {
       { name: "aCorner", size: 2 },
       { name: "aSize", size: 1, dynamic: true },
       { name: "aColor", size: 4, dynamic: true },
-      { name: "aPhase", size: 1 },
+      { name: "aPhase", size: 1, dynamic: true },
     ]);
     this.mesh.set("aCenter", this.centers);
     this.mesh.set("aCorner", corners);
@@ -189,25 +191,32 @@ export class PointField {
 
   push(x, y, z, size, r, g, b, a, phase = 0) {
     if (this.count >= this.capacity) return;
-    const i = this.count++;
-    this.centers[i * 3] = x;
-    this.centers[i * 3 + 1] = y;
-    this.centers[i * 3 + 2] = z;
-    this.sizes[i] = size;
-    this.colors[i * 4] = r;
-    this.colors[i * 4 + 1] = g;
-    this.colors[i * 4 + 2] = b;
-    this.colors[i * 4 + 3] = a;
-    this.phases[i] = phase;
+    const sprite = this.count++;
+    for (let corner = 0; corner < 4; corner++) {
+      const vertex = sprite * 4 + corner;
+      const center = vertex * 3;
+      const color = vertex * 4;
+      this.centers[center] = x;
+      this.centers[center + 1] = y;
+      this.centers[center + 2] = z;
+      this.sizes[vertex] = size;
+      this.colors[color] = r;
+      this.colors[color + 1] = g;
+      this.colors[color + 2] = b;
+      this.colors[color + 3] = a;
+      this.phases[vertex] = phase;
+    }
   }
 
   draw(renderer, { flicker = 0, model } = {}) {
     if (this.count === 0) return;
     const gl = this.gl;
-    // Stream only the dynamic ranges (corners/phases/indices are static).
-    this.mesh.subupdate("aCenter", this.centers.subarray(0, this.count * 3));
-    this.mesh.subupdate("aSize", this.sizes.subarray(0, this.count));
-    this.mesh.subupdate("aColor", this.colors.subarray(0, this.count * 4));
+    // Stream only the active quad vertices (corners/indices are static).
+    const vertices = this.count * 4;
+    this.mesh.subupdate("aCenter", this.centers.subarray(0, vertices * 3));
+    this.mesh.subupdate("aSize", this.sizes.subarray(0, vertices));
+    this.mesh.subupdate("aColor", this.colors.subarray(0, vertices * 4));
+    this.mesh.subupdate("aPhase", this.phases.subarray(0, vertices));
     // Index range for this frame's sprite count.
     this.mesh.index.count = this.count * 6;
     this.mesh.draw(this.program, {

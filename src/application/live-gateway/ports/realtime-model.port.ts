@@ -8,6 +8,8 @@ export interface LiveToolCall {
 
 export type LiveToolName =
   | "continue_hermes_conversation"
+  | "search_past_chats"
+  | "remember"
   | "start_background_task"
   | "list_background_tasks"
   | "get_background_task"

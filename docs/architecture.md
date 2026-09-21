@@ -1,6 +1,6 @@
 # Architecture
 
-Hermes Live Voice is a continuous voice gateway for Hermes Agent. The speech provider handles conversation and turn-taking. Hermes keeps its memory, tools, skills, MCP servers, and execution environment. The gateway owns authentication, persistent background-task supervision, and the protocol between them.
+Hermes Live Voice is a continuous voice gateway for Hermes Agent. The speech provider handles conversation and turn-taking. Hermes keeps its memory, tools, skills, MCP servers, and execution environment (the gateway bridges read access via a per-session context digest, a durable titled voice thread, and the search_past_chats/remember tools). The gateway owns authentication, persistent background-task supervision, and the protocol between them.
 
 It is an independent community integration, not a replacement for Hermes or an official NousResearch release.
 
@@ -33,7 +33,7 @@ The browser never receives the installation-wide gateway bearer or Hermes API ke
 
 ### Clients
 
-Voice clients capture microphone audio, send base64 PCM frames, play provider audio, render transcript and task state, and expose separate controls for speech interruption and exact task stop. The gateway also serves a standalone continuous browser console at `/`. Both browser surfaces use local PCM VAD with pre-roll, silence-tail turn detection, barge-in, and a playback analyser driving a shared canvas renderer. The shared browser SDK supplies protocol validation, reconnect snapshots, task/notification caches, bounded buffering, a microphone worklet, and audio playback.
+Voice clients capture microphone audio, send base64 PCM frames, play provider audio, render transcript and task state, and expose separate controls for speech interruption and exact task stop. The gateway also serves a standalone continuous browser console at `/`. Both browser surfaces use a permissive PCM pre-gate for streaming; the gateway confirms actual speech with a bundled Silero VAD model (protocol v7), keeps preroll and silence-tail turn semantics, performs echo-guarded barge-in, and drives a playback analyser feeding a shared canvas renderer. The shared browser SDK supplies protocol validation, reconnect snapshots, task/notification caches, bounded buffering, a microphone worklet, and audio playback.
 
 The terminal uses the same persistent protocol but is text-control only. It supports the durable task inbox and exact stop without adding native audio dependencies.
 

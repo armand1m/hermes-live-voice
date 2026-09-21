@@ -11,7 +11,7 @@ const lerp = (a, b, t) => a + (b - a) * t;
 
 /** Critically-damped spring with separate attack/release responsiveness. */
 export class Spring {
-  constructor(value = 0, { attack = 60, release = 0, damping = 1 } = {}) {
+  constructor(value = 0, { attack = 60, release = 0, damping = 1, min = 0, max = 1 } = {}) {
     this.value = value;
     this.target = value;
     this.velocity = 0;
@@ -20,14 +20,16 @@ export class Spring {
     // behaviour and only a few (energy, audio envelopes) need slow decay.
     this.release = release || attack;
     this.damping = damping;
+    this.min = min;
+    this.max = max;
   }
 
   set(target) {
-    this.target = clamp(target);
+    this.target = clamp(target, this.min, this.max);
   }
 
   snap(value) {
-    this.value = this.target = clamp(value);
+    this.value = this.target = clamp(value, this.min, this.max);
     this.velocity = 0;
   }
 
@@ -180,6 +182,174 @@ export class VisemeEstimator {
 }
 
 /**
+ * Text-synchronized viseme scheduling for lipsync.
+ *
+ * The audio-only estimator infers mouth shape from spectral energy, which
+ * reads as generic flapping. This scheduler converts the words actually
+ * being spoken into a phoneme-like unit queue (grapheme rules, no
+ * dictionary): the reveal pacing in voice.js feeds it text at the cadence
+ * real speech is playing, and update() plays the queue back with its
+ * amplitude gated by the live audio envelope — text provides articulation,
+ * audio provides timing and loudness.
+ */
+const VISEME_NAMES = ["closed", "open", "wide", "round", "narrow", "teeth"];
+
+// Ordered longest-first grapheme rules → [viseme, amount, hold seconds].
+const GRAPHEME_RULES = [
+  [["oo", "ou", "ow", "oa", "oi", "oy", "au", "aw", "ue", "ui"], "round", 1.0, 0.13],
+  [["ee", "ea", "ie", "ay", "ai", "ey"], "wide", 0.95, 0.12],
+  [["ch", "sh", "zh", "ck"], "narrow", 0.7, 0.07],
+  [["th", "ph"], "teeth", 0.9, 0.07],
+  [["qu", "wh"], "round", 0.75, 0.08],
+  [["ng"], "narrow", 0.35, 0.07],
+  [["gh"], "open", 0.3, 0.06],
+  [["a"], "open", 0.9, 0.12],
+  [["e"], "wide", 0.7, 0.1],
+  [["i", "y"], "wide", 0.6, 0.1],
+  [["o"], "round", 0.85, 0.12],
+  [["u"], "round", 0.8, 0.11],
+  [["m", "b", "p"], "closed", 0.95, 0.06],
+  [["f", "v"], "teeth", 0.85, 0.07],
+  [["w"], "round", 0.8, 0.07],
+  [["r"], "round", 0.45, 0.08],
+  [["l"], "open", 0.45, 0.08],
+  [["s", "z", "x", "j", "c", "k", "g", "q", "t", "d", "n", "h"], "narrow", 0.45, 0.06],
+];
+const RULE_LOOKUP = (() => {
+  const map = new Map();
+  for (const [keys, viseme, amount, hold] of GRAPHEME_RULES) {
+    for (const key of keys) map.set(key, [viseme, amount, hold]);
+  }
+  return map;
+})();
+const RULE_LENGTHS = [2, 1];
+
+export class TextVisemeScheduler {
+  constructor() {
+    this.weights = { closed: 1, open: 0, wide: 0, round: 0, narrow: 0, teeth: 0 };
+    this.queue = []; // upcoming units: [viseme, amount, hold]
+    this.queued = 0; // seconds of articulation waiting
+    this.cursor = 0; // seconds elapsed in the head unit
+    this.active = 0; // 0..1 — how much the text rig should override audio
+    this.silence = 0; // seconds of silent audio while units remain
+  }
+
+  /** Queue freshly revealed spoken text (word-sized chunks are ideal). */
+  feed(text) {
+    const lower = text.toLowerCase();
+    let i = 0;
+    while (i < lower.length) {
+      let matched = false;
+      for (const len of RULE_LENGTHS) {
+        const key = lower.slice(i, i + len);
+        const rule = key.length === len && RULE_LOOKUP.get(key);
+        if (rule) {
+          this.pushUnit(rule[0], rule[1], rule[2]);
+          i += len;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        // Spaces and punctuation become brief resting closures.
+        if (/\s/.test(lower[i])) this.pushUnit("closed", 0.5, 0.05);
+        else if (/[,.!?;:]/.test(lower[i])) this.pushUnit("closed", 0.7, 0.09);
+        i += 1;
+      }
+    }
+    this.compress();
+  }
+
+  pushUnit(viseme, amount, hold) {
+    this.queue.push([viseme, amount, hold]);
+    this.queued += hold;
+  }
+
+  /** Keep at most ~1.2s of articulation: speed the backlog up, never stall. */
+  compress() {
+    if (this.queued <= 1.2) return;
+    for (let i = Math.floor(this.queue.length / 2); i < this.queue.length; i++) {
+      const unit = this.queue[i];
+      this.queued -= unit[2] * 0.4;
+      unit[2] *= 0.6;
+    }
+    // Still overloaded (the reveal raced ahead): drop trailing consonants
+    // first — vowels carry the recognizable shape — then anything, so
+    // playback never lags far behind the voice.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = this.queue.length - 1; i >= 1 && this.queued > 1.2; i--) {
+        const unit = this.queue[i];
+        const isVowel = unit[0] === "open" || unit[0] === "round" || unit[0] === "wide";
+        if (pass === 0 && isVowel) continue;
+        this.queued -= unit[2];
+        this.queue.splice(i, 1);
+      }
+    }
+  }
+
+  /** Drop everything (speech ended or was interrupted). */
+  reset() {
+    this.queue.length = 0;
+    this.queued = 0;
+    this.cursor = 0;
+    this.active = 0;
+    this.silence = 0;
+  }
+
+  /**
+   * Advance playback. `activity` is the live output-audio level (0..1): the
+   * mouth articulates the queued text but only moves as loud as the voice,
+   * and goes fully closed when the voice stops.
+   */
+  update(dt, activity) {
+    const w = this.weights;
+    if (this.queue.length === 0) {
+      this.silence = 0;
+      this.active = Math.max(0, this.active - dt * 2.4);
+      for (const name of VISEME_NAMES) {
+        if (name !== "closed") w[name] *= Math.exp(-10 * dt);
+      }
+      w.closed += (1 - w.closed) * (1 - Math.exp(-10 * dt));
+      return w;
+    }
+    if (activity < 0.02) {
+      this.silence += dt;
+      if (this.silence > 0.6) {
+        // Audio ended while text remained (or raced far ahead): abandon it.
+        this.reset();
+        return w;
+      }
+    } else {
+      this.silence = 0;
+    }
+    this.active = Math.min(1, this.active + dt * 5);
+    // A backlog plays faster so the mouth catches up to the reveal.
+    const rate = this.queued > 0.5 ? 1.55 : 1.1;
+    this.cursor += dt * rate;
+    while (this.queue.length > 0 && this.cursor >= this.queue[0][2]) {
+      this.cursor -= this.queue[0][2];
+      this.queued -= this.queue[0][2];
+      this.queue.shift();
+    }
+    if (this.queue.length === 0) return w;
+    const current = this.queue[0];
+    const next = this.queue[1] || null;
+    // Smoothstep blend into the next unit over the tail of the current one.
+    let nextMix = 0;
+    if (next) {
+      const phase = clamp((this.cursor / current[2] - 0.55) / 0.45);
+      nextMix = phase * phase * (3 - 2 * phase);
+    }
+    const amp = clamp(activity * 2.4);
+    for (const name of VISEME_NAMES) w[name] = 0;
+    w[current[0]] += current[1] * (1 - nextMix) * amp;
+    if (next) w[next[0]] += next[1] * nextMix * amp;
+    w.closed += 1 - amp;
+    return w;
+  }
+}
+
+/**
  * Rig-level expression poses. Values are targets for the face rig; the head
  * component maps them onto weighted vertex regions. Blending happens through
  * the continuous springs in AgentStateController, never by snapping.
@@ -188,7 +358,7 @@ export const EXPRESSIONS = {
   neutral:     { browRaise: 0.08, browFurrow: 0,    lidOpen: 0.72, squint: 0.06, smile: 0.04, concern: 0,    tiltZ: 0,     jawRelax: 0.15 },
   attentive:   { browRaise: 0.38, browFurrow: 0.08, lidOpen: 0.96, squint: 0,    smile: 0.06, concern: 0,    tiltZ: 0.02,  jawRelax: 0.1 },
   curious:     { browRaise: 0.62, browFurrow: 0,    lidOpen: 0.9,  squint: 0,    smile: 0.14, concern: 0,    tiltZ: 0.16,  jawRelax: 0.22 },
-  processing:  { browRaise: 0.18, browFurrow: 0.3,  lidOpen: 0.55, squint: 0.14, smile: 0,    concern: 0.04, tiltZ: -0.06, jawRelax: 0.1 },
+  processing:  { browRaise: 0.18, browFurrow: 0.5,  lidOpen: 0.55, squint: 0.14, smile: 0,    concern: 0.04, tiltZ: -0.06, jawRelax: 0.1 },
   speaking:    { browRaise: 0.26, browFurrow: 0.06, lidOpen: 0.88, squint: 0.04, smile: 0.18, concern: 0,    tiltZ: 0.03,  jawRelax: 0.55 },
   amused:      { browRaise: 0.46, browFurrow: 0,    lidOpen: 0.78, squint: 0.3,  smile: 0.72, concern: 0,    tiltZ: 0.1,   jawRelax: 0.4 },
   uncertain:   { browRaise: 0.3,  browFurrow: 0.42, lidOpen: 0.6,  squint: 0.1,  smile: 0,    concern: 0.3,  tiltZ: -0.14, jawRelax: 0.2 },
@@ -251,8 +421,8 @@ export class AgentStateController {
       capture: new Spring(0, { attack: 400, release: 26 }),
       dispersal: new Spring(0, { attack: 18, release: 10 }),
       // Gaze intention in head-local space, -1..1.
-      gazeX: new Spring(0, { attack: 42, release: 42 }),
-      gazeY: new Spring(0, { attack: 42, release: 42 }),
+      gazeX: new Spring(0, { attack: 42, release: 42, min: -1, max: 1 }),
+      gazeY: new Spring(0, { attack: 42, release: 42, min: -1, max: 1 }),
     };
 
     // Expression targets, sprung more softly than signal springs.
@@ -260,7 +430,12 @@ export class AgentStateController {
     this.expressionSprings = {};
     for (const key of EXPRESSION_KEYS) {
       this.expression[key] = EXPRESSIONS.neutral[key];
-      this.expressionSprings[key] = new Spring(this.expression[key], { attack: 46, release: 30 });
+      this.expressionSprings[key] = new Spring(this.expression[key], {
+        attack: 46,
+        release: 30,
+        min: key === "tiltZ" ? -1 : 0,
+        max: 1,
+      });
     }
     this.expressionBase = EXPRESSIONS.neutral;
     this.pulse = null;
@@ -344,11 +519,11 @@ export class AgentStateController {
   }
 
   userLevel(level) {
-    // 20 Hz envelope from the capture worklet; drive instant attentiveness.
+    // 20 Hz envelope from the capture worklet. VAD transitions exclusively
+    // own listeningActive; ambient amplitude is only a visual envelope.
     const scaled = clamp(level * 9);
     this.micLevel = scaled;
     this.micLevelPeak = Math.max(this.micLevelPeak * 0.92, scaled);
-    if (scaled > 0.35) this.listeningActive = true;
   }
 
   userSpeechEnded() {
@@ -423,12 +598,15 @@ export class AgentStateController {
   }
 
   toolEnded(success) {
-    this.springs.toolActivity.set(0.25);
+    this.springs.toolActivity.set(0);
     this.pulseExpression(success === false ? "concerned" : "satisfied", success === false ? 3 : 2.2);
   }
 
   taskWaitingChanged(active) {
     this.taskWaiting = active;
+    // This is the authoritative aggregate task lifecycle signal. In
+    // particular, cancelled/stopping tasks do not call toolEnded in voice.js.
+    if (!active) this.springs.toolActivity.set(0);
   }
 
   taskTerminal(kind) {
@@ -442,7 +620,6 @@ export class AgentStateController {
     this.errorSince = this.time;
     this.springs.errorIntensity.set(1);
     this.springs.confidence.set(0.2);
-    this.pulseExpression("error", 2.8);
   }
 
   recover() {
@@ -524,7 +701,11 @@ export class AgentStateController {
     // Gaze intention: focused on the user while listening/speaking, wandering
     // while reasoning, glancing toward the peripheral tool node while tools
     // run. The head follows gaze with softer springs — eyes lead the head.
-    if (speaking) {
+    if (this.reducedMotion) {
+      // Keep semantic gaze changes, but remove all oscillator-driven drift.
+      s.gazeX.set(tool ? 0.4 : 0);
+      s.gazeY.set(thinking ? 0.18 : tool ? 0.06 : listening ? -0.04 : 0);
+    } else if (speaking) {
       s.gazeX.set(0);
       s.gazeY.set(0);
     } else if (listening) {
@@ -542,8 +723,9 @@ export class AgentStateController {
     }
 
     // --- expression blend ------------------------------------------
+    const errorActive = t - this.errorSince <= 1.6 || s.errorIntensity.value > 0.2;
     let base;
-    if (s.errorIntensity.value > 0.5) base = EXPRESSIONS.error;
+    if (errorActive) base = EXPRESSIONS.error;
     else if (speaking) base = EXPRESSIONS.speaking;
     else if (listening) base = EXPRESSIONS.attentive;
     else if (thinking) base = t - this.thinkingSince > 14 ? EXPRESSIONS.uncertain : EXPRESSIONS.processing;
@@ -563,7 +745,9 @@ export class AgentStateController {
     } else {
       this.pulseAmount = Math.max(0, this.pulseAmount - dt * 2.2);
     }
-    if (this.pulse) blendExpression(this.expression, base, this.pulse, this.pulseAmount);
+    // Errors are safety-significant and temporarily supersede contextual
+    // expression pulses; the pulse timer may continue and resume afterward.
+    if (this.pulse && !errorActive) blendExpression(this.expression, base, this.pulse, this.pulseAmount);
     else for (const key of EXPRESSION_KEYS) this.expression[key] = base[key];
 
     // --- integrate springs -----------------------------------------
@@ -592,6 +776,7 @@ export class AgentStateController {
     if (this.springs.toolActivity.value > 0.3) return "tool";
     if (this.thinkingActive) return "thinking";
     if (this.listeningActive) return "listening";
+    if (this.taskWaiting) return "waiting";
     if (this.paused) return "paused";
     return "idle";
   }

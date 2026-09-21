@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_RESAMPLED_PCM16_BYTES,
+  decodePcm16Base64,
   normalizePcm16Audio,
   parsePcmSampleRate,
   pcmMimeType,
   requirePcmSampleRate,
   resamplePcm16Base64,
+  resamplePcm16Samples,
   validatePcmSampleRate,
 } from "../src/domain/audio/pcm.js";
 
@@ -86,5 +88,37 @@ describe("PCM audio helpers", () => {
 
   it("rejects odd PCM byte counts", () => {
     expect(() => resamplePcm16Base64(Buffer.from([1]).toString("base64"), 16000, 24000)).toThrow(/even number/);
+  });
+
+  it("decodes base64 PCM16 into little-endian samples", () => {
+    const buffer = Buffer.alloc(4);
+    buffer.writeInt16LE(-1000, 0);
+    buffer.writeInt16LE(32_767, 2);
+    expect(Array.from(decodePcm16Base64(buffer.toString("base64")))).toEqual([-1000, 32_767]);
+    expect(() => decodePcm16Base64(Buffer.from([1]).toString("base64"))).toThrow(/even number/);
+  });
+
+  it("resamples PCM16 samples to normalized floats", () => {
+    const samples = Int16Array.from([0, 16_384, -16_384, 16_384]);
+
+    const identity = resamplePcm16Samples(samples, 24_000, 24_000);
+    expect(identity).toHaveLength(4);
+    expect(identity[1]).toBeCloseTo(0.5, 5);
+    expect(identity[2]).toBeCloseTo(-0.5, 5);
+
+    // Upsampling doubles the length with linear interpolation between samples.
+    const up = resamplePcm16Samples(samples, 8_000, 16_000);
+    expect(up).toHaveLength(8);
+    expect(up[1]).toBeCloseTo(0.25, 5);
+    expect(up[2]).toBeCloseTo(0.5, 5);
+
+    // Downsampling 24k -> 16k turns 3 samples into 2.
+    const down = resamplePcm16Samples(Int16Array.from([16_384, 16_384, 16_384]), 24_000, 16_000);
+    expect(down).toHaveLength(2);
+    expect(down[0]).toBeCloseTo(0.5, 5);
+
+    expect(resamplePcm16Samples(new Int16Array(0), 24_000, 16_000)).toHaveLength(0);
+    expect(() => resamplePcm16Samples(samples, 0, 16_000)).toThrow(/Source PCM sample rate/);
+    expect(() => resamplePcm16Samples(samples, 24_000, 192_000.5)).toThrow(/Target PCM sample rate/);
   });
 });

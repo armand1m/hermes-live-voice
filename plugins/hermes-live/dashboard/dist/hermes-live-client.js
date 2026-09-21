@@ -72,7 +72,7 @@ const TASK_STOP_RESPONSE_TYPES = new Set([
   "task.unknown",
 ]);
 const OPEN = 1;
-export const HERMES_LIVE_PROTOCOL_VERSION = 6;
+export const HERMES_LIVE_PROTOCOL_VERSION = 8;
 
 const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "session.ready",
@@ -80,6 +80,7 @@ const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "audio.output",
   "transcript.delta",
   "input.speech_started",
+  "input.speech_stopped",
   "input.pause_requested",
   "response.started",
   "response.completed",
@@ -656,7 +657,11 @@ export class HermesLiveClient {
         this.sessionStartRequestId = undefined;
         this.session = message;
         if (message.conversation?.sessionId) {
-          this.conversation = { mode: "resume", sessionId: message.conversation.sessionId };
+          // Keep a persistent preference across reconnects so each connection
+          // re-resolves the durable thread tip (fresh on every device).
+          this.conversation = this.conversation.mode === "persistent"
+            ? { mode: "persistent" }
+            : { mode: "resume", sessionId: message.conversation.sessionId };
         }
         this.reconnectSnapshotPending = true;
         this.setState("ready");
@@ -1088,13 +1093,21 @@ export class HermesLiveAudio {
     this.playbackEpoch = createPlaybackEpoch();
     this.playbackSuppressed = false;
     this.playbackOverflowed = false;
+    this.gatewaySpeechConfirmed = false;
     this.playbackResumeContext = undefined;
     this.playbackResumePromise = undefined;
     this.cancelPlaybackResume = undefined;
     this.unsubscribeClose = client.on?.("close", () => void this.dispose());
+    this.unsubscribeSpeechStarted = client.on?.("input.speech_started", (event) => {
+      if (event?.provider === "gateway") this.onConfirmedSpeechStarted(event);
+    });
+    this.unsubscribeSpeechStopped = client.on?.("input.speech_stopped", (event) => {
+      if (event?.provider === "gateway") this.onConfirmedSpeechStopped(event);
+    });
     this.unsubscribeResponseStarted = client.on?.("response.started", () => {
       this.playbackSuppressed = false;
       this.playbackOverflowed = false;
+      this.gatewaySpeechConfirmed = false;
     });
     this.unsubscribeResponseCancelled = client.on?.("response.cancelled", () => this.clearPlayback());
     this.unsubscribeResponseFailed = client.on?.("response.failed", () => this.clearPlayback());
@@ -1177,7 +1190,16 @@ export class HermesLiveAudio {
         processorOptions: { frameMs: 50 },
       });
       const captureRate = Math.round(context.sampleRate);
+      const gatewayDetection = this.client.session?.realtime?.audio?.input?.speechDetection === "gateway";
       const vad = new PcmVoiceActivityDetector(captureRate);
+      // Gateway speech detection (protocol v7): a permissive pre-gate only
+      // decides when to stream; the server's speech detector confirms speech,
+      // interrupts playback, and reports the turn end. The 1 s hangover keeps
+      // quiet frames flowing long enough for the server detector to confirm
+      // the stop and forward its silence tail to the provider.
+      const preGate = gatewayDetection
+        ? new PcmVoiceActivityDetector(captureRate, { threshold: 0.007, attackMs: 50, silenceMs: 1000 })
+        : null;
       const noiseSuppressor = new PcmNoiseSuppressor(captureRate);
       const preroll = [];
       let providerTailFrames = 0;
@@ -1188,6 +1210,23 @@ export class HermesLiveAudio {
         const filtered = noiseSuppressor.process(new Int16Array(frame));
         if (!this.localVad) {
             if (this.client.connected) this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
+            return;
+        }
+        if (preGate) {
+            const activity = preGate.process(filtered);
+            this.inputLevel = activity.level;
+            this.speechActive = activity.active;
+            this.emitter.emit("input.level", activity);
+            if (activity.started) {
+              for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
+              preroll.length = 0;
+            }
+            if (this.client.connected && (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad")) {
+              this.client.sendAudio(filtered, `audio/pcm;rate=${captureRate}`);
+            } else {
+              preroll.push(filtered);
+              if (preroll.length > 4) preroll.shift();
+            }
             return;
         }
           const activity = vad.process(filtered);
@@ -1452,6 +1491,29 @@ export class HermesLiveAudio {
     return truncate;
   }
 
+  /**
+   * Gateway-confirmed speech (protocol v7): the server ran the audio through
+   * speech detection, so cutting playback here cannot be a noise false start.
+   * One interrupt per confirmed utterance; a repeated confirmation (the
+   * provider relays the same start after the gateway event) is a no-op.
+   */
+  onConfirmedSpeechStarted(event) {
+    this.speechActive = true;
+    if (this.gatewaySpeechConfirmed) return;
+    this.gatewaySpeechConfirmed = true;
+    this.emitter.emit("input.speech_started", { source: "gateway", probability: event?.probability });
+    this.interrupt("gateway confirmed user speech");
+  }
+
+  onConfirmedSpeechStopped() {
+    this.speechActive = false;
+    this.gatewaySpeechConfirmed = false;
+    this.emitter.emit("input.speech_stopped", { source: "gateway" });
+    if (this.client.session?.realtime?.audio?.turnDetection === "disabled" && this.client.connected) {
+      this.client.endAudio();
+    }
+  }
+
   clearPlayback() {
     this.playbackEpoch.invalidate();
     this.playbackEpoch = createPlaybackEpoch();
@@ -1598,6 +1660,8 @@ export class HermesLiveAudio {
     this.clearPlayback();
     await this.closePlaybackContext();
     this.unsubscribeClose?.();
+    this.unsubscribeSpeechStarted?.();
+    this.unsubscribeSpeechStopped?.();
     this.unsubscribeResponseStarted?.();
     this.unsubscribeResponseCancelled?.();
     this.unsubscribeResponseFailed?.();
@@ -1657,7 +1721,7 @@ export function validateServerMessage(value) {
       requireInteger(message, "protocolVersion", { positive: true, maximum: 1_000 });
       if (message.protocolVersion !== HERMES_LIVE_PROTOCOL_VERSION) {
         throw new TypeError(
-          `Hermes Live protocol version ${message.protocolVersion} is not supported by this protocol v6 client. Upgrade the gateway and client together.`,
+          `Hermes Live protocol version ${message.protocolVersion} is not supported by this protocol v${HERMES_LIVE_PROTOCOL_VERSION} client. Upgrade the gateway and client together.`,
         );
       }
       optionalOpaqueId(message, "requestId", 128);
@@ -1703,10 +1767,17 @@ export function validateServerMessage(value) {
       optionalBoolean(message, "final");
       break;
     case "input.speech_started":
-      requireOnlyKeys(message, ["type", "provider", "itemId", "audioStartMs"]);
-      requireEnum(message, "provider", ["openai", "local"]);
+      requireOnlyKeys(message, ["type", "provider", "itemId", "audioStartMs", "probability"]);
+      requireEnum(message, "provider", ["openai", "local", "gateway"]);
       optionalOpaqueId(message, "itemId");
       optionalFiniteNumber(message, "audioStartMs", { minimum: 0, maximum: 3_600_000 });
+      optionalFiniteNumber(message, "probability", { minimum: 0, maximum: 1 });
+      break;
+    case "input.speech_stopped":
+      requireOnlyKeys(message, ["type", "provider", "itemId", "audioEndMs"]);
+      requireEnum(message, "provider", ["openai", "local", "gateway"]);
+      optionalOpaqueId(message, "itemId");
+      optionalFiniteNumber(message, "audioEndMs", { minimum: 0, maximum: 3_600_000 });
       break;
     case "input.pause_requested":
       requireOnlyKeys(message, ["type", "reason"]);
@@ -1852,6 +1923,11 @@ function requireEnum(value, key, allowed) {
   if (!allowed.includes(value[key])) {
     throw new TypeError(`Hermes Live ${value.type} message contains an unsupported ${key}.`);
   }
+}
+
+function optionalEnum(value, key, allowed) {
+  if (value[key] === undefined) return;
+  requireEnum(value, key, allowed);
 }
 
 function requireObject(value, key) {
@@ -2199,7 +2275,7 @@ function validateRealtimeCapabilities(value) {
     "turnDetection",
     ["disabled", "semantic_vad", "server_vad", "provider", "none"],
   );
-  requireOnlyKeys(audio.input, ["enabled", "mimeType", "recommendedFrameMs"], "session.ready realtime audio input");
+  requireOnlyKeys(audio.input, ["enabled", "mimeType", "recommendedFrameMs", "speechDetection"], "session.ready realtime audio input");
   requireOnlyKeys(audio.output, ["enabled", "mimeType"], "session.ready realtime audio output");
   const input = { ...audio.input, type: "session.ready realtime audio input" };
   const output = { ...audio.output, type: "session.ready realtime audio output" };
@@ -2208,6 +2284,7 @@ function validateRealtimeCapabilities(value) {
   optionalBoundedStringField(input, "mimeType", PUBLIC_MIME_TYPE_MAX_CHARS);
   optionalBoundedStringField(output, "mimeType", PUBLIC_MIME_TYPE_MAX_CHARS);
   optionalInteger(input, "recommendedFrameMs", { positive: true, maximum: 1_000 });
+  optionalEnum(input, "speechDetection", ["gateway", "client"]);
   if (input.enabled && !input.mimeType) requireString(input, "mimeType");
   if (output.enabled && !output.mimeType) requireString(output, "mimeType");
 }
@@ -2514,8 +2591,8 @@ function normalizeConversationSelection(value) {
     throw new TypeError("Hermes Live conversation selection must be an object.");
   }
   requireOnlyKeys(value, ["mode", "sessionId", "title"], "conversation selection");
-  if (!(["new", "resume", "unbound"].includes(value.mode))) {
-    throw new TypeError("Hermes Live conversation mode must be new, resume, or unbound.");
+  if (!(["new", "resume", "unbound", "persistent"].includes(value.mode))) {
+    throw new TypeError("Hermes Live conversation mode must be new, resume, unbound, or persistent.");
   }
   const sessionId = value.sessionId === undefined ? undefined : requireClientId(value.sessionId, "conversation sessionId");
   const title = optionalBoundedString(value.title, PUBLIC_CONVERSATION_TITLE_MAX_CHARS, "conversation title")?.trim();

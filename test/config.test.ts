@@ -47,6 +47,60 @@ describe("config", () => {
     expect(config.openai.turnDetection).toBe("server_vad");
     expect(config.openai.inputTranscriptionModel).toBe("gpt-4o-mini-transcribe");
     expect(config.openai.inputTranscriptionLanguage).toBeUndefined();
+    expect(config.vad).toEqual({
+      engine: "smart",
+      startProbability: 0.5,
+      stopProbability: 0.25,
+      startSustainMs: 100,
+      stopSustainMs: 500,
+      echoStartProbability: 0.7,
+      echoStartSustainMs: 200,
+      prerollMs: 250,
+      tailMs: 400,
+    });
+    expect(config.context).toEqual({
+      hermesHome: loadConfig({}).context.hermesHome,
+      digestEnabled: true,
+      voiceThreadTitle: "Hermes Live Voice",
+      recallSessionTitle: "Hermes Live Voice Recall",
+      recallTimeoutMs: 30_000,
+    });
+    expect(config.context.hermesHome).toMatch(/\.hermes$/u);
+  });
+
+  it("configures voice memory context and rejects non-absolute Hermes homes", () => {
+    expect(loadConfig({
+      HERMES_LIVE_HERMES_HOME: "/srv/hermes",
+      HERMES_LIVE_CONTEXT_DIGEST: "false",
+      HERMES_LIVE_VOICE_THREAD_TITLE: "Voice",
+      HERMES_LIVE_RECALL_TIMEOUT_MS: "45000",
+    }).context).toMatchObject({
+      hermesHome: "/srv/hermes",
+      digestEnabled: false,
+      voiceThreadTitle: "Voice",
+      recallTimeoutMs: 45_000,
+    });
+    expect(() => loadConfig({ HERMES_LIVE_HERMES_HOME: "relative/hermes" })).toThrowError(/absolute path/u);
+    expect(() => loadConfig({ HERMES_LIVE_RECALL_TIMEOUT_MS: "1000" })).toThrowError();
+  });
+
+  it("configures speech detection thresholds and rejects non-absolute model paths", () => {
+    expect(loadConfig({
+      HERMES_LIVE_VAD: "energy",
+      HERMES_LIVE_VAD_START_PROBABILITY: "0.6",
+      HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS: "300",
+      HERMES_LIVE_VAD_PREROLL_MS: "150",
+    }).vad).toMatchObject({
+      engine: "energy",
+      startProbability: 0.6,
+      echoStartSustainMs: 300,
+      prerollMs: 150,
+    });
+    expect(loadConfig({ HERMES_LIVE_VAD_MODEL: "/opt/models/silero_vad.onnx" }).vad.modelPath)
+      .toBe("/opt/models/silero_vad.onnx");
+    expect(() => loadConfig({ HERMES_LIVE_VAD_MODEL: "models/silero_vad.onnx" }))
+      .toThrowError(/absolute path/u);
+    expect(() => loadConfig({ HERMES_LIVE_VAD_START_PROBABILITY: "0.99" })).toThrowError();
   });
 
   it("matches the default local session limit to the managed single-pipeline provider", () => {

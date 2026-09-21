@@ -49,7 +49,7 @@ export type RealtimeResponseTruncation = z.infer<typeof RealtimeResponseTruncati
 
 export const ConversationSelectionSchema = z
   .object({
-    mode: z.enum(["new", "resume", "unbound"]),
+    mode: z.enum(["new", "resume", "unbound", "persistent"]),
     sessionId: ConversationIdSchema.optional(),
     title: z.string().trim().min(1).max(CLIENT_CONVERSATION_TITLE_MAX_CHARS).optional(),
   })
@@ -179,6 +179,12 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     context.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Conversation binding requires Hermes Live protocol v4.",
+    });
+  }
+  if (message.type === "session.start" && message.protocolVersion < 8 && message.conversation?.mode === "persistent") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Persistent voice conversations require Hermes Live protocol v8.",
     });
   }
 });

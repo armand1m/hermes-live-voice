@@ -47,6 +47,14 @@ const OpenAITranscriptionLanguageSchema = z.preprocess(
     message: "OPENAI_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE must be a lowercase ISO-639-1 code.",
   }).optional(),
 );
+const HermesHomePathSchema = z.string().min(1).max(MAX_STATE_FILE_PATH_CHARS).refine(
+  (value) => isAbsolute(value) && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value),
+  { message: "HERMES_LIVE_HERMES_HOME must be a bounded absolute path to the Hermes home directory." },
+);
+const VadModelPathSchema = z.string().min(1).max(MAX_STATE_FILE_PATH_CHARS).refine(
+  (value) => isAbsolute(value) && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value),
+  { message: "HERMES_LIVE_VAD_MODEL must be a bounded absolute path to a Silero VAD ONNX model." },
+);
 
 const EnvSchema = z.object({
   NODE_ENV: z.string().optional(),
@@ -121,9 +129,47 @@ const EnvSchema = z.object({
   OPENAI_REALTIME_OUTPUT_AUDIO_FORMAT: z.enum(["pcm16", "g711_ulaw", "g711_alaw"]).default("pcm16"),
   OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL: OpenAITranscriptionModelSchema.default("gpt-4o-mini-transcribe"),
   OPENAI_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE: OpenAITranscriptionLanguageSchema,
+
+  HERMES_LIVE_HERMES_HOME: HermesHomePathSchema.optional(),
+  HERMES_LIVE_CONTEXT_DIGEST: z.string().optional(),
+  HERMES_LIVE_VOICE_THREAD_TITLE: z.string().trim().min(1).max(100).default("Hermes Live Voice"),
+  HERMES_LIVE_RECALL_SESSION_TITLE: z.string().trim().min(1).max(100).default("Hermes Live Voice Recall"),
+  HERMES_LIVE_RECALL_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(120_000).default(30_000),
+
+  HERMES_LIVE_VAD: z.enum(["smart", "energy", "disabled"]).default("smart"),
+  HERMES_LIVE_VAD_MODEL: VadModelPathSchema.optional(),
+  HERMES_LIVE_VAD_START_PROBABILITY: z.coerce.number().min(0.05).max(0.95).default(0.5),
+  HERMES_LIVE_VAD_STOP_PROBABILITY: z.coerce.number().min(0.05).max(0.95).default(0.25),
+  HERMES_LIVE_VAD_START_SUSTAIN_MS: z.coerce.number().int().min(32).max(1_000).default(100),
+  HERMES_LIVE_VAD_STOP_SUSTAIN_MS: z.coerce.number().int().min(100).max(2_000).default(500),
+  HERMES_LIVE_VAD_ECHO_START_PROBABILITY: z.coerce.number().min(0.1).max(0.99).default(0.7),
+  HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS: z.coerce.number().int().min(32).max(1_000).default(200),
+  HERMES_LIVE_VAD_PREROLL_MS: z.coerce.number().int().min(0).max(1_000).default(250),
+  HERMES_LIVE_VAD_TAIL_MS: z.coerce.number().int().min(0).max(2_000).default(400),
 });
 
 export type RealtimeProvider = "local" | "gemini" | "openai" | "mock";
+
+export interface ContextConfig {
+  hermesHome: string;
+  digestEnabled: boolean;
+  voiceThreadTitle: string;
+  recallSessionTitle: string;
+  recallTimeoutMs: number;
+}
+
+export interface VadConfig {
+  engine: "smart" | "energy" | "disabled";
+  modelPath?: string;
+  startProbability: number;
+  stopProbability: number;
+  startSustainMs: number;
+  stopSustainMs: number;
+  echoStartProbability: number;
+  echoStartSustainMs: number;
+  prerollMs: number;
+  tailMs: number;
+}
 
 export interface AppConfig {
   server: {
@@ -190,6 +236,8 @@ export interface AppConfig {
     inputTranscriptionModel?: string;
     inputTranscriptionLanguage?: string;
   };
+  vad: VadConfig;
+  context: ContextConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -267,6 +315,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ...(parsed.OPENAI_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE
         ? { inputTranscriptionLanguage: parsed.OPENAI_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE }
         : {}),
+    },
+    vad: {
+      engine: parsed.HERMES_LIVE_VAD,
+      ...(parsed.HERMES_LIVE_VAD_MODEL ? { modelPath: parsed.HERMES_LIVE_VAD_MODEL } : {}),
+      startProbability: parsed.HERMES_LIVE_VAD_START_PROBABILITY,
+      stopProbability: parsed.HERMES_LIVE_VAD_STOP_PROBABILITY,
+      startSustainMs: parsed.HERMES_LIVE_VAD_START_SUSTAIN_MS,
+      stopSustainMs: parsed.HERMES_LIVE_VAD_STOP_SUSTAIN_MS,
+      echoStartProbability: parsed.HERMES_LIVE_VAD_ECHO_START_PROBABILITY,
+      echoStartSustainMs: parsed.HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS,
+      prerollMs: parsed.HERMES_LIVE_VAD_PREROLL_MS,
+      tailMs: parsed.HERMES_LIVE_VAD_TAIL_MS,
+    },
+    context: {
+      hermesHome: parsed.HERMES_LIVE_HERMES_HOME ?? join(homedir(), ".hermes"),
+      digestEnabled: parseBool(parsed.HERMES_LIVE_CONTEXT_DIGEST ?? "true"),
+      voiceThreadTitle: parsed.HERMES_LIVE_VOICE_THREAD_TITLE,
+      recallSessionTitle: parsed.HERMES_LIVE_RECALL_SESSION_TITLE,
+      recallTimeoutMs: parsed.HERMES_LIVE_RECALL_TIMEOUT_MS,
     },
   };
 }
