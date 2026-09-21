@@ -58,7 +58,7 @@ class MockLiveSession implements LiveModelSession {
     return false;
   }
 
-  async sendToolResponse(_call: LiveToolCall, response: Record<string, unknown>): Promise<void> {
+  async sendToolResponse(_call: LiveToolCall, response: Record<string, unknown>, _options?: { suppressSpeech?: boolean }): Promise<void> {
     const output = typeof response.message === "string"
       ? response.message
       : typeof response.output === "string"

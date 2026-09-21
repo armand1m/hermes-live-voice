@@ -56,6 +56,11 @@ const VadModelPathSchema = z.string().min(1).max(MAX_STATE_FILE_PATH_CHARS).refi
   { message: "HERMES_LIVE_VAD_MODEL must be a bounded absolute path to a Silero VAD ONNX model." },
 );
 
+const FillerDirectoryPathSchema = z.string().min(1).max(MAX_STATE_FILE_PATH_CHARS).refine(
+  (value) => isAbsolute(value) && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value),
+  { message: "HERMES_LIVE_FILLER_DIR must be a bounded absolute path to a filler clip directory." },
+);
+
 const EnvSchema = z.object({
   NODE_ENV: z.string().optional(),
   HERMES_LIVE_HOST: z.string().default("127.0.0.1"),
@@ -82,6 +87,8 @@ const EnvSchema = z.object({
     .max(MAX_COMPATIBLE_TEXT_CHARS)
     .default(20_000),
   HERMES_LIVE_PROVIDER_READY_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  /** WebSocket keepalive ping interval for live sessions; 0 disables the reaper. */
+  HERMES_LIVE_WS_KEEPALIVE_MS: z.coerce.number().int().min(0).max(600_000).default(15_000),
   HERMES_LIVE_TASK_STATE_FILE: TaskStateFileSchema.default(
     join(homedir(), ".hermes", "hermes-live", "tasks-v1.json"),
   ),
@@ -99,6 +106,9 @@ const EnvSchema = z.object({
   HERMES_LIVE_RUN_INSTRUCTIONS: z.string().optional(),
   HERMES_LIVE_HERMES_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).optional(),
+  HERMES_LIVE_ASYNC_TOOLS_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  /** Hard deadline before pending speech is forced into the next inter-turn gap. */
+  HERMES_LIVE_ANNOUNCE_MAX_DELAY_MS: z.coerce.number().int().min(5_000).max(600_000).default(90_000),
   HERMES_LIVE_HERMES_STREAM_IDLE_TIMEOUT_MS: z.coerce
     .number()
     .int()
@@ -108,6 +118,11 @@ const EnvSchema = z.object({
 
   HERMES_LIVE_PROVIDER: z.enum(["local", "gemini", "openai", "mock"]).default("local"),
   HERMES_LIVE_LOCAL_URL: LocalRealtimeUrlSchema.default("ws://127.0.0.1:8765/v1/realtime"),
+  HERMES_LIVE_TTS_URL: z.string().url().refine(isSafeHttpLocalUrl, {
+    message: "HERMES_LIVE_TTS_URL must be a credential-free local HTTP(S) URL (tts sidecar).",
+  }).optional(),
+  HERMES_LIVE_TTS_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
+  HERMES_LIVE_TTS_MAX_CHARS: z.coerce.number().int().min(100).max(4_000).default(1_000),
   HERMES_LIVE_LOCAL_VOICE: z.string().trim().min(1).max(128).default("Aiden"),
   HERMES_LIVE_LOCAL_ALLOW_REMOTE: z.string().optional(),
   HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING: z.string().optional(),
@@ -146,6 +161,12 @@ const EnvSchema = z.object({
   HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS: z.coerce.number().int().min(32).max(1_000).default(200),
   HERMES_LIVE_VAD_PREROLL_MS: z.coerce.number().int().min(0).max(1_000).default(250),
   HERMES_LIVE_VAD_TAIL_MS: z.coerce.number().int().min(0).max(2_000).default(400),
+
+  HERMES_LIVE_FILLER_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_FILLER_DELAY_MS: z.coerce.number().int().min(500).max(60_000).default(2_500),
+  HERMES_LIVE_FILLER_INTERVAL_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+  HERMES_LIVE_FILLER_MAX_PER_TOOL: z.coerce.number().int().min(1).max(10).default(3),
+  HERMES_LIVE_FILLER_DIR: FillerDirectoryPathSchema.optional(),
 });
 
 export type RealtimeProvider = "local" | "gemini" | "openai" | "mock";
@@ -171,6 +192,15 @@ export interface VadConfig {
   tailMs: number;
 }
 
+export interface FillerConfig {
+  enabled: boolean;
+  delayMs: number;
+  intervalMs: number;
+  maxPerTool: number;
+  /** Override the bundled assets/filler clip directory (tests, alt voices). */
+  directory?: string;
+}
+
 export interface AppConfig {
   server: {
     host: string;
@@ -186,6 +216,8 @@ export interface AppConfig {
     maxAudioBytes: number;
     maxTextChars: number;
     providerReadyTimeoutMs: number;
+    /** Client WebSocket ping interval; 0 disables the zombie reaper. */
+    wsKeepaliveMs?: number;
   };
   hermes: {
     baseUrl: string;
@@ -195,6 +227,10 @@ export interface AppConfig {
     timeoutMs: number;
     chatTimeoutMs?: number;
     streamIdleTimeoutMs?: number;
+    /** Slow chat/recall tools return spoken receipts; answers arrive later. */
+    asyncTools?: boolean;
+    /** Pending answer/announcement speech older than this forces delivery. */
+    announceMaxDelayMs?: number;
   };
   tasks: {
     stateFile: string;
@@ -215,6 +251,12 @@ export interface AppConfig {
     allowRemote: boolean;
     /** Managed runtime compatibility mode; external upstream endpoints leave this unset. */
     ownsTurnRouting?: boolean;
+  };
+  tts: {
+    /** Sidecar TTS base URL; unset routes all speech through the provider. */
+    baseUrl?: string;
+    requestTimeoutMs: number;
+    maxChars: number;
   };
   gemini: {
     apiKey?: string;
@@ -237,6 +279,7 @@ export interface AppConfig {
     inputTranscriptionLanguage?: string;
   };
   vad: VadConfig;
+  filler: FillerConfig;
   context: ContextConfig;
 }
 
@@ -262,6 +305,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxAudioBytes: parsed.HERMES_LIVE_MAX_AUDIO_BYTES,
       maxTextChars: parsed.HERMES_LIVE_MAX_TEXT_CHARS,
       providerReadyTimeoutMs: parsed.HERMES_LIVE_PROVIDER_READY_TIMEOUT_MS,
+      wsKeepaliveMs: parsed.HERMES_LIVE_WS_KEEPALIVE_MS,
     },
     hermes: {
       baseUrl: withoutTrailingSlash(parsed.HERMES_BASE_URL),
@@ -272,6 +316,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       chatTimeoutMs: parsed.HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS
         ?? Math.max(DEFAULT_HERMES_CHAT_TIMEOUT_MS, parsed.HERMES_LIVE_HERMES_TIMEOUT_MS),
       streamIdleTimeoutMs: parsed.HERMES_LIVE_HERMES_STREAM_IDLE_TIMEOUT_MS,
+      asyncTools: parsed.HERMES_LIVE_ASYNC_TOOLS_ENABLED === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_ASYNC_TOOLS_ENABLED),
+      announceMaxDelayMs: parsed.HERMES_LIVE_ANNOUNCE_MAX_DELAY_MS,
     },
     tasks: {
       stateFile: parsed.HERMES_LIVE_TASK_STATE_FILE,
@@ -291,6 +338,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       voice: parsed.HERMES_LIVE_LOCAL_VOICE,
       allowRemote: parseBool(parsed.HERMES_LIVE_LOCAL_ALLOW_REMOTE),
       ownsTurnRouting: parseBool(parsed.HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING),
+    },
+    tts: {
+      ...(parsed.HERMES_LIVE_TTS_URL ? { baseUrl: parsed.HERMES_LIVE_TTS_URL } : {}),
+      requestTimeoutMs: parsed.HERMES_LIVE_TTS_TIMEOUT_MS,
+      maxChars: parsed.HERMES_LIVE_TTS_MAX_CHARS,
     },
     gemini: {
       ...(geminiApiKey ? { apiKey: geminiApiKey } : {}),
@@ -327,6 +379,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       echoStartSustainMs: parsed.HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS,
       prerollMs: parsed.HERMES_LIVE_VAD_PREROLL_MS,
       tailMs: parsed.HERMES_LIVE_VAD_TAIL_MS,
+    },
+    filler: {
+      enabled: parsed.HERMES_LIVE_FILLER_ENABLED === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_FILLER_ENABLED),
+      delayMs: parsed.HERMES_LIVE_FILLER_DELAY_MS,
+      intervalMs: parsed.HERMES_LIVE_FILLER_INTERVAL_MS,
+      maxPerTool: parsed.HERMES_LIVE_FILLER_MAX_PER_TOOL,
+      ...(parsed.HERMES_LIVE_FILLER_DIR ? { directory: parsed.HERMES_LIVE_FILLER_DIR } : {}),
     },
     context: {
       hermesHome: parsed.HERMES_LIVE_HERMES_HOME ?? join(homedir(), ".hermes"),
@@ -471,6 +531,17 @@ function isSafeHermesBaseUrl(value: string): boolean {
     parsed.pathname === "/" &&
     !value.includes("?") &&
     !value.includes("#")
+  );
+}
+
+function isSafeHttpLocalUrl(value: string): boolean {
+  const parsed = parseSafeConfiguredUrl(value);
+  return Boolean(
+    parsed &&
+    ["http:", "https:"].includes(parsed.protocol) &&
+    (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]" || parsed.hostname === "::1") &&
+    !value.includes("?") &&
+    !value.includes("#"),
   );
 }
 

@@ -1,0 +1,47 @@
+{
+  "sampleRateHz": 24000,
+  "format": "pcm16-mono-raw",
+  "speaker": "Aiden",
+  "clips": [
+    {
+      "name": "still_working",
+      "text": "Still working on it.",
+      "durationMs": 918
+    },
+    {
+      "name": "checking",
+      "text": "Let me check with Hermes.",
+      "durationMs": 1467
+    },
+    {
+      "name": "taking_longer",
+      "text": "This one's taking a bit longer.",
+      "durationMs": 1716
+    },
+    {
+      "name": "almost_there",
+      "text": "Almost there.",
+      "durationMs": 665
+    },
+    {
+      "name": "still_digging",
+      "text": "Hermes is still digging into it.",
+      "durationMs": 1796
+    },
+    {
+      "name": "answer_ready",
+      "text": "Hermes has your answer whenever you're ready.",
+      "durationMs": 2438
+    },
+    {
+      "name": "one_moment",
+      "text": "One moment.",
+      "durationMs": 585
+    },
+    {
+      "name": "reconnecting",
+      "text": "Give me a second, I'm reconnecting.",
+      "durationMs": 1716
+    }
+  ]
+}

@@ -74,6 +74,13 @@ export interface HermesSessionChatResult {
   usage?: HermesRunUsage;
 }
 
+/** Typed projection of the /api/sessions/{id}/chat/stream SSE surface. */
+export type HermesChatStreamEvent =
+  | { type: "assistant.delta"; text: string }
+  | { type: "assistant.commentary"; text: string }
+  | { type: "assistant.completed"; sessionId: string; content: string }
+  | { type: "run.failed"; error?: string };
+
 export type HermesRunStatus =
   | "queued"
   | "running"
@@ -159,6 +166,12 @@ export interface HermesRunsPort {
     message: string,
     options?: { signal?: AbortSignal; sessionKey?: string; instructions?: string },
   ): Promise<HermesSessionChatResult>;
+  /** Streaming twin of chatSession (POST /api/sessions/{id}/chat/stream, SSE). */
+  chatSessionStream?(
+    sessionId: string,
+    message: string,
+    options?: { signal?: AbortSignal; sessionKey?: string; instructions?: string },
+  ): AsyncGenerator<HermesChatStreamEvent>;
   startRun(params: StartRunParams, signal?: AbortSignal): Promise<StartRunResult>;
   getRun(runId: string, options?: AbortSignal | HermesRequestOptions): Promise<HermesRunSnapshot>;
   stopRun(runId: string, options?: AbortSignal | HermesRequestOptions): Promise<{ run_id: string; status: "stopping" }>;

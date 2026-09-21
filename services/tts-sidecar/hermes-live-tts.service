@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes Live Voice TTS sidecar (gateway-side Qwen3-TTS, same voice as the s2s stack)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/armand1m/.hermes/hermes-live/voice-stack/.venv/bin/python /home/armand1m/Projects/mine/hermes-live-voice/services/tts-sidecar/tts_sidecar.py --host 127.0.0.1 --port 8766
+Restart=on-failure
+RestartSec=10
+# Short receipts/answers are rare and small; keep the sidecar from starving
+# the s2s stack's CPU TTS when they do overlap.
+Nice=5
+Environment=HF_HOME=/home/armand1m/models/hf
+
+[Install]
+WantedBy=default.target

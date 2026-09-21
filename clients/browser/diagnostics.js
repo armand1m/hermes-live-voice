@@ -310,7 +310,7 @@ export function createDiagnosticsOverlay(options = {}) {
   const grid = document.createElement("div");
   grid.className = "diag-grid";
   const rows = {};
-  for (const key of ["lat", "jit", "stall", "fps", "gw", "stack", "load", "ago", "sgap"]) {
+  for (const key of ["lat", "jit", "stall", "fps", "gw", "stack", "load", "ago", "sgap", "tool", "ann"]) {
     const label = document.createElement("span");
     label.className = "diag-k";
     label.textContent = key;
@@ -384,6 +384,8 @@ export function createDiagnosticsOverlay(options = {}) {
       : "—");
     setText(rows.ago, fmtMs(serverFresh ? server.lastAudioOutputMsAgo : null));
     setText(rows.sgap, fmtMs(serverFresh ? server.gatewayAudioGapP95Ms : null));
+    setText(rows.tool, `${fmtMs(serverFresh ? server.toolSpeechP50Ms : null)} / ${fmtMs(serverFresh ? server.toolSpeechP95Ms : null)}`);
+    setText(rows.ann, `${fmtMs(serverFresh ? server.announcementDelayP50Ms : null)} / ${fmtMs(serverFresh ? server.announcementDelayP95Ms : null)}`);
   }
 
   // --- timers, paused while the tab is hidden ------------------------------

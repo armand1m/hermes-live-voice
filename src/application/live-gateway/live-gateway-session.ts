@@ -23,7 +23,11 @@ import {
 import type { TaskExecutionMode, TaskRecord } from "../../domain/tasks/index.js";
 import { realtimeClientCapabilities } from "./client-capabilities.js";
 import type { ClientConnectionPort, ClientInboundFrame } from "./ports/client-connection.port.js";
-import type { HermesRunsPort, HermesSessionSummary } from "./ports/hermes-runs.port.js";
+import type {
+  HermesRunsPort,
+  HermesSessionChatResult,
+  HermesSessionSummary,
+} from "./ports/hermes-runs.port.js";
 import type { TaskSupervisorPort } from "./ports/task-supervisor.port.js";
 import {
   type LiveModelEvent,
@@ -34,6 +38,11 @@ import {
 } from "./ports/realtime-model.port.js";
 import { buildSystemInstruction } from "./system-instruction.js";
 import { buildContextDigest } from "./context-digest.js";
+import { SpeechTimingTracker, type SpeechTimingMetrics } from "./speech-timing.js";
+import { FillerSpeaker, type FillerEmit } from "./filler-speaker.js";
+import { deferredAnswerSpeech } from "./deferred-answer-speech.js";
+import { SpeechMux } from "./speech-mux.js";
+import type { SpeechSink } from "./ports/speech-sink.port.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
 import {
@@ -80,6 +89,13 @@ const MAX_PROVIDER_TOOL_RESPONSE_BYTES = 256_000;
 const MAX_CACHED_PROVIDER_TOOL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PUBLIC_TASKS = 100;
 const MAX_TOOL_RESOURCE_KEYS = 8;
+/** Deferred answers held per session; evicted oldest-first when exceeded. */
+const MAX_DEFERRED_ANSWERS = 16;
+/** After this long undelivered, an "answer ready" filler clip escalates. */
+const DEFERRED_ANSWER_ESCALATION_MS = 20_000;
+/** How often the announcement-deadline watch runs while speech is pending. */
+const ANNOUNCEMENT_DEADLINE_CHECK_MS = 5_000;
+const DEFAULT_ANNOUNCE_MAX_DELAY_MS = 90_000;
 
 export interface LiveGatewaySessionDeps {
   config: AppConfig;
@@ -89,6 +105,8 @@ export interface LiveGatewaySessionDeps {
   logger: Logger;
   /** Gateway speech detection (protocol v7); omitted sessions keep client-side VAD. */
   speechDetection?: SpeechDetectionService;
+  /** Gateway-side TTS sidecar; omitted keeps all speech on the provider. */
+  speechSink?: SpeechSink;
 }
 
 interface ProviderToolCallRecord {
@@ -100,8 +118,25 @@ interface ProviderToolCallRecord {
   responseBytes?: number;
 }
 
+/**
+ * A Hermes chat turn accepted with an instant spoken receipt whose real
+ * answer arrives later through the idle-gated exact-speech channel.
+ */
+interface DeferredAnswerRecord {
+  pendingId: string;
+  kind: "conversation" | "recall";
+  startedAt: number;
+  readyAt?: number;
+  speech?: string;
+  delivered: boolean;
+  /** Un-spoken tail of the streamed answer (sidecar sentence pumping). */
+  deltaBuffer?: string;
+  /** Characters of the final answer already spoken through the sidecar. */
+  streamedChars?: number;
+}
+
 type HeldSessionInput =
-  | { kind: "audio"; data: string; mimeType: string }
+  | { kind: "audio"; data: string; mimeType: string; preGated?: boolean }
   | { kind: "audio_end" }
   | { kind: "text"; text: string };
 
@@ -129,6 +164,7 @@ export class LiveGatewaySession {
   private readonly notificationDeliveryAttempts = new Map<string, number>();
   private notificationFlushRunning = false;
   private notificationRetryTimer?: ReturnType<typeof setTimeout>;
+  private announcementDeadlineTimer?: ReturnType<typeof setInterval>;
   private notificationResponsePending = false;
   private notificationResponseTimer?: ReturnType<typeof setTimeout>;
   private providerResponseActive = false;
@@ -156,6 +192,17 @@ export class LiveGatewaySession {
   private readonly audioGapSamples = new Float32Array(128);
   private audioGapLength = 0;
   private audioGapNext = 0;
+  // Speech-wait telemetry: tool call → first speech, announcement delivery lag.
+  private readonly speechTiming = new SpeechTimingTracker();
+  // Filler side-channel: pre-recorded clips spoken during slow tool waits.
+  private filler?: FillerSpeaker;
+  /** Filler sequences armed by a provider error skip the tool-pending gate. */
+  private fillerSequenceForProvider = false;
+  // Gateway-side TTS sidecar: speech without the provider LLM (Phase 4).
+  private speechMux?: SpeechMux;
+  // Deferred Hermes answers (async tools): receipt now, speech when ready.
+  private readonly deferredAnswers = new Map<string, DeferredAnswerRecord>();
+  private deferredAnswerEscalationTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly client: ClientConnectionPort,
@@ -212,6 +259,40 @@ export class LiveGatewaySession {
       this.ownerId = this.deps.taskSupervisor.registerOwner(this.sessionKey, this.sessionKey);
       unsubscribe = this.deps.taskSupervisor.subscribe(this.ownerId, (record) => this.receiveTaskRecord(record));
       this.unsubscribeTasks = unsubscribe;
+
+      if (this.deps.config.filler.enabled) {
+        this.filler = new FillerSpeaker({
+          emit: (message) => this.emitFillerSpeech(message),
+          gate: () => this.fillerSpeechAllowed(),
+          onInjection: () => this.speechTiming.noteFillerInjection(),
+          onUnavailable: (error) => this.deps.logger.warn("filler clip library unavailable", {
+            sessionId: this.id,
+            error: errorToMessage(error),
+          }),
+          delayMs: this.deps.config.filler.delayMs,
+          intervalMs: this.deps.config.filler.intervalMs,
+          maxPerSequence: this.deps.config.filler.maxPerTool,
+          ...(this.deps.config.filler.directory ? { directory: this.deps.config.filler.directory } : {}),
+        });
+      }
+
+      // TTS sidecar (local provider only: it speaks the same 24 kHz PCM the
+      // realtime boundary publishes). Unset HERMES_LIVE_TTS_URL keeps all
+      // speech on the provider exact-speech path.
+      if (this.deps.speechSink && this.deps.config.realtime.provider === "local") {
+        this.speechMux = new SpeechMux({
+          client: this.deps.speechSink,
+          emit: (message) => this.emitFillerSpeech(message),
+          gate: () => this.fillerSpeechAllowed(),
+          onSpeakingChange: (speaking) => {
+            this.speechGate?.setDownlinkActive(speaking || this.downlinkActiveForGate());
+          },
+          onUnavailable: (error) => this.deps.logger.warn("tts sidecar unavailable; falling back to provider speech", {
+            sessionId: this.id,
+            error,
+          }),
+        });
+      }
 
       // Speech detection loads its model in parallel with provider connect so
       // the session-ready handshake stays bounded by the provider, not the VAD.
@@ -279,6 +360,7 @@ export class LiveGatewaySession {
             {
               searchPastChats: availableTools.includes("search_past_chats"),
               remember: availableTools.includes("remember"),
+              deferredAnswers: this.deps.config.hermes.asyncTools !== false,
             },
           ),
           ...(this.deps.config.hermes.instructions
@@ -316,6 +398,10 @@ export class LiveGatewaySession {
               error: "realtime_provider_error",
             });
             if (!this.closing) {
+              // Recoverable provider error: the session stays alive, so cover
+              // the silent gap with a clip instead of dead air.
+              this.fillerSequenceForProvider = true;
+              this.filler?.beginSequence();
               this.fail("realtime_provider_error", new Error("Realtime provider reported an error."), true);
             }
           },
@@ -431,6 +517,7 @@ export class LiveGatewaySession {
         }
       }
       this.readySent = true;
+      this.armAnnouncementDeadlineWatch();
       const initialTaskSequences = new Map(initialTasks.map((record) => [record.taskId, record.sequence]));
       for (const record of unreadTasks) {
         const notification = projectTaskNotification(record);
@@ -447,6 +534,7 @@ export class LiveGatewaySession {
         // one that has already been announced for speech again.
         if (record.notification.announcedAt === undefined) {
           this.pendingNotifications.set(record.taskId, structuredClone(record));
+          this.speechTiming.noteAnnouncementPending(record.taskId, Date.now());
         }
       }
       for (const record of this.pendingTaskRecords.values()) {
@@ -808,6 +896,223 @@ export class LiveGatewaySession {
     return result;
   }
 
+  /**
+   * Accept a slow Hermes chat turn for background execution. Returns the
+   * pending id the receipt names; the shaped answer arrives as exact speech
+   * through the idle-gated flush, with filler coverage while it computes.
+   */
+  private startDeferredAnswer(
+    kind: DeferredAnswerRecord["kind"],
+    resolveSessionId: string | (() => Promise<string>),
+    message: string,
+    instructions?: string,
+  ): string {
+    const pendingId = `defer_${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+    const record: DeferredAnswerRecord = {
+      pendingId,
+      kind,
+      startedAt: Date.now(),
+      delivered: false,
+    };
+    this.deferredAnswers.set(pendingId, record);
+    while (this.deferredAnswers.size > MAX_DEFERRED_ANSWERS) {
+      const oldest = [...this.deferredAnswers.values()].sort((left, right) => left.startedAt - right.startedAt)[0];
+      if (!oldest || oldest.pendingId === pendingId) break;
+      this.deferredAnswers.delete(oldest.pendingId);
+    }
+    // Fillers cover the wait behind the same delay/interval policy as tools.
+    this.filler?.beginSequence();
+    void this.serializeConversationOperation(() => this.runDeferredAnswer(record, resolveSessionId, message, instructions))
+      .catch(() => undefined);
+    return pendingId;
+  }
+
+  private async runDeferredAnswer(
+    record: DeferredAnswerRecord,
+    resolveSessionId: string | (() => Promise<string>),
+    message: string,
+    instructions?: string,
+  ): Promise<void> {
+    try {
+      const sessionId = typeof resolveSessionId === "string" ? resolveSessionId : await resolveSessionId();
+      if (this.closing) return;
+      let completed: HermesSessionChatResult | undefined;
+      const stream = this.deps.hermes.chatSessionStream;
+      if (stream) {
+        try {
+          for await (const event of stream.call(
+            this.deps.hermes,
+            sessionId,
+            message,
+            {
+              signal: this.abort.signal,
+              sessionKey: this.sessionKey!,
+              ...(instructions ? { instructions } : {}),
+            },
+          )) {
+            if (this.closing) return;
+            if (event.type === "assistant.delta") {
+              this.pumpDeferredDelta(record, event.text);
+            } else if (event.type === "assistant.completed") {
+              completed = { sessionId: event.sessionId, content: event.content };
+              break;
+            } else if (event.type === "run.failed") break;
+          }
+        } catch (error) {
+          if (this.closing) return;
+          this.deps.logger.warn("deferred chat stream failed; falling back to blocking chat", {
+            sessionId: this.id,
+            pendingId: record.pendingId,
+            error: errorToMessage(error),
+          });
+        }
+      }
+      if (!completed) {
+        if (this.closing) return;
+        const chatSession = this.deps.hermes.chatSession!;
+        completed = await chatSession.call(this.deps.hermes, sessionId, message, {
+          signal: this.abort.signal,
+          sessionKey: this.sessionKey!,
+          ...(instructions ? { instructions } : {}),
+        });
+      }
+      if (this.closing) return;
+      if (record.kind === "conversation") {
+        this.conversation = {
+          ...this.conversation,
+          sessionId: completed.sessionId,
+          lastActiveAt: Date.now(),
+        } as PublicConversation;
+      }
+      this.completeDeferredAnswer(record, completed.content);
+    } catch (error) {
+      if (this.closing) return;
+      this.deps.logger.warn("deferred hermes answer failed", {
+        sessionId: this.id,
+        pendingId: record.pendingId,
+        error: errorToMessage(error),
+      });
+      this.completeDeferredAnswer(record, "I couldn't finish that one. Want me to try again?");
+    }
+  }
+
+  private completeDeferredAnswer(record: DeferredAnswerRecord, answer: string): void {
+    const current = this.deferredAnswers.get(record.pendingId);
+    if (!current || current.delivered) return;
+    const spokenChars = current.streamedChars ?? 0;
+    if (spokenChars > 0) {
+      // Already streaming through the sidecar: speak only the unseen tail.
+      const tail = answer.slice(Math.min(spokenChars, answer.length)).trim();
+      if (!tail) {
+        current.delivered = true;
+        this.deferredAnswers.delete(current.pendingId);
+        return;
+      }
+      if (this.speechMux?.available) {
+        void this.speechMux.speak(deferredAnswerSpeech(tail));
+        current.delivered = true;
+        this.deferredAnswers.delete(current.pendingId);
+        return;
+      }
+      current.speech = deferredAnswerSpeech(tail);
+    } else {
+      current.speech = deferredAnswerSpeech(current.kind === "recall" ? answer.slice(0, 4_000) : answer);
+    }
+    current.readyAt = Date.now();
+    this.armDeferredAnswerEscalation();
+    this.scheduleNotificationFlush();
+  }
+
+  /**
+   * Sentence pump for streamed answers: each completed delta sentence goes
+   * straight to the sidecar, so first answer speech follows the first
+   * sentence instead of the full completion.
+   */
+  private pumpDeferredDelta(record: DeferredAnswerRecord, delta: string): void {
+    const mux = this.speechMux;
+    if (!mux?.available || record.delivered) return;
+    record.deltaBuffer = (record.deltaBuffer ?? "") + delta;
+    if (record.deltaBuffer.length > 4_000) record.deltaBuffer = record.deltaBuffer.slice(-2_000);
+    for (;;) {
+      const match = record.deltaBuffer.match(/[^.!?]+[.!?]+(\s|$)/u);
+      if (!match) break;
+      const consumed = match[0];
+      record.deltaBuffer = record.deltaBuffer.slice(consumed.length);
+      record.streamedChars = (record.streamedChars ?? 0) + consumed.length;
+      const sentence = consumed.trim();
+      if (sentence) void mux.speak(sentence);
+    }
+  }
+
+  /** If the user stays busy, an "answer ready" clip invites them back. */
+  private armDeferredAnswerEscalation(): void {
+    if (this.deferredAnswerEscalationTimer !== undefined) return;
+    this.deferredAnswerEscalationTimer = setTimeout(() => {
+      this.deferredAnswerEscalationTimer = undefined;
+      const stillWaiting = [...this.deferredAnswers.values()]
+        .filter((candidate) => !candidate.delivered && candidate.speech !== undefined);
+      if (stillWaiting.length === 0 || this.closing) return;
+      this.filler?.speakOnce("answer_ready");
+    }, DEFERRED_ANSWER_ESCALATION_MS);
+    this.deferredAnswerEscalationTimer.unref?.();
+  }
+
+  /** Delivers at most one ready answer as exact speech; true when spoken. */
+  private async deliverNextDeferredAnswer(force = false): Promise<boolean> {
+    if (this.closing || !this.liveSession?.sendTaskNotification) return false;
+    const ready = [...this.deferredAnswers.values()]
+      .filter((candidate) => !candidate.delivered && candidate.speech !== undefined)
+      .sort((left, right) => (left.readyAt ?? 0) - (right.readyAt ?? 0));
+    const record = ready[0];
+    if (!record) return false;
+    // The flush's guards can be invalidated while an answer was computed.
+    if (
+      this.userSpeaking ||
+      this.providerResponseActive ||
+      (!force && this.providerTurnResponseExpected) ||
+      this.notificationResponsePending
+    ) {
+      return false;
+    }
+    // Sidecar first: no provider LLM echo, no busy() serialization.
+    const mux = this.speechMux;
+    if (mux?.available) {
+      const outcome = await mux.speak(record.speech!);
+      if (outcome === "spoken") {
+        this.deferredAnswers.delete(record.pendingId);
+        this.scheduleNotificationFlush();
+        return true;
+      }
+      if (outcome === "aborted") return false;
+      // skipped/failed/unavailable: fall through to the provider path.
+    }
+    this.notificationResponsePending = true;
+    const context = `[HERMES_LIVE_DEFERRED_ANSWER_V1:${this.notificationToken}] ${JSON.stringify({ announcement: record.speech })}`;
+    try {
+      await withAbortAndDeadline(
+        this.liveSession.sendTaskNotification({ context, announcement: record.speech!, speech: record.speech! }),
+        this.abort.signal,
+        MAX_PROVIDER_IO_WAIT_MS,
+        "Realtime provider deferred answer did not settle before the safety deadline.",
+      );
+    } catch (error) {
+      this.notificationResponsePending = false;
+      if (!this.closing) {
+        this.deps.logger.warn("deferred answer speech delivery failed", {
+          sessionId: this.id,
+          pendingId: record.pendingId,
+          error: errorToMessage(error),
+        });
+      }
+      return false;
+    }
+    this.deferredAnswers.delete(record.pendingId);
+    this.stopFiller();
+    if (this.notificationResponsePending) this.armNotificationResponseWatchdog();
+    this.scheduleNotificationFlush();
+    return true;
+  }
+
   private availableProviderTools(): LiveToolName[] {
     const tools: LiveToolName[] = [
       "start_background_task",
@@ -850,6 +1155,17 @@ export class LiveGatewaySession {
         if (!chatSession) {
           return Promise.resolve({ ok: false, error: "This Hermes installation cannot continue saved conversations." });
         }
+        // Async tools: acknowledge instantly, deliver the answer as speech
+        // when it is ready. The held-input window collapses to the receipt.
+        if (this.deps.config.hermes.asyncTools !== false) {
+          const pendingId = this.startDeferredAnswer("conversation", this.conversation.sessionId!, message);
+          return Promise.resolve({
+            spoken_response: "On it — I'm checking with Hermes now. Keep talking; I'll share the answer the moment I have it.",
+            ok: true,
+            deferred: true,
+            pending_id: pendingId,
+          });
+        }
         return this.serializeConversationOperation(async () => {
           const result = await chatSession.call(this.deps.hermes, this.conversation.sessionId!, message, {
             signal: this.abort.signal,
@@ -875,6 +1191,17 @@ export class LiveGatewaySession {
         const chatSession = this.deps.hermes.chatSession;
         if (!chatSession || !this.deps.hermes.listSessions || !this.deps.hermes.createSession) {
           return Promise.resolve({ ok: false, error: "This Hermes installation cannot search past conversations." });
+        }
+        if (this.deps.config.hermes.asyncTools !== false) {
+          // The recall session resolves inside the background runner so the
+          // spoken receipt returns without any Hermes round-trip.
+          const pendingId = this.startDeferredAnswer("recall", async () => this.recallSession(), query, RECALL_INSTRUCTIONS);
+          return Promise.resolve({
+            spoken_response: "Let me look through our past chats — give me a moment.",
+            ok: true,
+            deferred: true,
+            pending_id: pendingId,
+          });
         }
         return this.serializeConversationOperation(async () => {
           const recallSessionId = await this.recallSession();
@@ -1115,6 +1442,9 @@ export class LiveGatewaySession {
       responseDelivery: "not_started",
     };
     this.providerToolCalls.set(id, record);
+    this.speechTiming.noteToolCallStarted(Date.now());
+    // Fast tools finish before the filler delay elapses; slow ones get clips.
+    if (!this.fillerSequenceForProvider) this.filler?.beginSequence();
     this.pendingProviderToolCalls += 1;
     this.scheduleProviderToolOperation(async () => {
       try {
@@ -1193,13 +1523,25 @@ export class LiveGatewaySession {
     if (record.cancelled || this.closing || !this.liveSession) return;
     record.responseDelivery = "sending";
     try {
+      const spokenReceipt = typeof response.spoken_response === "string" ? response.spoken_response.trim() : "";
+      const sidecarSpeaksReceipt = spokenReceipt.length > 0 && (this.speechMux?.available ?? false);
+      if (sidecarSpeaksReceipt) {
+        // The sidecar speaks the receipt without a provider LLM round-trip.
+        void this.speechMux!.speak(spokenReceipt, { immediate: true });
+      }
       await withAbortAndDeadline(
-        this.liveSession.sendToolResponse(call, response),
+        this.liveSession.sendToolResponse(
+          call,
+          response,
+          sidecarSpeaksReceipt ? { suppressSpeech: true } : undefined,
+        ),
         this.abort.signal,
         MAX_PROVIDER_IO_WAIT_MS,
         "Realtime provider tool response did not settle before the safety deadline.",
       );
       if (!record.cancelled) record.responseDelivery = "sent";
+      // The receipt speech is starting: filler and stale sidecar speech yield.
+      if (!sidecarSpeaksReceipt) this.stopFiller();
     } catch (error) {
       if (this.closing) return;
       this.deps.logger.warn("failed to send realtime tool response", {
@@ -1249,11 +1591,12 @@ export class LiveGatewaySession {
    */
   private async handleGatedAudioInput(message: Extract<ClientMessage, { type: "audio.input" }>): Promise<void> {
     const gate = this.speechGate!;
-    gate.setDownlinkActive(this.providerResponseActive || this.providerTurnResponseExpected);
+    gate.setDownlinkActive(this.downlinkActiveForGate());
     const decision = await gate.ingest({ data: message.data, mimeType: message.mimeType });
     if (this.closing) return;
     if (decision.started) {
       this.userSpeaking = true;
+      this.stopFiller();
       this.send({
         type: "input.speech_started",
         provider: "gateway",
@@ -1279,6 +1622,65 @@ export class LiveGatewaySession {
     this.scheduleNotificationFlush();
   }
 
+  private emitFillerSpeech(message: FillerEmit): void {
+    if (this.closing) return;
+    if (message.kind === "transcript") {
+      this.send({ type: "transcript.delta", speaker: "assistant", text: message.text, final: true });
+      return;
+    }
+    this.send({ type: "audio.output", data: message.data, mimeType: message.mimeType });
+  }
+
+  /**
+   * Filler clips may speak only into genuine dead air: never over the user,
+   * a live provider response, or a pending announcement handoff. Tool-wait
+   * sequences additionally require an outstanding tool response; sequences
+   * armed by a provider error are the exception (the tool state is exactly
+   * what cannot be trusted then).
+   */
+  private fillerSpeechAllowed(): boolean {
+    if (
+      this.closing ||
+      this.userSpeaking ||
+      this.providerResponseActive ||
+      this.providerTurnResponseExpected ||
+      this.notificationResponsePending
+    ) {
+      return false;
+    }
+    return this.fillerSequenceForProvider
+      || this.providerToolResponsePending()
+      || this.hasUndeliveredDeferredAnswers();
+  }
+
+  private hasUndeliveredDeferredAnswers(): boolean {
+    for (const record of this.deferredAnswers.values()) {
+      if (!record.delivered) return true;
+    }
+    return false;
+  }
+
+  private hasReadyDeferredAnswers(): boolean {
+    for (const record of this.deferredAnswers.values()) {
+      if (!record.delivered && record.speech !== undefined) return true;
+    }
+    return false;
+  }
+
+  private stopFiller(): void {
+    this.fillerSequenceForProvider = false;
+    this.filler?.stop();
+    this.speechMux?.abort();
+  }
+
+  /** Downlink-active covers provider speech, expected responses, fillers, and sidecar speech. */
+  private downlinkActiveForGate(): boolean {
+    return this.providerResponseActive
+      || this.providerTurnResponseExpected
+      || (this.filler?.active ?? false)
+      || (this.speechMux?.speaking ?? false);
+  }
+
   /**
    * True while any provider tool call has not yet delivered its output: the
    * local speech runtime fails a new turn in that window ("Cannot generate a
@@ -1297,11 +1699,46 @@ export class LiveGatewaySession {
   }
 
   private holdAudioInput(data: string, mimeType: string): void {
+    // With a speech gate, held frames still run through it: the gateway hears
+    // the user during tool waits (barge-in, filler stop), and the gate's
+    // forward output (preroll included) is what gets buffered for the flush.
+    if (this.speechGate && isPcmMimeType(mimeType)) {
+      void this.ingestHeldAudio(data, mimeType);
+      return;
+    }
+    this.pushHeldAudio(data, mimeType);
+    this.userSpeaking = true;
+  }
+
+  private async ingestHeldAudio(data: string, mimeType: string): Promise<void> {
+    const gate = this.speechGate!;
+    gate.setDownlinkActive(this.downlinkActiveForGate());
+    const decision = await gate.ingest({ data, mimeType });
+    if (this.closing) return;
+    if (decision.started) {
+      this.userSpeaking = true;
+      this.stopFiller();
+      this.send({
+        type: "input.speech_started",
+        provider: "gateway",
+        ...(decision.probability === undefined ? {} : { probability: decision.probability }),
+      });
+    }
+    for (const frame of decision.forward) {
+      this.pushHeldAudio(frame.data, frame.mimeType, true);
+    }
+    if (decision.stopped) {
+      this.userSpeaking = false;
+      this.send({ type: "input.speech_stopped", provider: "gateway" });
+      this.scheduleNotificationFlush();
+    }
+  }
+
+  private pushHeldAudio(data: string, mimeType: string, preGated = false): void {
     const samples = Buffer.from(data, "base64").length / 2;
     const frameMs = samples * 1_000 / requirePcmSampleRate(mimeType);
-    this.heldInputs.push({ kind: "audio", data, mimeType });
+    this.heldInputs.push({ kind: "audio", data, mimeType, ...(preGated ? { preGated: true } : {}) });
     this.heldAudioMs += frameMs;
-    this.userSpeaking = true;
     while (
       this.heldInputs.length > 1
       && (this.heldAudioMs > MAX_HELD_AUDIO_MS || this.heldInputs.length > MAX_HELD_INPUTS)
@@ -1350,7 +1787,9 @@ export class LiveGatewaySession {
           });
           continue;
         }
-        if (this.speechGate && isPcmMimeType(input.mimeType)) {
+        // Pre-gated frames were already scored while held; re-ingesting would
+        // duplicate speech events and double-buffer the preroll.
+        if (!input.preGated && this.speechGate && isPcmMimeType(input.mimeType)) {
           await this.handleGatedAudioInput({ type: "audio.input", data: input.data, mimeType: input.mimeType });
         } else {
           await this.forwardRealtimeClientInput(
@@ -1448,6 +1887,7 @@ export class LiveGatewaySession {
       return;
     }
     if (event.type === "input_speech_started") {
+      this.stopFiller();
       if (!this.speechGate) this.userSpeaking = true;
       const itemId = publicProviderIdentifier(event.itemId);
       const audioStartMs = publicAudioStartMs(event.audioStartMs);
@@ -1470,6 +1910,8 @@ export class LiveGatewaySession {
     if (event.status === "started") {
       if (event.scope !== "task_notification") this.providerTurnResponseExpected = false;
       this.providerResponseActive = true;
+      this.stopFiller();
+      this.speechTiming.noteResponseStarted(event.scope, Date.now());
       const responseId = publicProviderIdentifier(event.responseId);
       this.send({ type: "response.started", ...(responseId ? { responseId } : {}) });
       return;
@@ -1524,6 +1966,7 @@ export class LiveGatewaySession {
     }
     if (record.notification.unread && record.notification.announcedAt === undefined && notification) {
       this.pendingNotifications.set(record.taskId, structuredClone(record));
+      this.speechTiming.noteAnnouncementPending(record.taskId, Date.now());
     } else {
       this.pendingNotifications.delete(record.taskId);
       this.notificationDeliveryAttempts.delete(record.taskId);
@@ -1541,7 +1984,7 @@ export class LiveGatewaySession {
       this.providerTurnResponseExpected ||
       this.userSpeaking ||
       this.notificationRetryTimer !== undefined ||
-      this.pendingNotifications.size === 0
+      (this.pendingNotifications.size === 0 && !this.hasReadyDeferredAnswers())
     ) {
       return;
     }
@@ -1550,20 +1993,29 @@ export class LiveGatewaySession {
     });
   }
 
-  private async flushNotifications(): Promise<void> {
+  private async flushNotifications(force = false): Promise<void> {
     if (
       this.closing ||
       this.notificationFlushRunning ||
       this.notificationResponsePending ||
-      this.providerResponseActive ||
-      this.providerTurnResponseExpected ||
-      this.userSpeaking ||
       !this.liveSession?.sendTaskNotification ||
-      !this.ownerId
+      !this.ownerId ||
+      (!force && (this.providerResponseActive || this.providerTurnResponseExpected || this.userSpeaking))
     ) {
       return;
     }
     const candidates = [...this.pendingNotifications.values()];
+    if (candidates.length === 0 && !this.hasReadyDeferredAnswers()) return;
+    this.notificationFlushRunning = true;
+    // Deferred answers outrank task notifications: the user asked for them
+    // and is waiting. One speech response per flush; the loser re-schedules.
+    if (this.hasReadyDeferredAnswers()) {
+      try {
+        if (await this.deliverNextDeferredAnswer(force)) return;
+      } finally {
+        this.notificationFlushRunning = false;
+      }
+    }
     if (candidates.length === 0) return;
     this.notificationFlushRunning = true;
     const records: TaskRecord[] = [];
@@ -1629,6 +2081,9 @@ export class LiveGatewaySession {
         MAX_PROVIDER_IO_WAIT_MS,
         "Realtime provider task notification did not settle before the safety deadline.",
       );
+      for (const record of records) {
+        this.speechTiming.noteAnnouncementDelivered(record.taskId, Date.now());
+      }
       for (const record of records) {
         try {
           await this.deps.taskSupervisor.completeNotificationAnnouncement(
@@ -1700,11 +2155,41 @@ export class LiveGatewaySession {
       // unread inbox item untouched. A reconnect receives a fresh snapshot and
       // may try again with a fresh bounded budget.
       this.pendingNotifications.delete(record.taskId);
+      this.speechTiming.forgetAnnouncement(record.taskId);
       return;
     }
     this.notificationDeliveryAttempts.set(record.taskId, attempt);
     this.pendingNotifications.set(record.taskId, structuredClone(record));
     this.scheduleNotificationRetry(NOTIFICATION_RETRY_BASE_MS * (2 ** (attempt - 1)));
+  }
+
+  /**
+   * Deadline watch for pending speech: once an answer or announcement has
+   * waited past announceMaxDelayMs, deliver it at the next gap where the user
+   * is not speaking and the provider is not mid-response — overriding the
+   * strict idle gate (which a stale expected-turn flag can wedge forever).
+   */
+  private armAnnouncementDeadlineWatch(): void {
+    if (this.announcementDeadlineTimer !== undefined) return;
+    this.announcementDeadlineTimer = setInterval(() => {
+      if (this.closing) return;
+      const now = Date.now();
+      const maxDelayMs = this.deps.config.hermes.announceMaxDelayMs ?? DEFAULT_ANNOUNCE_MAX_DELAY_MS;
+      const agedAnswer = [...this.deferredAnswers.values()].some(
+        (record) => !record.delivered && record.speech !== undefined && now - (record.readyAt ?? record.startedAt) > maxDelayMs,
+      );
+      const agedNotification = [...this.pendingNotifications.values()].some(
+        (record) => now - record.updatedAt > maxDelayMs,
+      );
+      if (!agedAnswer && !agedNotification) return;
+      if (this.userSpeaking || this.providerResponseActive || this.notificationResponsePending || this.notificationFlushRunning) return;
+      if (this.notificationRetryTimer !== undefined) {
+        clearTimeout(this.notificationRetryTimer);
+        this.notificationRetryTimer = undefined;
+      }
+      void this.flushNotifications(true);
+    }, ANNOUNCEMENT_DEADLINE_CHECK_MS);
+    this.announcementDeadlineTimer.unref?.();
   }
 
   private scheduleNotificationRetry(delayMs: number): void {
@@ -1775,6 +2260,16 @@ export class LiveGatewaySession {
   }
 
   private async performClose(): Promise<void> {
+    this.stopFiller();
+    if (this.deferredAnswerEscalationTimer !== undefined) {
+      clearTimeout(this.deferredAnswerEscalationTimer);
+      this.deferredAnswerEscalationTimer = undefined;
+    }
+    if (this.announcementDeadlineTimer !== undefined) {
+      clearInterval(this.announcementDeadlineTimer);
+      this.announcementDeadlineTimer = undefined;
+    }
+    this.deferredAnswers.clear();
     this.unsubscribeTasks?.();
     this.unsubscribeTasks = undefined;
     this.pendingTaskRecords.clear();
@@ -1875,6 +2370,15 @@ export class LiveGatewaySession {
     const sorted = Array.from(this.audioGapSamples.subarray(0, this.audioGapLength)).sort((a, b) => a - b);
     const percentile = (quantile: number) => sorted[Math.min(sorted.length - 1, Math.floor(quantile * (sorted.length - 1)))];
     return { lastOutputMsAgo, gapP50Ms: percentile(0.5), gapP95Ms: percentile(0.95) };
+  }
+
+  /**
+   * Speech-wait telemetry consumed by GET /v1/metrics: how long the user
+   * waited to hear anything after a tool call began, and how long completed
+   * tasks waited before their announcement was spoken.
+   */
+  speechTimingMetrics(): SpeechTimingMetrics {
+    return this.speechTiming.metrics();
   }
 
   private handleClientMessageFailure(error: unknown, requestId?: string): void {

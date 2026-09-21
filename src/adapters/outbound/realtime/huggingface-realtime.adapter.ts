@@ -42,6 +42,7 @@ const LOCAL_TURN_END_SILENCE = Buffer.alloc(
 ).toString("base64");
 const LOCAL_SESSION_UPDATE_SETTLE_MS = 100;
 const LOCAL_BUSY_RETRY_MS = 500;
+const LOCAL_PROVIDER_KEEPALIVE_MS = 15_000;
 const LOCAL_MAX_EVENT_BYTES = 16 * 1024 * 1024;
 const LOCAL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const LOCAL_MAX_QUEUED_RESPONSES = 32;
@@ -79,7 +80,8 @@ export class HuggingFaceRealtimeAdapter implements LiveModelAdapter {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
         throw new Error(
-          `Hugging Face speech-to-speech stayed busy for ${this.connectTimeoutMs}ms.`,
+          `Hugging Face speech-to-speech stayed busy for ${this.connectTimeoutMs}ms. `
+          + "Its single pipeline slot is held by another session; if this persists, check for a stale gateway connection or restart hermes-s2s.",
         );
       }
       try {
@@ -206,6 +208,9 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
   private readonly bufferedAssistantText: Extract<LiveModelEvent, { type: "text" }>[] = [];
   private bufferedAssistantTextChars = 0;
   private responseTimeout?: ReturnType<typeof setTimeout>;
+  private keepaliveTimer?: ReturnType<typeof setInterval>;
+  private providerPongPending = false;
+  private missedProviderPongs = 0;
   private providerClosedAt?: number;
   private providerErrorCount = 0;
   private lastProviderError?: string;
@@ -234,6 +239,34 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
       this.reset();
       if (this.ready) callbacks.onClose?.({ code, reason: reason.toString("utf8") });
     });
+    this.armProviderKeepalive();
+  }
+
+  /**
+   * A half-open provider socket wedges the single pipeline slot with no error
+   * and no close. Protocol pings detect it: two consecutive missed pongs fail
+   * the session through the normal close path instead of a zombie.
+   */
+  private armProviderKeepalive(): void {
+    this.ws.on("pong", () => {
+      this.providerPongPending = false;
+      this.missedProviderPongs = 0;
+    });
+    this.keepaliveTimer = setInterval(() => {
+      if (this.closing || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.providerPongPending) {
+        this.missedProviderPongs += 1;
+        if (this.missedProviderPongs >= 2) {
+          this.fail(new Error("Local voice WebSocket stopped answering keepalive pings."));
+          return;
+        }
+      } else {
+        this.missedProviderPongs = 0;
+      }
+      this.providerPongPending = true;
+      this.ws.ping();
+    }, LOCAL_PROVIDER_KEEPALIVE_MS);
+    this.keepaliveTimer.unref?.();
   }
 
   configure(
@@ -289,7 +322,12 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
     return true;
   }
 
-  async sendToolResponse(call: LiveToolCall, response: Record<string, unknown>): Promise<void> {
+  async sendToolResponse(
+    call: LiveToolCall,
+    response: Record<string, unknown>,
+    options?: { suppressSpeech?: boolean },
+  ): Promise<void> {
+    const suppressSpeech = options?.suppressSpeech === true;
     if (!call.id) throw new Error(`Hugging Face function call ${call.name} did not include a call_id.`);
     const spokenReceipt = localSpokenToolReceipt(response);
     const returnedTaskId = localReturnedTaskId(response);
@@ -297,7 +335,7 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
     const routedAction = this.syntheticToolCalls.get(call.id);
     if (routedAction) {
       this.syntheticToolCalls.delete(call.id);
-      if (spokenReceipt) {
+      if (spokenReceipt && !suppressSpeech) {
         this.schedule({
           kind: "conversation",
           response: {
@@ -404,7 +442,7 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
         type: "conversation.item.create",
         item: { type: "function_call_output", call_id: call.id, output: JSON.stringify(response) },
       },
-      ...(spokenReceipt
+      ...(spokenReceipt && !suppressSpeech
         ? {
             response: {
               instructions: `Say exactly this one short tool receipt and nothing else: ${JSON.stringify(spokenReceipt)}`,
@@ -425,7 +463,7 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
     const response = buildOpenAITaskNotificationResponse(notification);
     response.metadata = {
       hermes_live_purpose: "task_notification",
-      hermes_live_exact_speech: notification.announcement,
+      hermes_live_exact_speech: notification.speech ?? notification.announcement,
     };
     this.schedule({ kind: "task_notification", response });
   }
@@ -671,6 +709,10 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
 
   private reset(): void {
     this.clearResponseTimeout();
+    if (this.keepaliveTimer !== undefined) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = undefined;
+    }
     this.responsePending = false;
     this.responseActive = false;
     this.implicitResponsePending = false;

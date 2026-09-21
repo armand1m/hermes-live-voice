@@ -12,6 +12,7 @@ import type {
   HermesRunUsage,
   HermesRunsPort,
   HermesSessionChatResult,
+  HermesChatStreamEvent,
   HermesSessionHistory,
   HermesSessionMessage,
   HermesSessionSummary,
@@ -265,6 +266,72 @@ export class HermesClient implements HermesRunsPort {
       content,
       ...(usage ? { usage } : {}),
     };
+  }
+
+  async *chatSessionStream(
+    sessionId: string,
+    message: string,
+    options: { signal?: AbortSignal; sessionKey?: string; instructions?: string } = {},
+  ): AsyncGenerator<HermesChatStreamEvent> {
+    requireHermesSessionId(sessionId);
+    const input = boundedSafeText(message, 100_000, "Hermes session message", true);
+    await this.ensureSessionModelReady(sessionId, options.signal);
+    const body: Record<string, unknown> = { message: input };
+    if (options.instructions !== undefined) {
+      body.instructions = boundedSafeText(options.instructions, 100_000, "Hermes session instructions", true);
+    }
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/chat/stream`;
+    const publicPath = "/api/sessions/{session_id}/chat/stream";
+    const idleTimeoutMessage =
+      `Hermes chat stream was idle for ${this.streamIdleTimeoutMs}ms: ${publicPath}`;
+    const requestSignal = createRequestSignal(
+      options.signal,
+      this.chatTimeoutMs,
+      `Hermes chat stream did not finish within ${this.chatTimeoutMs}ms: ${publicPath}`,
+    );
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        redirect: "error",
+        headers: this.headers({
+          accept: "text/event-stream",
+          "content-type": "application/json",
+          ...this.sessionHeaders(options.sessionKey),
+        }),
+        body: JSON.stringify(body),
+        signal: requestSignal.signal,
+      });
+      if (!response.ok) {
+        const metadata = await readHermesErrorMetadata(response, MAX_HERMES_JSON_RESPONSE_BYTES);
+        throw new HermesRequestError(
+          response.status,
+          publicPath,
+          metadata.retryAfter,
+          "Hermes chat stream request failed",
+          metadata.errorCode,
+        );
+      }
+      if (!response.body) {
+        throw new Error("Hermes chat stream response did not include a body.");
+      }
+      requestSignal.clearTimeout();
+      for await (const event of parseSseStream(response.body, {
+        idleTimeoutMs: this.streamIdleTimeoutMs,
+        idleTimeoutMessage,
+        onIdle: () => requestSignal.abort(new Error(idleTimeoutMessage)),
+      })) {
+        const projected = projectChatStreamEvent(event);
+        if (projected) yield projected;
+        if (projected?.type === "assistant.completed" || projected?.type === "run.failed") return;
+      }
+    } catch (error) {
+      throw requestSignal.timedOut()
+        ? new Error(`Hermes chat stream did not finish within ${this.chatTimeoutMs}ms: ${publicPath}`)
+        : error;
+    } finally {
+      requestSignal.cleanup();
+    }
   }
 
   private async defaultModelSelection(signal?: AbortSignal): Promise<HermesModelSelection | undefined> {
@@ -856,6 +923,32 @@ function requireHermesSessionId(sessionId: string): void {
   if (!isBoundedHermesIdentifier(sessionId)) {
     throw new Error("Hermes session id must be a bounded identifier.");
   }
+}
+
+/** Maps one raw SSE payload from /chat/stream onto the typed stream events. */
+function projectChatStreamEvent(event: HermesRunEvent): HermesChatStreamEvent | undefined {
+  const name = event.event;
+  if (name === "assistant.delta") {
+    const delta = typeof event.delta === "string" ? event.delta.slice(0, MAX_HERMES_RUN_OUTPUT_CHARS) : "";
+    return delta ? { type: "assistant.delta", text: delta } : undefined;
+  }
+  if (name === "assistant.commentary") {
+    const text = typeof event.text === "string" ? event.text.slice(0, MAX_HERMES_RUN_OUTPUT_CHARS) : "";
+    return text.trim() ? { type: "assistant.commentary", text } : undefined;
+  }
+  if (name === "assistant.completed") {
+    const sessionId = typeof event.session_id === "string" ? event.session_id : "";
+    const content = typeof event.content === "string" ? event.content.slice(0, MAX_HERMES_RUN_OUTPUT_CHARS) : "";
+    if (!isBoundedHermesIdentifier(sessionId)) {
+      throw new Error("Hermes chat stream completion did not include a bounded session id.");
+    }
+    return { type: "assistant.completed", sessionId, content };
+  }
+  if (name === "run.failed" || name === "run.interrupted" || name === "run.cancelled") {
+    const error = typeof event.error === "string" ? event.error.slice(0, 500) : undefined;
+    return { type: "run.failed", ...(error ? { error } : {}) };
+  }
+  return undefined;
 }
 
 function boundedRetryAfter(response: Response): string | undefined {

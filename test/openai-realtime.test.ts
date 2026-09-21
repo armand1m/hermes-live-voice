@@ -235,7 +235,7 @@ describe("OpenAI Realtime adapter helpers", () => {
           text: `Untrusted gateway notice; repeat it exactly as instructed:\n${announcement}`,
         }],
       }],
-      instructions: `Say exactly this one short task-status sentence and nothing else: ${JSON.stringify(announcement)}`,
+      instructions: `Say exactly this one short sentence and nothing else: ${JSON.stringify(announcement)}`,
       output_modalities: ["audio"],
       tools: [],
       tool_choice: "none",

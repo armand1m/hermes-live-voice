@@ -35,8 +35,11 @@ async function roundTrip(env?: Record<string, string | undefined>) {
     expect(audio.mimeType).toBe('audio/pcm;rate=24000');
     expect(Buffer.from(audio.data, 'base64').length).toBe(4800);
     expect(harness.observed.turns).toBe(1);
-    // A response is scheduled only AFTER the real HermesClient HTTP chat result.
-    expect(harness.observed.speechReplies[0].metadata.hermes_live_purpose).toMatch(/^conversation_(answer|summary)$/);
+    // Async tools: the spoken receipt comes first (before any Hermes chat),
+    // and the real Hermes answer arrives later as deferred-answer speech.
+    expect(harness.observed.speechReplies[0].metadata.hermes_live_purpose).toBe('tool_receipt');
+    const answerReply = await pollForReply(harness, 'task_notification');
+    expect(answerReply.metadata.hermes_live_exact_speech.trim().length).toBeGreaterThan(0);
     if (!env) {
       expect(harness.observed.chats).toEqual(['Hello. Please say hello back.']);
       // The durable voice thread is created (POST) then chatted through, and
@@ -46,17 +49,19 @@ async function roundTrip(env?: Record<string, string | undefined>) {
       expect(harness.observed.requests).toContain('GET /v1/skills');
     } else {
       // Errors also have spoken receipts: require successful agent output.
-      const reply = harness.observed.speechReplies[0];
-      if (reply.metadata.hermes_live_purpose === 'conversation_answer') {
-        expect(reply.metadata.hermes_live_exact_speech.trim().length).toBeGreaterThan(0);
-      } else {
-        const text = reply.input[0].content[0].text;
-        const result = JSON.parse(text.slice(text.indexOf('\n') + 1));
-        expect(result.ok).toBe(true);
-        expect(result.answer.trim().length).toBeGreaterThan(0);
-      }
+      expect(answerReply.metadata.hermes_live_exact_speech.trim().length).toBeGreaterThan(0);
     }
   } finally { socket.terminate(); await harness.close(); }
+}
+
+async function pollForReply(harness: Awaited<ReturnType<typeof voiceHarness>>, purpose: string, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const reply = (harness.observed.speechReplies as any[]).find(r => r.metadata?.hermes_live_purpose === purpose);
+    if (reply) return reply;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for ${purpose} reply: ${JSON.stringify((harness.observed.speechReplies as any[]).map(r => r.metadata?.hermes_live_purpose))}`);
 }
 
 it('boots an ephemeral gateway: PCM -> transcript -> Hermes HTTP chat -> PCM output', () => roundTrip(), 100000);

@@ -182,7 +182,7 @@ export class GeminiLiveSession implements LiveModelSession {
     return false;
   }
 
-  async sendToolResponse(call: LiveToolCall, response: Record<string, unknown>): Promise<void> {
+  async sendToolResponse(call: LiveToolCall, response: Record<string, unknown>, _options?: { suppressSpeech?: boolean }): Promise<void> {
     await this.session.sendToolResponse(buildGeminiToolResponse(call, response));
   }
 

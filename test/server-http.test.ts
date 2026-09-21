@@ -147,6 +147,27 @@ describe("HTTP server", () => {
     }
   });
 
+  it("reaps zombie live clients that stop answering keepalive pings", async () => {
+    const server = await startServer({
+      config: testConfig({ server: { wsKeepaliveMs: 60 } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      logger: fakeLogger(),
+    });
+    openServers.push(server);
+    const socket = await openUncooperativeWebSocket(server.url);
+    // The raw peer never answers protocol pings: two missed keepalives must
+    // terminate it so the session (and its provider slot) is released.
+    const closed = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+      socket.once("error", () => resolve());
+    });
+    await expect(Promise.race([
+      closed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("zombie socket survived the reaper")), 2_000)),
+    ])).resolves.toBeUndefined();
+  });
+
   it("forces an uncooperative WebSocket closed and releases the task-store lock", async () => {
     const config = testConfig();
     const first = await startServer({
@@ -1012,6 +1033,7 @@ function testConfig(
       model: "hermes-agent",
       timeoutMs: 30_000,
       streamIdleTimeoutMs: 120_000,
+      asyncTools: false,
       ...overrides.hermes,
     },
     tasks: {
@@ -1043,6 +1065,8 @@ function testConfig(
       ...overrides.openai,
     },
     vad: testVadConfig(),
+    filler: { enabled: false, delayMs: 2_500, intervalMs: 15_000, maxPerTool: 3 },
+    tts: { requestTimeoutMs: 15_000, maxChars: 1_000 },
     context: testContextConfig(),
   };
 }

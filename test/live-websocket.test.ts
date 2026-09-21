@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { createServer } from "node:http";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
@@ -284,6 +285,242 @@ describe("live gateway WebSocket", () => {
     start.resolve({ runId: "run_deferred", status: "queued" });
     await expect(client.messages.wait("task.started", (message) => message.taskId === receipt.response.task_id)).resolves
       .toMatchObject({ taskId: receipt.response.task_id });
+  });
+
+  it("speaks receipts and answers through the tts sidecar without provider speech", async () => {
+    // Stub sidecar: streams one PCM frame per request.
+    const payload = Buffer.alloc(4_800, 7);
+    const ttsServer = createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/v1/tts") {
+        res.writeHead(200, { "content-type": "audio/pcm" });
+        res.end(payload);
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => ttsServer.listen(0, "127.0.0.1", resolve));
+    openServers.push({ close: () => new Promise<void>((resolve) => ttsServer.close(() => resolve())) } as TestServer);
+    const ttsUrl = `http://127.0.0.1:${(ttsServer.address() as import("node:net").AddressInfo).port}`;
+
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    hermes.chatBehavior = async () => ({ sessionId: "session_tip", content: "Sidecar answer." });
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({
+        realtime: { provider: "local", model: "qwen-local" },
+        tts: { baseUrl: ttsUrl },
+        hermes: { asyncTools: true },
+      }),
+      hermes,
+      provider,
+    });
+    const client = await connectClient(server.url);
+    send(client.socket, {
+      type: "session.start",
+      protocolVersion: 5,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await client.messages.wait("session.ready");
+    await client.messages.wait("task.snapshot");
+
+    provider.emit({
+      type: "tool_call",
+      call: { id: "sidecar_chat", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+    });
+
+    // The receipt is spoken by the sidecar: transcript plus PCM frames, with
+    // no provider response round-trip on the critical path.
+    const receiptLine = await client.messages.wait(
+      "transcript.delta",
+      (message) => message.speaker === "assistant" && String(message.text).includes("checking with Hermes"),
+    );
+    expect(receiptLine.final).toBe(true);
+    const receiptAudio = await client.messages.wait("audio.output");
+    expect(Buffer.from(receiptAudio.data, "base64").equals(payload)).toBe(true);
+
+    // The answer also arrives as sidecar speech, never as a provider
+    // task-notification response.
+    await client.messages.wait(
+      "transcript.delta",
+      (message) => message.speaker === "assistant" && String(message.text).includes("Sidecar answer."),
+    );
+    const answerAudio = await client.messages.wait("audio.output");
+    expect(Buffer.from(answerAudio.data, "base64").equals(payload)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(provider.latest.notificationCalls).toEqual([]);
+  }, 15_000);
+
+  it("forces an overdue deferred answer through a wedged expected-turn gate", async () => {
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    hermes.chatBehavior = async () => ({
+      sessionId: "session_tip",
+      content: "Deadline answer.",
+    });
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({
+        hermes: { asyncTools: true, announceMaxDelayMs: 5_000 },
+      }),
+      hermes,
+      provider,
+    });
+    const client = await connectClient(server.url);
+    send(client.socket, {
+      type: "session.start",
+      protocolVersion: 4,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await client.messages.wait("session.ready");
+    await client.messages.wait("task.snapshot");
+
+    provider.emit({
+      type: "tool_call",
+      call: { id: "deadline_chat", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+    });
+    await provider.latest.toolResponses.wait((entry) => entry.call.id === "deadline_chat");
+
+    // A speech_stopped with no following response wedges providerTurnResponse-
+    // Expected forever; the normal idle gate would never open again.
+    provider.emit({ type: "input_speech_started", provider: "local" });
+    provider.emit({ type: "input_speech_stopped", provider: "local" });
+
+    // The deadline watch overrides the wedged gate within maxDelay + check.
+    await expect(provider.latest.notifications.wait(() => true, 15_000)).resolves.toMatchObject({
+      speech: "Deadline answer.",
+    });
+  }, 30_000);
+
+  it("returns a deferred-answer receipt instantly and speaks the Hermes answer when idle", async () => {
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    const answer = deferred<HermesSessionChatResult>();
+    hermes.chatBehavior = async () => answer.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({ hermes: { asyncTools: true } }),
+      hermes,
+      provider,
+    });
+    const client = await connectClient(server.url);
+    send(client.socket, {
+      type: "session.start",
+      protocolVersion: 4,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await client.messages.wait("session.ready");
+    await client.messages.wait("task.snapshot");
+
+    provider.emit({
+      type: "tool_call",
+      call: { id: "deferred_chat", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+    });
+
+    // The receipt lands immediately even though the chat turn is still
+    // blocked: the voice loop is free again within milliseconds.
+    const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === "deferred_chat");
+    expect(receipt.response).toMatchObject({
+      ok: true,
+      deferred: true,
+      pending_id: expect.stringMatching(/^defer_[a-f0-9]{6,}$/u),
+      spoken_response: expect.stringContaining("checking with Hermes"),
+    });
+
+    // The user can keep talking while the answer computes: text flows to the
+    // provider right away instead of being held for the whole chat turn.
+    send(client.socket, { type: "text.input", text: "Take your time." });
+    await waitUntil(() => provider.latest.textInputs.includes("Take your time."));
+    provider.emit({ type: "response", status: "completed" });
+
+    answer.resolve({ sessionId: "session_tip", content: "Two fixes landed. The audit passed. Details are in the log." });
+    const notification = await provider.latest.notifications.wait();
+    expect(notification).toMatchObject({
+      announcement: "Two fixes landed. The audit passed. Details are in the log.",
+      speech: "Two fixes landed. The audit passed. Details are in the log.",
+    });
+    expect(notification.context).toContain("HERMES_LIVE_DEFERRED_ANSWER_V1");
+  });
+
+  it("speaks filler clips while a Hermes chat turn stalls and stops when provider speech begins", async () => {
+    const fillerDirectory = mkdtempSync(join(temporaryRoot, "filler-clips-"));
+    stateDirectories.push(fillerDirectory);
+    // A two-frame (200 ms) clip at 24 kHz PCM16, same shape as provider audio.
+    const clip = Buffer.alloc(2 * 24_000 * 2 * 100 / 1_000);
+    for (let index = 0; index < clip.length; index += 1) clip[index] = index % 251;
+    writeFileSync(join(fillerDirectory, "hold_on.pcm"), clip);
+    writeFileSync(join(fillerDirectory, "hold_on.txt"), "Still working on it.");
+
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    const answer = deferred<HermesSessionChatResult>();
+    hermes.chatBehavior = async () => answer.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({
+        filler: { enabled: true, delayMs: 500, intervalMs: 15_000, maxPerTool: 2, directory: fillerDirectory },
+      }),
+      hermes,
+      provider,
+    });
+    const client = await connectClient(server.url);
+    send(client.socket, {
+      type: "session.start",
+      protocolVersion: 4,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await client.messages.wait("session.ready");
+    await client.messages.wait("task.snapshot");
+
+    try {
+      provider.emit({
+        type: "tool_call",
+        call: { id: "slow_chat_filler", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+      });
+
+      // After the filler delay the clip covers the stalled chat turn as
+      // ordinary audio.output frames — no protocol change, same PCM contract.
+      const firstFrame = await client.messages.wait("audio.output");
+      expect(firstFrame).toMatchObject({ type: "audio.output", mimeType: "audio/pcm;rate=24000" });
+      expect(Buffer.from(firstFrame.data, "base64").equals(clip.subarray(0, 4_800))).toBe(true);
+
+      // The provider starting to speak silences the mid-flight clip instantly.
+      provider.emit({ type: "response", status: "started" });
+      await client.messages.expectNone("audio.output", 400);
+    } finally {
+      answer.resolve({ sessionId: "session_tip", content: "Hermes answered." });
+    }
+
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "slow_chat_filler"))
+      .resolves.toMatchObject({ response: { ok: true, message: "Hermes answered." } });
   });
 
   it("projects a stop during blocked dispatch as stopping until the exact Hermes run can be stopped", async () => {
@@ -2423,7 +2660,10 @@ function testConfig(overrides: {
   server?: Partial<AppConfig["server"]>;
   hermes?: Partial<AppConfig["hermes"]>;
   tasks?: Partial<AppConfig["tasks"]>;
+  realtime?: Partial<AppConfig["realtime"]>;
   vad?: Partial<AppConfig["vad"]>;
+  filler?: Partial<AppConfig["filler"]>;
+  tts?: Partial<AppConfig["tts"]>;
   context?: Partial<AppConfig["context"]>;
 } = {}): AppConfig {
   const stateFile = createTaskStateFile();
@@ -2447,6 +2687,9 @@ function testConfig(overrides: {
       model: "hermes-agent",
       timeoutMs: 30_000,
       streamIdleTimeoutMs: 120_000,
+      // Blocking chat tools by default: legacy-semantics tests. Async-tool
+      // tests opt in explicitly.
+      asyncTools: false,
       ...overrides.hermes,
     },
     tasks: {
@@ -2459,7 +2702,7 @@ function testConfig(overrides: {
       pollIntervalMs: 25,
       ...overrides.tasks,
     },
-    realtime: { provider: "mock", model: "test-live-model" },
+    realtime: { provider: "mock", model: "test-live-model", ...overrides.realtime },
     gemini: { model: "gemini-live-test", enterprise: false, location: "us-central1" },
     openai: {
       baseUrl: "wss://api.openai.com/v1/realtime",
@@ -2481,6 +2724,18 @@ function testConfig(overrides: {
       prerollMs: 250,
       tailMs: 400,
       ...overrides.vad,
+    },
+    filler: {
+      enabled: false,
+      delayMs: 2_500,
+      intervalMs: 15_000,
+      maxPerTool: 3,
+      ...overrides.filler,
+    },
+    tts: {
+      requestTimeoutMs: 15_000,
+      maxChars: 1_000,
+      ...overrides.tts,
     },
     context: {
       hermesHome: "/nonexistent-hermes-home",

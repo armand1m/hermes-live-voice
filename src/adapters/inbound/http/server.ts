@@ -20,6 +20,7 @@ import { TaskSupervisor } from "../../../application/task-supervisor/task-superv
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
 import { HermesClient } from "../../outbound/hermes/hermes-runs.client.js";
 import { createLiveModelAdapter } from "../../outbound/realtime/factory.js";
+import { sidecarTtsClientFromConfig } from "../../outbound/tts/local-tts.client.js";
 import { FileTaskStore } from "../../outbound/task-store/file-task-store.js";
 import type { Logger } from "../../../logger.js";
 import { buildReadinessReport } from "../../../readiness.js";
@@ -77,6 +78,7 @@ export async function startServer({
   }
   const hermes = providedHermes ?? new HermesClient(config.hermes);
   const liveModel = providedLiveModel ?? createLiveModelAdapter(config);
+  const speechSink = sidecarTtsClientFromConfig(config);
   const speechDetection = providedSpeechDetection ?? createSpeechDetectionService(config, logger);
   const taskSupervisor = providedTaskSupervisor ?? new TaskSupervisor({
     store: new FileTaskStore({
@@ -191,6 +193,7 @@ export async function startServer({
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      armClientKeepalive(ws, config.server.wsKeepaliveMs, logger);
       const session = new LiveGatewaySession(new WebSocketClientConnection(ws), {
         config,
         hermes,
@@ -198,6 +201,7 @@ export async function startServer({
         taskSupervisor,
         logger,
         speechDetection,
+        ...(speechSink ? { speechSink } : {}),
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -483,6 +487,13 @@ async function handleHttp(
     let lastAudioOutputMsAgo: number | null = null;
     let gatewayAudioGapP50Ms: number | null = null;
     let gatewayAudioGapP95Ms: number | null = null;
+    // Speech-wait telemetry: the worst recent tool→speech and announcement
+    // latencies across sessions, plus the filler injections spoken.
+    let toolSpeechP50Ms: number | null = null;
+    let toolSpeechP95Ms: number | null = null;
+    let announcementDelayP50Ms: number | null = null;
+    let announcementDelayP95Ms: number | null = null;
+    let fillerInjections = 0;
     for (const session of options.sessions) {
       const audio = session.audioDeliveryMetrics();
       if (audio.lastOutputMsAgo !== null) {
@@ -496,6 +507,20 @@ async function handleHttp(
       if (audio.gapP95Ms !== null) {
         gatewayAudioGapP95Ms = Math.max(gatewayAudioGapP95Ms ?? 0, audio.gapP95Ms);
       }
+      const timing = session.speechTimingMetrics();
+      if (timing.toolSpeechP50Ms !== null) {
+        toolSpeechP50Ms = Math.max(toolSpeechP50Ms ?? 0, timing.toolSpeechP50Ms);
+      }
+      if (timing.toolSpeechP95Ms !== null) {
+        toolSpeechP95Ms = Math.max(toolSpeechP95Ms ?? 0, timing.toolSpeechP95Ms);
+      }
+      if (timing.announcementDelayP50Ms !== null) {
+        announcementDelayP50Ms = Math.max(announcementDelayP50Ms ?? 0, timing.announcementDelayP50Ms);
+      }
+      if (timing.announcementDelayP95Ms !== null) {
+        announcementDelayP95Ms = Math.max(announcementDelayP95Ms ?? 0, timing.announcementDelayP95Ms);
+      }
+      fillerInjections += timing.fillerInjections;
     }
     json(req, res, 200, {
       ts: Date.now(),
@@ -505,6 +530,11 @@ async function handleHttp(
       lastAudioOutputMsAgo,
       gatewayAudioGapP50Ms,
       gatewayAudioGapP95Ms,
+      toolSpeechP50Ms,
+      toolSpeechP95Ms,
+      announcementDelayP50Ms,
+      announcementDelayP95Ms,
+      fillerInjections,
       voiceStackCpuPct: processMetrics.voiceStackCpuPct,
       voiceStackPid: processMetrics.voiceStackPid,
       eventLagMs: processMetrics.eventLagMs,
@@ -864,4 +894,46 @@ function listenHttpServer(server: ReturnType<typeof createServer>, port: number,
     server.once("listening", onListening);
     server.listen(port, host);
   });
+}
+
+/**
+ * Zombie-session reaper. A vanished client (sleep, roam, NAT drop) leaves a
+ * half-open WebSocket that keeps its provider pipeline slot and blocks new
+ * sessions with 503s. Browsers answer protocol pings automatically, so two
+ * consecutive missed pongs mean the peer is gone: terminate the socket, which
+ * runs the normal close path and releases the slot.
+ */
+function armClientKeepalive(
+  ws: import("ws").WebSocket,
+  keepaliveMs: number | undefined,
+  logger: Logger,
+): void {
+  const intervalMs = keepaliveMs ?? 15_000;
+  if (intervalMs <= 0) return;
+  let alive = true;
+  let missedPongs = 0;
+  ws.on("pong", () => {
+    alive = true;
+    missedPongs = 0;
+  });
+  const timer = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    if (!alive) {
+      missedPongs += 1;
+      if (missedPongs >= 2) {
+        logger.warn("terminating unresponsive live client after missed keepalives", {
+          keepaliveMs: intervalMs,
+        });
+        ws.terminate();
+        return;
+      }
+    } else {
+      missedPongs = 0;
+    }
+    alive = false;
+    ws.ping();
+  }, intervalMs);
+  timer.unref?.();
+  ws.once("close", () => clearInterval(timer));
+  ws.once("error", () => clearInterval(timer));
 }

@@ -29,6 +29,8 @@ export interface LiveTaskNotification {
   context: string;
   /** Short, already-sanitized generic sentence that may be spoken to the user. */
   announcement: string;
+  /** Exact speech override (deferred Hermes answers): spoken verbatim instead of the announcement. */
+  speech?: string;
 }
 
 export const MAX_LIVE_TASK_NOTIFICATION_CONTEXT_CHARS = 1_000;
@@ -39,6 +41,13 @@ export function requireLiveTaskNotification(value: unknown): LiveTaskNotificatio
     throw new Error("Task notification is invalid.");
   }
   const candidate = value as Record<string, unknown>;
+  const speech = candidate.speech === undefined
+    ? undefined
+    : requireTaskNotificationText(
+        candidate.speech,
+        MAX_LIVE_TASK_NOTIFICATION_ANNOUNCEMENT_CHARS,
+        "speech",
+      );
   return {
     context: requireTaskNotificationText(
       candidate.context,
@@ -50,6 +59,7 @@ export function requireLiveTaskNotification(value: unknown): LiveTaskNotificatio
       MAX_LIVE_TASK_NOTIFICATION_ANNOUNCEMENT_CHARS,
       "announcement",
     ),
+    ...(speech !== undefined ? { speech } : {}),
   };
 }
 
@@ -94,7 +104,17 @@ export interface LiveModelSession {
   /** Returns true when this call starts or schedules a provider response. */
   sendAudioStreamEnd(): Promise<boolean>;
   cancelResponse(reason?: string, truncate?: RealtimeResponseTruncation): Promise<boolean>;
-  sendToolResponse(call: LiveToolCall, response: Record<string, unknown>): Promise<void>;
+  /**
+   * Deliver a tool result. `suppressSpeech` asks adapters that would speak the
+   * response's spoken_response as a provider exact-speech receipt to skip it
+   * (the gateway sidecar is speaking it instead); the tool output itself is
+   * always delivered.
+   */
+  sendToolResponse(
+    call: LiveToolCall,
+    response: Record<string, unknown>,
+    options?: { suppressSpeech?: boolean },
+  ): Promise<void>;
   sendTaskNotification?(notification: LiveTaskNotification): Promise<void>;
   close(): Promise<void>;
 }

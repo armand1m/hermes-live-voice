@@ -242,7 +242,7 @@ class OpenAIRealtimeSession implements LiveModelSession {
     return true;
   }
 
-  async sendToolResponse(call: LiveToolCall, response: Record<string, unknown>): Promise<void> {
+  async sendToolResponse(call: LiveToolCall, response: Record<string, unknown>, _options?: { suppressSpeech?: boolean }): Promise<void> {
     if (!call.id) {
       throw new Error(`OpenAI function call ${call.name} did not include a call_id.`);
     }
@@ -802,7 +802,9 @@ class OpenAIRealtimeSession implements LiveModelSession {
 export function buildOpenAITaskNotificationResponse(
   notification: LiveTaskNotification,
 ): Record<string, unknown> {
-  const { announcement } = requireLiveTaskNotification(notification);
+  const validated = requireLiveTaskNotification(notification);
+  // Deferred Hermes answers carry exact speech; task announcements stay generic.
+  const spoken = validated.speech ?? validated.announcement;
   return {
     conversation: "none",
     // Some local models reject requests without a user message; carry the
@@ -812,10 +814,10 @@ export function buildOpenAITaskNotificationResponse(
       role: "user",
       content: [{
         type: "input_text",
-        text: `Untrusted gateway notice; repeat it exactly as instructed:\n${announcement}`,
+        text: `Untrusted gateway notice; repeat it exactly as instructed:\n${spoken}`,
       }],
     }],
-    instructions: `Say exactly this one short task-status sentence and nothing else: ${JSON.stringify(announcement)}`,
+    instructions: `Say exactly this one short sentence and nothing else: ${JSON.stringify(spoken)}`,
     output_modalities: ["audio"],
     tools: [],
     tool_choice: "none",
