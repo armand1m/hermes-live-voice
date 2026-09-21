@@ -1179,11 +1179,11 @@ export class HermesLiveAudio {
       node.port.onmessage = (event) => {
         if (event.data?.type === "flushed") return;
         try {
-          const frame = event.data;
-          if (!this.localVad) {
-            this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
+        const frame = event.data;
+        if (!this.localVad) {
+            if (this.client.connected) this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
             return;
-          }
+        }
           const activity = vad.process(new Int16Array(frame));
           this.inputLevel = activity.level;
           this.speechActive = activity.active;
@@ -1194,7 +1194,7 @@ export class HermesLiveAudio {
             for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
             preroll.length = 0;
           }
-          if (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad") {
+          if (this.client.connected && (activity.active || activity.stopped || this.client.session?.realtime?.audio?.turnDetection === "semantic_vad")) {
             this.client.sendAudio(frame, `audio/pcm;rate=${captureRate}`);
           } else {
             preroll.push(frame);
@@ -1204,7 +1204,7 @@ export class HermesLiveAudio {
             this.emitter.emit("input.speech_stopped", activity);
             // Provider VAD already sees the silence tail. Only manual-mode
             // providers need an explicit commit, otherwise turns duplicate.
-            if (this.client.session?.realtime?.audio?.turnDetection === "disabled") this.client.endAudio();
+            if (this.client.connected && this.client.session?.realtime?.audio?.turnDetection === "disabled") this.client.endAudio();
           }
         } catch (error) {
           this.emitter.emit("error", { error: toError(error), code: "audio_send_failed" });

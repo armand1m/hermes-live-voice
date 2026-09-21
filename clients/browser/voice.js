@@ -56,7 +56,7 @@ audio.on('microphone', event => {
 });
 client.on('audio.output', event => void audio.play(event).catch(error));
 client.on('input.speech_started', () => audio.clearPlayback());
-client.on('input.pause_requested', () => void audio.stopMicrophone({ endTurn: false }));
+client.on('input.pause_requested', () => void audio.stopMicrophone({ endTurn: false }).catch(() => undefined));
 let current;
 client.on('transcript.delta', event => {
   if (!current || current.dataset.speaker !== event.speaker || current.dataset.final === 'true') {
