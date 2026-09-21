@@ -5,7 +5,13 @@ const mute = document.querySelector('#mute');
 // Optional operator-supplied token stays in memory, never in HTML or storage.
 const token = new URLSearchParams(location.hash.slice(1)).get('token') || undefined;
 if (location.hash) history.replaceState(null, '', location.pathname + location.search);
-const url = new URL('/v1/live', location.href); url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+// The bundled page may be mounted at /voice (for example through Tailscale
+// Serve). Keep the WebSocket on that same mount instead of falling back to
+// the host's unrelated root service.
+const mountPath = location.pathname.endsWith('/')
+  ? location.pathname.slice(0, -1)
+  : location.pathname;
+const url = new URL(`${mountPath}/v1/live`, location.href); url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const client = new HermesLiveClient({ url: url.href, token, conversation: { mode: 'new' } });
 const audio = new HermesLiveAudio(client);
 const visualizer = new HermesVoiceVisualizer(document.querySelector('#field'), audio, client);
