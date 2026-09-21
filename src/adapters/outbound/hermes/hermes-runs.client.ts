@@ -201,7 +201,14 @@ export class HermesClient implements HermesRunsPort {
     }
     return {
       sessionId: response.session_id,
-      messages: response.data.map((value) => parseHermesSessionMessage(value)),
+      messages: response.data.flatMap((value) => {
+        // Hermes API Server includes non-conversational `session_meta` records
+        // in histories created by Telegram and other transports. They carry
+        // session bookkeeping rather than a chat turn and must not prevent a
+        // valid conversation from being resumed.
+        if (isHermesSessionMetaMessage(value)) return [];
+        return [parseHermesSessionMessage(value)];
+      }),
     };
   }
 
@@ -673,6 +680,10 @@ function parseHermesSessionSummary(value: unknown, expectedId?: string): HermesS
     summary.parentSessionId = value.parent_session_id;
   }
   return summary;
+}
+
+function isHermesSessionMetaMessage(value: unknown): boolean {
+  return isRecord(value) && value.role === "session_meta";
 }
 
 function parseHermesSessionMessage(value: unknown): HermesSessionMessage {

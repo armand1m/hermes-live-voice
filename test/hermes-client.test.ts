@@ -510,6 +510,27 @@ describe("HermesClient", () => {
     });
   });
 
+  it("ignores Hermes transport metadata records when resuming a Telegram session", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      object: "list",
+      session_id: "telegram_session",
+      data: [
+        { role: "session_meta", content: { source: "telegram", model: "qwen" } },
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+      ],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(hermesClient().getSessionHistory("telegram_session")).resolves.toEqual({
+      sessionId: "telegram_session",
+      messages: [
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+      ],
+    });
+  });
+
   it("continues a persisted Hermes session using the session chat endpoint", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({
