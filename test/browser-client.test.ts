@@ -1333,6 +1333,48 @@ describe("HermesLiveAudio", () => {
     await audio.dispose();
   });
 
+  it("grows the playback lead after an underrun and shrinks it after clean utterances", async () => {
+    const context = new FakeAudioContext({ sampleRate: 24_000 });
+    const audio = createAudio({
+      audioContextFactory: () => context as unknown as AudioContext,
+    });
+    // 40 ms frames at 24 kHz.
+    const frame = pcmFrame(new Array(960).fill(0));
+    const play = () => audio.play({ type: "audio.output", data: frame, mimeType: "audio/pcm;rate=24000" });
+
+    // First utterance: two back-to-back frames (0.18s lead, then contiguous).
+    await play();
+    await play();
+    expect(context.sources[0].startedAt).toBeCloseTo(0.18, 3);
+    expect(context.sources[1].startedAt).toBeCloseTo(0.22, 3);
+
+    // Simulate a delivery gap: playback drains while a third frame is late.
+    context.currentTime = 0.5;
+    await play();
+    expect((audio as unknown as { playbackUnderruns: number }).playbackUnderruns).toBe(1);
+    // The late frame rebuilds a cushion instead of starting bare.
+    expect(context.sources[2].startedAt).toBeGreaterThan(0.5);
+
+    // Finish the utterance naturally: the next response starts with a bigger lead.
+    const internals = audio as unknown as {
+      playbackSources: Set<{ source: FakeBufferSource }>;
+      finishPlaybackRecord: (record: { source: FakeBufferSource }) => void;
+      playbackLeadMs: number;
+    };
+    const records = [...internals.playbackSources];
+    for (const record of records) internals.finishPlaybackRecord(record);
+    expect(internals.playbackLeadMs).toBe(330);
+
+    // A clean utterance with no gaps shrinks the lead back toward the base.
+    context.currentTime = 1.0;
+    await play();
+    await play();
+    for (const record of [...internals.playbackSources]) internals.finishPlaybackRecord(record);
+    expect(internals.playbackLeadMs).toBe(270);
+
+    await audio.dispose();
+  });
+
   it.each(["disabled", "server_vad", "semantic_vad", "provider"])("continuously captures, barges in, and ends %s turns exactly once", async (turnDetection) => {
     const client = { ...audioClient(), session: { realtime: { audio: {
       input: { enabled: true, mimeType: "audio/pcm;rate=24000" }, turnDetection,

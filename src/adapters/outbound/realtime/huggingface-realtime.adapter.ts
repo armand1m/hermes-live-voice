@@ -206,9 +206,16 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
   private bufferedAssistantTextChars = 0;
   private responseTimeout?: ReturnType<typeof setTimeout>;
   private providerClosedAt?: number;
+  private providerErrorCount = 0;
+  private lastProviderError?: string;
   private closing = false;
   private ready = false;
   private closeOperation?: Promise<void>;
+
+  /** Recoverable provider errors seen since connect (diagnostics). */
+  get providerErrors(): { count: number; last?: string } {
+    return { count: this.providerErrorCount, ...(this.lastProviderError ? { last: this.lastProviderError } : {}) };
+  }
 
   constructor(
     private readonly ws: WebSocket,
@@ -448,7 +455,13 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
       return;
     }
     if (event.type === "error") {
-      this.fail(new Error(localProviderError(event)));
+      // Post-ready errors follow the OpenAI realtime contract: a top-level
+      // error typically accompanies response.done(status=failed) and the
+      // session keeps listening (a failed LLM generation is spoken as a
+      // fallback, not fatal). Killing the connection here dropped live calls
+      // on every transient provider error; a genuinely fatal runtime closes
+      // the socket itself and flows through the normal close path.
+      this.recordProviderError(event);
       return;
     }
 
@@ -637,6 +650,12 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
       throw new Error("Local voice WebSocket exceeded the safe outbound buffer limit.");
     }
     this.ws.send(payload);
+  }
+
+  /** Counts recoverable post-ready provider errors for diagnostics. */
+  private recordProviderError(event: unknown): void {
+    this.providerErrorCount += 1;
+    this.lastProviderError = localProviderError(event);
   }
 
   private fail(error: Error): void {

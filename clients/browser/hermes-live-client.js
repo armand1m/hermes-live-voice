@@ -1066,6 +1066,9 @@ export class HermesLiveAudio {
       DEFAULT_PLAYBACK_RESUME_TIMEOUT_MS,
     );
     this.playbackLeadMs = positiveInteger(options.playbackLeadMs, DEFAULT_PLAYBACK_LEAD_MS);
+    this.basePlaybackLeadMs = this.playbackLeadMs;
+    this.playbackUnderruns = 0;
+    this.playbackConsecutiveLate = 0;
     this.mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
     this.audioContextFactory = options.audioContextFactory ?? ((config) => new AudioContext(config));
     this.audioWorkletNodeFactory = options.audioWorkletNodeFactory ??
@@ -1441,10 +1444,25 @@ export class HermesLiveAudio {
     } else {
       source.connect(this.playbackAnalyser ?? context.destination);
     }
-    // Local TTS can briefly generate slower than realtime. Buffer the start of
-    // each response so small delivery gaps do not become audible stutters.
-    const startLead = this.playbackSources.size === 0 ? this.playbackLeadMs / 1_000 : 0.02;
-    const startAt = Math.max(context.currentTime + startLead, this.playbackCursor || 0);
+    // Local TTS can briefly generate slower than realtime. The first frame of
+    // each response leads by an adaptive buffer; mid-response frames rebuild a
+    // small cushion after a delivery gap so sustained slow generation turns
+    // repeated micro-stutters into one slightly longer pause.
+    const now = context.currentTime;
+    let startAt;
+    if (this.playbackSources.size === 0) {
+      startAt = Math.max(now + this.playbackLeadMs / 1_000, this.playbackCursor || 0);
+    } else {
+      const drained = this.playbackCursor > 0 && now - this.playbackCursor > 0.005;
+      if (drained) {
+        this.playbackUnderruns += 1;
+        this.playbackConsecutiveLate += 1;
+      } else if (this.playbackCursor > now + 0.05) {
+        this.playbackConsecutiveLate = 0;
+      }
+      const cushion = Math.min(0.22, this.playbackConsecutiveLate * 0.05);
+      startAt = Math.max(now + 0.02 + cushion, this.playbackCursor);
+    }
     const contentIndex = frame.contentIndex;
     const itemKey = frame.itemId ? `${frame.itemId}:${contentIndex}` : "";
     if (itemKey && !this.playbackItems.has(itemKey)) {
@@ -1476,7 +1494,20 @@ export class HermesLiveAudio {
   finishPlaybackRecord(record) {
     if (!this.playbackSources.delete(record)) return;
     if (!record.stopped && record.itemKey) this.addPlayedAudio(record.itemKey, record.duration * 1_000);
-    if (this.playbackSources.size === 0) this.playbackCursor = 0;
+    if (this.playbackSources.size === 0) {
+      if (!record.stopped) {
+        // Adaptive lead: an utterance that drained the queue grows the next
+        // response's buffer; a clean one shrinks it back toward the base.
+        if (this.playbackUnderruns > 0) {
+          this.playbackLeadMs = Math.min(900, this.playbackLeadMs + 150);
+        } else if (this.playbackLeadMs > this.basePlaybackLeadMs) {
+          this.playbackLeadMs = Math.max(this.basePlaybackLeadMs, this.playbackLeadMs - 60);
+        }
+      }
+      this.playbackUnderruns = 0;
+      this.playbackConsecutiveLate = 0;
+      this.playbackCursor = 0;
+    }
     this.emitter.emit("playback", {
       active: this.playbackSources.size > 0,
       queued: this.playbackSources.size,

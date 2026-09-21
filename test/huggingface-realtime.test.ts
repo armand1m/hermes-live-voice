@@ -329,7 +329,7 @@ describe("Hugging Face speech-to-speech adapter", () => {
     await waitUntil(() => harness.messages.some((message) => message.type === "response.create"));
     harness.send({ type: "response.created", response: { id: "resp_empty", status: "in_progress" } });
     harness.send({ type: "response.done", response: { id: "resp_empty", status: "completed" } });
-    await waitUntil(() => events.some((event) => event.type === "response" && event.status === "failed"));
+    await waitUntil(() => events.some((event) => (event as any).type === "response" && (event as any).status === "failed"), 2_000, JSON.stringify(events.map((e) => (e as any).type)));
 
     expect(events).toContainEqual({
       type: "response",
@@ -572,6 +572,43 @@ describe("Hugging Face speech-to-speech adapter", () => {
 
     harness.send({ type: "response.created", response: { id: "resp_chat", status: "in_progress" } });
     harness.send({ type: "response.done", response: { id: "resp_chat", status: "completed" } });
+    await session.close();
+  });
+
+  it("survives post-ready provider errors that accompany failed responses", async () => {
+    const harness = await createHarness();
+    const events: LiveModelEvent[] = [];
+    const adapter = new HuggingFaceRealtimeAdapter(
+      { ...localConfig(), url: harness.url, ownsTurnRouting: true },
+      1_000,
+      1_000,
+    );
+    const session = await adapter.connect({
+      sessionId: "local_recoverable_error",
+      systemInstruction: "You are Hermes.",
+      availableTools: ["continue_hermes_conversation"],
+      callbacks: {
+        onEvent: (event) => events.push(event),
+        onError: (error) => events.push({ type: "text", speaker: "system", text: `ON_ERROR:${String(error)}` } as LiveModelEvent),
+      },
+    });
+
+    // A failed LLM generation arrives as a top-level error; per the OpenAI
+    // realtime contract it accompanies a failed response while the session
+    // keeps listening, so it must not kill the connection.
+    harness.send({
+      type: "error",
+      error: { type: "invalid_request_error", message: "LLM generation failed" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(events.some((event) => event.type === "text" && event.text.startsWith("ON_ERROR:"))).toBe(false);
+    const providerErrors = (session as unknown as { providerErrors: { count: number; last?: string } }).providerErrors;
+    expect(providerErrors).toMatchObject({ count: 1, last: expect.stringContaining("LLM generation failed") });
+
+    // The connection is still usable: a new turn routes normally.
+    await session.sendText("Still there?");
+    await waitUntil(() => events.some((event) => event.type === "tool_call"));
+    expect(harness.closeEvents).toEqual([]);
     await session.close();
   });
 
