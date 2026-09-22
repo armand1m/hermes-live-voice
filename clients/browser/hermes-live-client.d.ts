@@ -141,6 +141,7 @@ export type HermesLiveKnownServerMessage =
   | { type: "input.speech_started"; provider: "openai" | "local" | "gateway"; itemId?: string; audioStartMs?: number; probability?: number }
   | { type: "input.speech_stopped"; provider: "openai" | "local" | "gateway"; itemId?: string; audioEndMs?: number }
   | { type: "input.pause_requested"; reason: "voice_command" }
+  | { type: "client.audio_settings"; source: "voice_command"; microphone?: "active" | "paused"; effects?: boolean; effectsVolume?: number }
   | { type: "response.started"; responseId?: string }
   | { type: "response.completed"; responseId?: string }
   | { type: "response.cancelled"; responseId?: string }
@@ -226,6 +227,7 @@ export interface HermesLiveClientEventMap {
   "input.speech_started": Extract<HermesLiveKnownServerMessage, { type: "input.speech_started" }>;
   "input.speech_stopped": Extract<HermesLiveKnownServerMessage, { type: "input.speech_stopped" }>;
   "input.pause_requested": Extract<HermesLiveKnownServerMessage, { type: "input.pause_requested" }>;
+  "client.audio_settings": Extract<HermesLiveKnownServerMessage, { type: "client.audio_settings" }>;
   "response.started": Extract<HermesLiveKnownServerMessage, { type: "response.started" }>;
   "response.completed": Extract<HermesLiveKnownServerMessage, { type: "response.completed" }>;
   "response.cancelled": Extract<HermesLiveKnownServerMessage, { type: "response.cancelled" }>;

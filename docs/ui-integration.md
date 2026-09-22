@@ -120,6 +120,7 @@ The host endpoint must return either a same-origin authenticated WebSocket relay
 | `transcript.delta`, `audio.output` | Render speaker-attributed conversation and queue negotiated audio. |
 | `input.speech_started`, response lifecycle | Stop local playback and represent provider speech independently from Hermes work. |
 | `input.pause_requested` | Stop microphone capture without ending the turn; keep playback, connection, and tasks alive, then show a resume control. |
+| `client.audio_settings` (v9) | Advisory agent request from an explicit user voice command: resume/pause the microphone and apply interface sound settings. The client stays authoritative; hosts without sound cues may ignore the effects fields. |
 | `session.error`, SDK `error`, and `close` | Show bounded actionable connection state without leaking credentials or provider errors. |
 
 Use the SDK task controls:

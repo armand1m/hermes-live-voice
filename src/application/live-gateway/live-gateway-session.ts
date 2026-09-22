@@ -355,6 +355,7 @@ export class LiveGatewaySession {
             {
               bound: this.conversation.mode !== "unbound",
               voiceInputPause: this.protocolVersion >= 6,
+              clientAudioControl: this.protocolVersion >= 9,
             },
             this.deps.config.realtime.provider === "local",
             {
@@ -1135,6 +1136,7 @@ export class LiveGatewaySession {
       tools.push("search_past_chats");
     }
     if (this.protocolVersion >= 6) tools.push("pause_voice_input");
+    if (this.protocolVersion >= 9) tools.push("set_client_audio");
     return tools;
   }
 
@@ -1367,6 +1369,61 @@ export class LiveGatewaySession {
           ok: true,
           listening: false,
           message: "Microphone listening paused. The user can resume from the client microphone control.",
+        });
+      }
+      case "set_client_audio": {
+        if (this.protocolVersion < 9) {
+          return Promise.resolve({
+            ok: false,
+            error: "Voice-controlled client audio settings require Hermes Live protocol v9.",
+          });
+        }
+        const microphone = call.args.microphone;
+        if (microphone !== undefined && microphone !== "active" && microphone !== "paused") {
+          throw new Error("set_client_audio microphone must be active or paused.");
+        }
+        const effects = call.args.effects;
+        if (effects !== undefined && typeof effects !== "boolean") {
+          throw new Error("set_client_audio effects must be a boolean.");
+        }
+        const effectsVolumeRaw = call.args.effects_volume;
+        if (
+          effectsVolumeRaw !== undefined
+          && (typeof effectsVolumeRaw !== "number" || !Number.isFinite(effectsVolumeRaw)
+            || effectsVolumeRaw < 0 || effectsVolumeRaw > 1)
+        ) {
+          throw new Error("set_client_audio effects_volume must be a number between 0 and 1.");
+        }
+        if (microphone === undefined && effects === undefined && effectsVolumeRaw === undefined) {
+          return Promise.resolve({
+            ok: false,
+            error: "set_client_audio requires at least one of microphone, effects, or effects_volume.",
+          });
+        }
+        const effectsVolume = effectsVolumeRaw === undefined
+          ? undefined
+          : Math.round(effectsVolumeRaw * 100) / 100;
+        this.send({
+          type: "client.audio_settings",
+          source: "voice_command",
+          ...(microphone !== undefined ? { microphone } : {}),
+          ...(effects !== undefined ? { effects } : {}),
+          ...(effectsVolume !== undefined ? { effectsVolume } : {}),
+        });
+        // Fire-and-forget like pause_voice_input: the client stays in charge
+        // of its own hardware, so the receipt describes the request, not a
+        // confirmed client state.
+        const applied = [
+          microphone === "active"
+            ? "the microphone is listening again"
+            : microphone === "paused" ? "the microphone is paused" : null,
+          effects === true ? "the interface sounds are on" : effects === false ? "the interface sounds are off" : null,
+          effectsVolume !== undefined ? `the interface sound volume is ${Math.round(effectsVolume * 100)}%` : null,
+        ].filter(Boolean).join(", ");
+        return Promise.resolve({
+          spoken_response: `Done — ${applied}.`,
+          ok: true,
+          message: `Client audio settings requested: ${applied}. The client applies them and stays authoritative.`,
         });
       }
       default:

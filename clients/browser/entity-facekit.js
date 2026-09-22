@@ -269,7 +269,7 @@ export class FaceKitHead {
 
     // --- blendshape weights --------------------------------------------------
     const w = this.morphWeights;
-    w.jawOpen = clamp(mouth.jaw * 0.78 + mouth.energy * 0.06);
+    w.jawOpen = clamp(mouth.jaw * 0.64 + mouth.energy * 0.05);
     w.mouthFunnel = clamp(mouth.round * 0.42 + mouth.teeth * 0.26);
     w.mouthPucker = clamp(mouth.narrow * 0.38 + mouth.round * 0.42 + mouth.press * 0.16);
     w.mouthSmile_L = w.mouthSmile_R = clamp(e.smile * 0.5 + mouth.wide * 0.14);

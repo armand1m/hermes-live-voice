@@ -149,6 +149,46 @@ describe("live gateway WebSocket", () => {
     await legacy.messages.expectNone("input.pause_requested", 40);
   });
 
+  it("lets protocol v9 users change client audio settings by voice", async () => {
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider });
+    const current = await readyClient(server.url, { protocolVersion: 9 });
+
+    expect(provider.latest.params.systemInstruction).toContain("call set_client_audio");
+    expect(provider.latest.params.availableTools).toContain("set_client_audio");
+    provider.emit({
+      type: "tool_call",
+      call: { id: "audio_settings_v9", name: "set_client_audio", args: { microphone: "active", effects: false } },
+    });
+
+    await expect(current.messages.wait("client.audio_settings")).resolves.toEqual({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "active",
+      effects: false,
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "audio_settings_v9"))
+      .resolves.toMatchObject({
+        response: {
+          ok: true,
+          spoken_response: expect.stringContaining("Done"),
+        },
+      });
+
+    const legacy = await readyClient(server.url, { protocolVersion: 8 });
+    expect(provider.latest.params.systemInstruction).not.toContain("call set_client_audio");
+    expect(provider.latest.params.availableTools).not.toContain("set_client_audio");
+    provider.emit({
+      type: "tool_call",
+      call: { id: "audio_settings_v8", name: "set_client_audio", args: { effects: true } },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "audio_settings_v8"))
+      .resolves.toMatchObject({
+        response: { ok: false, error: expect.stringContaining("protocol v9") },
+      });
+    await legacy.messages.expectNone("client.audio_settings", 40);
+  });
+
   it("resumes the writable Hermes conversation tip and keeps canonical chat in that session", async () => {
     const hermes = new HermesHarness();
     hermes.sessions.set("session_original", {
@@ -2618,7 +2658,7 @@ async function readyClient(
   options: {
     profileId?: string;
     userLabel?: string;
-    protocolVersion?: 3 | 4 | 5 | 6 | 7 | 8;
+    protocolVersion?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
     expectedSnapshotReason?: "initial" | "reconnect";
   } = {},
 ): Promise<{
@@ -2664,6 +2704,7 @@ function testConfig(overrides: {
   vad?: Partial<AppConfig["vad"]>;
   filler?: Partial<AppConfig["filler"]>;
   tts?: Partial<AppConfig["tts"]>;
+  narrator?: Partial<AppConfig["narrator"]>;
   context?: Partial<AppConfig["context"]>;
 } = {}): AppConfig {
   const stateFile = createTaskStateFile();
@@ -2736,6 +2777,11 @@ function testConfig(overrides: {
       requestTimeoutMs: 15_000,
       maxChars: 1_000,
       ...overrides.tts,
+    },
+    narrator: {
+      model: "qwen3.8-27b",
+      requestTimeoutMs: 30_000,
+      ...overrides.narrator,
     },
     context: {
       hermesHome: "/nonexistent-hermes-home",

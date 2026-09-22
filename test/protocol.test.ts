@@ -14,9 +14,9 @@ import {
 
 const NOW = 1_784_131_200_000;
 
-describe("protocol v8", () => {
+describe("protocol v9", () => {
   it("binds current sessions to a new, resumed, or unbound Hermes conversation", () => {
-    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(8);
+    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(9);
     expect(
       parseClientMessage({
         type: "session.start",
@@ -317,6 +317,33 @@ describe("protocol v8", () => {
     });
   });
 
+  it("parses agent-requested client audio settings and rejects empty or out-of-range requests", () => {
+    expect(parseServerMessage({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "active",
+      effectsVolume: 0.4,
+    })).toEqual({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "active",
+      effectsVolume: 0.4,
+    });
+    expect(() => parseServerMessage({ type: "client.audio_settings", source: "voice_command" })).toThrow(
+      /at least one audio setting/i,
+    );
+    expect(() => parseServerMessage({
+      type: "client.audio_settings",
+      source: "voice_command",
+      effectsVolume: 1.4,
+    })).toThrow();
+    expect(() => parseServerMessage({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "loud",
+    })).toThrow();
+  });
+
   it("exposes only gateway tools to OpenAI Realtime", () => {
     expect(OPENAI_HERMES_LIVE_TOOLS.map((tool) => tool.name)).toEqual([
       "continue_hermes_conversation",
@@ -328,6 +355,7 @@ describe("protocol v8", () => {
       "follow_up_background_task",
       "stop_background_task",
       "pause_voice_input",
+      "set_client_audio",
     ]);
     expect(OPENAI_HERMES_LIVE_TOOLS.every((tool) => tool.type === "function")).toBe(true);
     expect(OPENAI_HERMES_LIVE_TOOLS[0]).toHaveProperty("parameters");
@@ -345,6 +373,7 @@ describe("protocol v8", () => {
       "follow_up_background_task",
       "stop_background_task",
       "pause_voice_input",
+      "set_client_audio",
     ]);
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).toHaveProperty("parametersJsonSchema");
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).not.toHaveProperty("parameters");

@@ -21,6 +21,9 @@ import type { LiveModelAdapter } from "../../../application/live-gateway/ports/r
 import { HermesClient } from "../../outbound/hermes/hermes-runs.client.js";
 import { createLiveModelAdapter } from "../../outbound/realtime/factory.js";
 import { sidecarTtsClientFromConfig } from "../../outbound/tts/local-tts.client.js";
+import { narratorClientFromConfig } from "../../outbound/narrator/narrator-llm.client.js";
+import { createTaskNarrationService, type TaskNarrationService } from "../../../application/live-gateway/task-narration.service.js";
+import { projectTaskSnapshot } from "../../../application/live-gateway/task-public-projection.js";
 import { FileTaskStore } from "../../outbound/task-store/file-task-store.js";
 import type { Logger } from "../../../logger.js";
 import { buildReadinessReport } from "../../../readiness.js";
@@ -48,6 +51,7 @@ export interface StartServerOptions {
   liveModel?: LiveModelAdapter;
   taskSupervisor?: TaskSupervisorRuntime;
   speechDetection?: SpeechDetectionService;
+  narration?: TaskNarrationService;
   signal?: AbortSignal;
 }
 
@@ -64,6 +68,7 @@ export async function startServer({
   liveModel: providedLiveModel,
   taskSupervisor: providedTaskSupervisor,
   speechDetection: providedSpeechDetection,
+  narration: providedNarration,
   signal,
 }: StartServerOptions): Promise<{
   close(): Promise<void>;
@@ -80,6 +85,10 @@ export async function startServer({
   const liveModel = providedLiveModel ?? createLiveModelAdapter(config);
   const speechSink = sidecarTtsClientFromConfig(config);
   const speechDetection = providedSpeechDetection ?? createSpeechDetectionService(config, logger);
+  const narrationClient = narratorClientFromConfig(config);
+  const narration = providedNarration ?? (narrationClient
+    ? createTaskNarrationService({ client: narrationClient })
+    : undefined);
   const taskSupervisor = providedTaskSupervisor ?? new TaskSupervisor({
     store: new FileTaskStore({
       directory: dirname(config.tasks.stateFile),
@@ -125,9 +134,12 @@ export async function startServer({
   };
   if (signal?.aborted) closeTaskStateForAbort();
   else signal?.addEventListener("abort", closeTaskStateForAbort, { once: true });
+  // The owner id the HTTP narration route uses to resolve task records;
+  // sessions register the same key, so they share one task inbox.
+  let defaultOwnerId = "";
   try {
     if (signal?.aborted) throw startupAbortError(signal);
-    taskSupervisor.registerOwner(defaultSessionKey, defaultSessionKey);
+    defaultOwnerId = taskSupervisor.registerOwner(defaultSessionKey, defaultSessionKey);
     await taskSupervisor.initialize();
     if (signal?.aborted) throw startupAbortError(signal);
   } catch (error) {
@@ -149,6 +161,9 @@ export async function startServer({
         config,
         hermes,
         taskSupervisor,
+        taskOwnerId: defaultOwnerId,
+        narration,
+        logger,
         sessions,
         metrics,
         requireHermesApiKey: !providedHermes,
@@ -395,6 +410,11 @@ async function handleHttp(
     config: AppConfig;
     hermes: HermesRunsPort;
     taskSupervisor: TaskSupervisorRuntime;
+    /** Owner whose task inbox the narration route resolves records from. */
+    taskOwnerId: string;
+    /** Present only when a narrator LLM is configured. */
+    narration?: TaskNarrationService;
+    logger: Logger;
     sessions: Set<LiveGatewaySession>;
     metrics: GatewayMetricsCollector;
     requireHermesApiKey: boolean;
@@ -425,6 +445,10 @@ async function handleHttp(
     "/entity-scene.js": ["entity-scene.js", "text/javascript; charset=utf-8"],
     "/entity-debug.js": ["entity-debug.js", "text/javascript; charset=utf-8"],
     "/diagnostics.js": ["diagnostics.js", "text/javascript; charset=utf-8"],
+    "/sfx.js": ["sfx.js", "text/javascript; charset=utf-8"],
+    "/markdown.js": ["markdown.js", "text/javascript; charset=utf-8"],
+    "/task-narrator.js": ["task-narrator.js", "text/javascript; charset=utf-8"],
+    "/brain-status.json": ["brain-status.json", "application/json; charset=utf-8"],
   };
   const asset = browserFiles[url.pathname];
   if (asset) {
@@ -541,6 +565,48 @@ async function handleHttp(
     });
     return;
   }
+  if (url.pathname === "/v1/task-narration") {
+    if (req.method !== "POST") {
+      methodNotAllowed(req, res, "POST");
+      return;
+    }
+    if (!options.narration) {
+      json(req, res, 503, { status: "narration_disabled" });
+      return;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonObjectBody(req);
+    } catch (error) {
+      json(req, res, 400, { status: "invalid_request", error: errorToMessage(error) });
+      return;
+    }
+    const taskId = typeof body.taskId === "string" ? body.taskId.trim() : "";
+    if (!TASK_ID_PATTERN.test(taskId)) {
+      json(req, res, 400, { status: "invalid_request", error: "taskId must be a task id." });
+      return;
+    }
+    // The record is resolved from the gateway's own task inbox — the client
+    // never supplies the content being summarized.
+    const record = await options.taskSupervisor.get(options.taskOwnerId, taskId);
+    if (!record) {
+      json(req, res, 404, { status: "not_found" });
+      return;
+    }
+    try {
+      const result = await options.narration.narrate(projectTaskSnapshot(record, { includeOutput: true }));
+      json(req, res, 200, result);
+    } catch (error) {
+      // A failure can mean the LLM is down (or was crashed by this very
+      // request); the service quarantines the revision — say so in the log.
+      options.logger.error("task narration failed", {
+        taskId,
+        error: errorToMessage(error),
+      });
+      json(req, res, 502, { status: "narration_failed", error: errorToMessage(error) });
+    }
+    return;
+  }
   if (url.pathname === "/v1/capabilities") {
     if (!isGetOrHead(req)) {
       methodNotAllowed(req, res, "GET, HEAD");
@@ -575,6 +641,9 @@ async function handleHttp(
         server_managed_identity: !options.config.server.trustClientIdentity,
         max_sessions: options.config.server.maxSessions,
         gateway_speech_vad: options.config.vad.engine !== "disabled",
+        // Protocol v9: the agent can request client-side audio setting
+        // changes (microphone pause/resume, interface sounds) by voice.
+        client_audio_control: true,
         context_digest: options.config.context.digestEnabled,
         persistent_voice_thread: true,
         huggingface_local: options.config.realtime.provider === "local",
@@ -670,7 +739,7 @@ function isAuthorized(req: IncomingMessage, config: AppConfig, url: URL, options
 }
 
 function requiresHttpAuth(pathname: string): boolean {
-  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations" || pathname === "/v1/metrics";
+  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations" || pathname === "/v1/metrics" || pathname === "/v1/task-narration";
 }
 
 function isWebSocketOriginAllowed(req: IncomingMessage, config: AppConfig): boolean {
@@ -847,6 +916,31 @@ function json(
   } else {
     res.end(payload);
   }
+}
+
+/** Narration requests carry one task id; anything larger is malformed. */
+const MAX_JSON_BODY_BYTES = 4_096;
+/** Public task ids are exactly `task_` plus 32 lowercase hex characters. */
+const TASK_ID_PATTERN = /^task_[0-9a-f]{32}$/;
+
+async function readJsonObjectBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_JSON_BODY_BYTES) throw new Error("Request body is too large.");
+    chunks.push(chunk as Buffer);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new Error("Request body must be valid JSON.");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Request body must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function bearerToken(authorization: string | undefined): string | undefined {

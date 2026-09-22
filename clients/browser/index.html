@@ -43,6 +43,7 @@
 </section>
 
 <div id="log-toggle" class="log-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="log-drawer"><span>Conversation log</span><i aria-hidden="true"></i></div>
+<div id="task-toggle" class="log-toggle task-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="task-drawer"><span>Task log</span><i aria-hidden="true"></i></div>
 <div id="log-drawer" class="log-drawer" role="region" aria-label="Conversation history" hidden>
   <div class="drawer-head">
     <div><span class="rail-label">Session archive</span><h2>Conversation</h2></div>
@@ -50,6 +51,14 @@
   </div>
   <p id="log-empty">No exchanges recorded in this session.</p>
   <div id="log-transcript" aria-live="off"></div>
+</div>
+<div id="task-drawer" class="log-drawer task-drawer" role="region" aria-label="Task history" hidden>
+  <div class="drawer-head">
+    <div><span class="rail-label">Background work</span><h2>Task log</h2></div>
+    <span id="task-count" aria-label="Tasks recorded">00</span>
+  </div>
+  <p id="task-empty">No background tasks in this session.</p>
+  <div id="task-list" aria-live="off"></div>
 </div>
 
 <button id="mute" disabled aria-pressed="false">Mute</button>

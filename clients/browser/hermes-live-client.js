@@ -72,7 +72,7 @@ const TASK_STOP_RESPONSE_TYPES = new Set([
   "task.unknown",
 ]);
 const OPEN = 1;
-export const HERMES_LIVE_PROTOCOL_VERSION = 8;
+export const HERMES_LIVE_PROTOCOL_VERSION = 9;
 
 const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "session.ready",
@@ -82,6 +82,7 @@ const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "input.speech_started",
   "input.speech_stopped",
   "input.pause_requested",
+  "client.audio_settings",
   "response.started",
   "response.completed",
   "response.cancelled",
@@ -1814,6 +1815,19 @@ export function validateServerMessage(value) {
       requireOnlyKeys(message, ["type", "reason"]);
       requireEnum(message, "reason", ["voice_command"]);
       break;
+    case "client.audio_settings": {
+      requireOnlyKeys(message, ["type", "source", "microphone", "effects", "effectsVolume"]);
+      requireEnum(message, "source", ["voice_command"]);
+      if (message.microphone !== undefined) requireEnum(message, "microphone", ["active", "paused"]);
+      optionalBoolean(message, "effects");
+      optionalFiniteNumber(message, "effectsVolume", { minimum: 0, maximum: 1 });
+      if (
+        message.microphone === undefined && message.effects === undefined && message.effectsVolume === undefined
+      ) {
+        throw new TypeError("Hermes Live client.audio_settings requires at least one setting.");
+      }
+      break;
+    }
     case "response.started":
     case "response.completed":
     case "response.cancelled":

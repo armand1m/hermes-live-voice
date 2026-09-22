@@ -15,6 +15,8 @@ import {
   startServer,
   type TaskSupervisorRuntime,
 } from "../src/adapters/inbound/http/server.js";
+import { createTaskNarrationService } from "../src/application/live-gateway/task-narration.service.js";
+import type { NarratorLlmClient } from "../src/adapters/outbound/narrator/narrator-llm.client.js";
 
 const openServers: Array<{ close(): Promise<void> }> = [];
 const taskStateDirectory = realpathSync(tmpdir());
@@ -217,8 +219,8 @@ describe("HTTP server", () => {
     });
     await expect(fetch(`${server.url}/v1/capabilities`).then((res) => res.json())).resolves.toMatchObject({
       object: "hermes_live.capabilities",
-      protocolVersion: 8,
-      supportedProtocolVersions: [3, 4, 5, 6, 7, 8],
+      protocolVersion: 9,
+      supportedProtocolVersions: [3, 4, 5, 6, 7, 8, 9],
       realtime: {
         provider: "openai",
         model: "gpt-realtime-2",
@@ -835,6 +837,97 @@ describe("HTTP server", () => {
     });
   });
 
+  it("narrates a task through the configured LLM once per revision", async () => {
+    const record = seededCompletedTaskRecord();
+    const summarize = vi.fn(async () => "**Done** — checks passed");
+    const narration = createTaskNarrationService({
+      client: { summarize, model: "qwen3.8-27b" } as unknown as NarratorLlmClient,
+    });
+    const taskSupervisor = {
+      registerOwner: vi.fn(() => "owner_test"),
+      initialize: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      health: vi.fn(async () => undefined),
+      get: vi.fn(async (_owner: string, taskId: string) => (taskId === record.taskId ? record : undefined)),
+    } as unknown as TaskSupervisorRuntime;
+    const server = await startServer({
+      config: testConfig({ server: { authToken: "secret-token" } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      taskSupervisor,
+      narration,
+      logger: fakeLogger(),
+    });
+    openServers.push(server);
+
+    const url = `${server.url}/v1/task-narration`;
+    const auth = { authorization: "Bearer secret-token", "content-type": "application/json" };
+    // Auth is enforced, the method is POST-only, and the body must be JSON.
+    expect((await fetch(url, { method: "POST", body: JSON.stringify({ taskId: record.taskId }) })).status).toBe(401);
+    expect((await fetch(url, { method: "GET", headers: auth })).status).toBe(405);
+    expect((await fetch(url, { method: "POST", headers: auth, body: "{nope" })).status).toBe(400);
+    expect((await fetch(url, { method: "POST", headers: auth, body: JSON.stringify({}) })).status).toBe(400);
+    expect((await fetch(url, { method: "POST", headers: auth, body: JSON.stringify({ taskId: "not a task id" }) })).status).toBe(400);
+    expect((await fetch(url, { method: "POST", headers: auth, body: JSON.stringify({ taskId: "task_00000000000000000000000000000000" }) })).status).toBe(404);
+
+    const post = () => fetch(url, { method: "POST", headers: auth, body: JSON.stringify({ taskId: record.taskId }) });
+    const first = await post();
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      taskId: record.taskId,
+      markdown: "**Done** — checks passed",
+      model: "qwen3.8-27b",
+      cached: false,
+    });
+    // The second request is served from the revision cache.
+    await expect((await post()).json()).resolves.toMatchObject({ cached: true });
+    expect(summarize).toHaveBeenCalledTimes(1);
+    // Records are resolved from the gateway's own inbox, never client input.
+    expect(taskSupervisor.get).toHaveBeenCalledWith(expect.any(String), record.taskId);
+  });
+
+  it("answers 503 when no narrator LLM is configured and 502 when it fails", async () => {
+    const record = seededCompletedTaskRecord();
+    const taskSupervisor = () => ({
+      registerOwner: vi.fn(() => "owner_test"),
+      initialize: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      health: vi.fn(async () => undefined),
+      get: vi.fn(async () => record),
+    }) as unknown as TaskSupervisorRuntime;
+
+    const bare = await startServer({
+      config: testConfig({ server: { authToken: "secret-token" } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      taskSupervisor: taskSupervisor(),
+      logger: fakeLogger(),
+    });
+    openServers.push(bare);
+    const auth = { authorization: "Bearer secret-token", "content-type": "application/json" };
+    expect((await fetch(`${bare.url}/v1/task-narration`, {
+      method: "POST", headers: auth, body: JSON.stringify({ taskId: record.taskId }),
+    })).status).toBe(503);
+
+    const failing = createTaskNarrationService({
+      client: { summarize: vi.fn(async () => { throw new Error("LLM down"); }), model: "m" } as unknown as NarratorLlmClient,
+    });
+    const wedged = await startServer({
+      config: testConfig({ server: { authToken: "secret-token" } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      taskSupervisor: taskSupervisor(),
+      narration: failing,
+      logger: fakeLogger(),
+    });
+    openServers.push(wedged);
+    const response = await fetch(`${wedged.url}/v1/task-narration`, {
+      method: "POST", headers: auth, body: JSON.stringify({ taskId: record.taskId }),
+    });
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toMatchObject({ status: "narration_failed" });
+  });
+
   it("rejects malformed WebSocket upgrades without taking down the HTTP server", async () => {
     const server = await startServer({
       config: testConfig(),
@@ -1011,6 +1104,7 @@ function testConfig(
     local?: Partial<AppConfig["local"]>;
     gemini?: Partial<AppConfig["gemini"]>;
     openai?: Partial<AppConfig["openai"]>;
+    narrator?: Partial<AppConfig["narrator"]>;
   } = {},
 ): AppConfig {
   return {
@@ -1067,6 +1161,7 @@ function testConfig(
     vad: testVadConfig(),
     filler: { enabled: false, delayMs: 2_500, intervalMs: 15_000, maxPerTool: 3 },
     tts: { requestTimeoutMs: 15_000, maxChars: 1_000 },
+    narrator: { model: "qwen3.8-27b", requestTimeoutMs: 30_000, ...overrides.narrator },
     context: testContextConfig(),
   };
 }
@@ -1075,6 +1170,14 @@ function createTaskStateFile(prefix: string): string {
   const directory = mkdtempSync(join(taskStateDirectory, prefix));
   taskStateDirectories.push(directory);
   return join(directory, "tasks-v1.json");
+}
+
+/** A completed task record with retained output, ready for narration. */
+function seededCompletedTaskRecord(): ReturnType<typeof createTaskRecord> {
+  const now = 1_780_000_000_000;
+  const queued = createTaskRecord({ ownerIdentity: "agent:main:hermes-live:default:voice", input: "Inspect the repository", now });
+  const running = transitionTask(transitionTask(queued, "dispatching", { now: now + 1 }), "running", { now: now + 2, runId: "run_test" });
+  return transitionTask(running, "completed", { now: now + 3, output: "3 checks passed", summary: "Repository checks passed." });
 }
 
 function testContextConfig(): AppConfig["context"] {

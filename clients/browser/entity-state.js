@@ -467,6 +467,11 @@ export class AgentStateController {
 
     // Dev playground overrides (mode pinning + parameter clamps).
     this.debug = { active: false, mode: null, params: {} };
+
+    // Optional semantic-cue observer (e.g. voice.js routes these to the
+    // interface-sound module). The controller stays audio-unaware: it only
+    // names what happened, never how it sounds.
+    this.onCue = null;
   }
 
   /** Legacy canvas data-state derivation, matching the previous contract. */
@@ -643,6 +648,7 @@ export class AgentStateController {
   pulseExpression(name, duration) {
     const pose = EXPRESSIONS[name];
     if (!pose) return;
+    if (typeof this.onCue === "function") this.onCue(`expression:${name}`);
     this.pulse = pose;
     this.pulseDuration = duration;
     this.pulseRemaining = duration;

@@ -123,6 +123,11 @@ const EnvSchema = z.object({
   }).optional(),
   HERMES_LIVE_TTS_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
   HERMES_LIVE_TTS_MAX_CHARS: z.coerce.number().int().min(100).max(4_000).default(1_000),
+  HERMES_LIVE_NARRATOR_URL: z.string().url().refine(isSafeHttpLocalUrl, {
+    message: "HERMES_LIVE_NARRATOR_URL must be a credential-free local HTTP(S) URL (OpenAI-compatible LLM for task narration).",
+  }).optional(),
+  HERMES_LIVE_NARRATOR_MODEL: z.string().trim().min(1).max(128).default("qwen3.8-27b"),
+  HERMES_LIVE_NARRATOR_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
   HERMES_LIVE_LOCAL_VOICE: z.string().trim().min(1).max(128).default("Aiden"),
   HERMES_LIVE_LOCAL_ALLOW_REMOTE: z.string().optional(),
   HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING: z.string().optional(),
@@ -258,6 +263,12 @@ export interface AppConfig {
     requestTimeoutMs: number;
     maxChars: number;
   };
+  narrator: {
+    /** OpenAI-compatible LLM base URL for task-log narration; unset disables the endpoint. */
+    baseUrl?: string;
+    model: string;
+    requestTimeoutMs: number;
+  };
   gemini: {
     apiKey?: string;
     model: string;
@@ -343,6 +354,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ...(parsed.HERMES_LIVE_TTS_URL ? { baseUrl: parsed.HERMES_LIVE_TTS_URL } : {}),
       requestTimeoutMs: parsed.HERMES_LIVE_TTS_TIMEOUT_MS,
       maxChars: parsed.HERMES_LIVE_TTS_MAX_CHARS,
+    },
+    narrator: {
+      ...(parsed.HERMES_LIVE_NARRATOR_URL ? { baseUrl: parsed.HERMES_LIVE_NARRATOR_URL } : {}),
+      model: parsed.HERMES_LIVE_NARRATOR_MODEL,
+      requestTimeoutMs: parsed.HERMES_LIVE_NARRATOR_TIMEOUT_MS,
     },
     gemini: {
       ...(geminiApiKey ? { apiKey: geminiApiKey } : {}),

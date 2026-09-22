@@ -158,6 +158,32 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
       properties: {},
     },
   },
+  {
+    name: "set_client_audio",
+    description:
+      "Change the user's browser audio settings when they explicitly ask: resume or pause the microphone after a pause ('unmute me', 'listen again'), or turn the interface sound effects on/off and set their volume (0 to 1). Only change what the user asked for; the client applies the request and stays in charge of its own hardware.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        microphone: {
+          type: "string",
+          enum: ["active", "paused"],
+          description: "Resume ('active') or pause ('paused') microphone listening on the client.",
+        },
+        effects: {
+          type: "boolean",
+          description: "Enable or disable the interface sound effects.",
+        },
+        effects_volume: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description: "Interface sound effects volume from 0 (silent) to 1 (loudest).",
+        },
+      },
+    },
+  },
 ] as const satisfies ReadonlyArray<{
   name: LiveToolName;
   description: string;
@@ -187,6 +213,7 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   follow_up_background_task: "Start new durable work from one finished task.",
   stop_background_task: "Request cancellation of one exact task.",
   pause_voice_input: "Pause microphone input without stopping tasks or disconnecting.",
+  set_client_audio: "Resume or pause the mic, or change interface sound effects, on explicit request.",
 };
 
 export function selectHermesLiveToolDeclarations(names?: readonly LiveToolName[]) {

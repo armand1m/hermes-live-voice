@@ -16,6 +16,7 @@ export interface LocalRoutedAction {
     | "follow_up_background_task"
     | "stop_background_task"
     | "pause_voice_input"
+    | "set_client_audio"
   >;
   args: Record<string, unknown>;
   taskQuestion?: string;
@@ -86,6 +87,10 @@ export function localRoutedAction(text: string): LocalRoutedAction | undefined {
       taskControl: { type: "follow_up", message: value },
     };
   }
+  // Browser audio settings run before the pause block so "unmute the sound
+  // effects" or "desilencia" is never misread as a listening pause.
+  const clientAudio = clientAudioActionFromUtterance(value);
+  if (clientAudio) return clientAudio;
   if ([
     /^(?:please\s+)?(?:pause|mute|stop)\s+(?:the\s+)?(?:microphone|mic|listening)\b/iu,
     /^(?:por\s+favor[,\s]+)?(?:pausa|silencia)\s+(?:el\s+)?(?:micr[oó]fono|micro|la\s+escucha)\b/iu,
@@ -145,6 +150,61 @@ export function localRoutedAction(text: string): LocalRoutedAction | undefined {
     /^(?:si\s+us\s+plau[,\s]+)?(?:qu[eè]\s+est[aà]s\s+fent|qu[eè]\s+hi\s+ha\s+en\s+marxa|llista\s+(?:les\s+meves\s+)?tasques|estat\s+de\s+(?:les\s+meves\s+)?tasques)\b/iu,
   ].some((pattern) => pattern.test(value))) {
     return { name: "list_background_tasks", args: { include_completed: true, summary_only: true } };
+  }
+  return undefined;
+}
+
+/**
+ * Explicit browser audio-setting requests (interface sounds, microphone
+ * resume). Conservative by design: only unmistakable utterances route here,
+ * because these act on the user's own hardware. Effect toggles are matched
+ * before the bare microphone resume so "unmute the sound effects" is not
+ * read as "unmute the microphone".
+ */
+function clientAudioActionFromUtterance(value: string): LocalRoutedAction | undefined {
+  if ([
+    /^(?:please\s+)?(?:turn\s+off|disable|deactivate|mute|stop)\s+(?:the\s+)?(?:sound\s+effects?|interface\s+(?:sounds?|sound\s+effects?)|ui\s+sounds?|beeps?|chimes?)\b/iu,
+    /^(?:please\s+)?(?:sound\s+effects?|interface\s+sounds?|ui\s+sounds?|beeps?|chimes?)\s+off\b/iu,
+    /^(?:please\s+)?no\s+more\s+(?:sound\s+effects?|beeps?|chimes?)\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:desactiva|quita|silencia)\s+(?:los?\s+)?(?:efectos?\s+de\s+sonido|sonidos?\s+de\s+la\s+interfaz|pitidos?)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:desactiva|treu|silencia)\s+(?:els?\s+)?(?:efectes?\s+de\s+so|sons?\s+d['’]interf[ií]cie)\b/iu,
+  ].some((pattern) => pattern.test(value))) {
+    return { name: "set_client_audio", args: { effects: false } };
+  }
+  if ([
+    /^(?:please\s+)?(?:turn\s+on|enable|activate|unmute)\s+(?:the\s+)?(?:sound\s+effects?|interface\s+(?:sounds?|sound\s+effects?)|ui\s+sounds?|beeps?|chimes?)\b/iu,
+    /^(?:please\s+)?(?:sound\s+effects?|interface\s+sounds?|ui\s+sounds?|beeps?|chimes?)\s+(?:back\s+)?on\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:activa|pon)\s+(?:los?\s+)?(?:efectos?\s+de\s+sonido|sonidos?\s+de\s+la\s+interfaz|pitidos?)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:activa|posa)\s+(?:els?\s+)?(?:efectes?\s+de\s+so|sons?\s+d['’]interf[ií]cie)\b/iu,
+  ].some((pattern) => pattern.test(value))) {
+    return { name: "set_client_audio", args: { effects: true } };
+  }
+  if ([
+    /^(?:please\s+)?(?:make\s+)?(?:the\s+)?(?:sound\s+effects?|interface\s+sounds?|beeps?|chimes?)\s+(?:quieter|softer|less\s+loud)\b/iu,
+    /^(?:please\s+)?turn\s+(?:the\s+)?(?:sound\s+effects?|interface\s+sounds?|beeps?|chimes?)(?:\s+volume)?\s+down\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:baja\s+(?:el\s+)?volumen\s+(?:de\s+)?(?:los\s+)?(?:efectos|pitidos)|haz\s+(?:los?\s+)?(?:efectos|pitidos)\s+m[aá]s\s+bajos)/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:baixa\s+(?:el\s+)?volum\s+(?:dels|del)\s+(?:efectes|pitidos)|fes\s+(?:els?\s+)?(?:efectes|pitidos)\s+m[eé]s\s+baixos)/iu,
+  ].some((pattern) => pattern.test(value))) {
+    return { name: "set_client_audio", args: { effects_volume: 0.25 } };
+  }
+  if ([
+    /^(?:please\s+)?(?:make\s+)?(?:the\s+)?(?:sound\s+effects?|interface\s+sounds?|beeps?|chimes?)\s+(?:louder|more\s+audible)\b/iu,
+    /^(?:please\s+)?turn\s+(?:the\s+)?(?:sound\s+effects?|interface\s+sounds?|beeps?|chimes?)(?:\s+volume)?\s+up\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:sube\s+(?:el\s+)?volumen\s+(?:de\s+)?(?:los\s+)?(?:efectos|pitidos)|haz\s+(?:los?\s+)?(?:efectos|pitidos)\s+m[aá]s\s+fuertes)/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:puja\s+(?:el\s+)?volum\s+(?:dels|del)\s+(?:efectes|pitidos)|fes\s+(?:els?\s+)?(?:efectes|pitidos)\s+m[eé]s\s+forts)/iu,
+  ].some((pattern) => pattern.test(value))) {
+    return { name: "set_client_audio", args: { effects_volume: 0.85 } };
+  }
+  if ([
+    /^(?:please\s+)?unmute\b/iu,
+    /^(?:please\s+)?(?:resume|restart)\s+(?:the\s+)?(?:microphone|mic|listening)\b/iu,
+    /^(?:please\s+)?(?:listen|start\s+listening)\s+again\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:reactiva|reanuda|desilencia)\b/iu,
+    /^(?:por\s+favor[,\s]+)?(?:vuelve\s+a\s+escuchar(?:me)?|escucha\s+de\s+nuevo)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:reactiva|repr[eè]n|desilencia)\b/iu,
+    /^(?:si\s+us\s+plau[,\s]+)?(?:torna\s+a\s+escoltar(?:[- ]?me)?|escolta\s+de\s+nou)\b/iu,
+  ].some((pattern) => pattern.test(value))) {
+    return { name: "set_client_audio", args: { microphone: "active" } };
   }
   return undefined;
 }

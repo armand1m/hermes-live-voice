@@ -36,13 +36,13 @@ describe("HermesLiveClient", () => {
     expect(socket.sent[0]).toEqual({
       type: "session.start",
       id: "req_1",
-      protocolVersion: 8,
+      protocolVersion: 9,
       profileId: "demo",
       conversation: { mode: "new" },
     });
     socket.message(readyMessage("live_1"));
 
-    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 8 });
+    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 9 });
     expect(client.connected).toBe(true);
     expect(client.getSnapshot()).toMatchObject({
       connection: "ready",
@@ -78,7 +78,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     expect(socket.sent[0]).toMatchObject({
       type: "session.start",
-      protocolVersion: 8,
+      protocolVersion: 9,
       conversation: { mode: "resume", sessionId: "saved_chat" },
     });
     socket.message({
@@ -104,6 +104,43 @@ describe("HermesLiveClient", () => {
       reason: "voice_command",
       arbitrary: true,
     })).toThrow(/unsupported field/i);
+  });
+
+  it("validates and emits agent-requested client audio settings", async () => {
+    const { client, socket } = await connectedClient("live_audio_settings");
+    const listener = vi.fn();
+    client.on("client.audio_settings", listener);
+
+    socket.message({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "active",
+      effects: false,
+      effectsVolume: 0.4,
+    });
+    await flushMessages();
+
+    expect(listener).toHaveBeenCalledWith({
+      type: "client.audio_settings",
+      source: "voice_command",
+      microphone: "active",
+      effects: false,
+      effectsVolume: 0.4,
+    });
+    expect(() => validateServerMessage({
+      type: "client.audio_settings",
+      source: "voice_command",
+    })).toThrow(/at least one/i);
+    expect(() => validateServerMessage({
+      type: "client.audio_settings",
+      source: "voice_command",
+      effectsVolume: 1.4,
+    })).toThrow(/effectsVolume/i);
+    expect(() => validateServerMessage({
+      type: "client.audio_settings",
+      source: "remote_control",
+      effects: true,
+    })).toThrow(/source/i);
   });
 
   it("starts and correlates an exact durable task follow-up", async () => {
@@ -958,7 +995,7 @@ describe("HermesLiveClient", () => {
     const connection = client.connect();
     const socket = await nextSocket();
     socket.open();
-    socket.message({ type: "session.ready", protocolVersion: 8 });
+    socket.message({ type: "session.ready", protocolVersion: 9 });
 
     await expect(connection).rejects.toThrow(/requires sessionId/);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
@@ -1197,7 +1234,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     socket.message({ ...readyMessage("legacy"), protocolVersion: 2 });
 
-    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v8.*upgrade/i);
+    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v9.*upgrade/i);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
   });
 });
@@ -1867,7 +1904,7 @@ function createClient(overrides: Record<string, unknown> = {}): HermesLiveClient
 function readyMessage(sessionId: string) {
   return {
     type: "session.ready",
-    protocolVersion: 8,
+    protocolVersion: 9,
     sessionId,
     model: "mock-live",
     hermes: {},

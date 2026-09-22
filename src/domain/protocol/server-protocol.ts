@@ -214,7 +214,7 @@ const TaskEventBase = {
 const SessionReadyMessageSchema = z
   .object({
     type: z.literal("session.ready"),
-    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8)]),
+    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8), z.literal(9)]),
     requestId: RequestIdSchema.optional(),
     sessionId: PublicIdSchema,
     model: z.string().min(1).max(PUBLIC_MODEL_MAX_CHARS),
@@ -284,6 +284,25 @@ const InputPauseRequestedMessageSchema = z
     reason: z.literal("voice_command"),
   })
   .strict();
+
+// v9: the agent (via the set_client_audio tool) asks the browser to change
+// local audio settings. Advisory like input.pause_requested — the client
+// remains authoritative over its own hardware. At least one setting must be
+// present; the schema keeps the message meaningful on the wire.
+const ClientAudioSettingsMessageSchema = z
+  .object({
+    type: z.literal("client.audio_settings"),
+    source: z.literal("voice_command"),
+    microphone: z.enum(["active", "paused"]).optional(),
+    effects: z.boolean().optional(),
+    effectsVolume: z.number().finite().min(0).max(1).optional(),
+  })
+  .strict()
+  .superRefine((message, context) => {
+    if (message.microphone === undefined && message.effects === undefined && message.effectsVolume === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "At least one audio setting is required." });
+    }
+  });
 
 const ResponseStartedMessageSchema = z
   .object({ type: z.literal("response.started"), responseId: PublicIdSchema.optional() })
@@ -416,6 +435,7 @@ export const ServerMessageSchema = z.union([
   InputSpeechStartedMessageSchema,
   InputSpeechStoppedMessageSchema,
   InputPauseRequestedMessageSchema,
+  ClientAudioSettingsMessageSchema,
   ResponseStartedMessageSchema,
   ResponseCompletedMessageSchema,
   ResponseCancelledMessageSchema,

@@ -15,7 +15,8 @@ export type LiveToolName =
   | "get_background_task"
   | "follow_up_background_task"
   | "stop_background_task"
-  | "pause_voice_input";
+  | "pause_voice_input"
+  | "set_client_audio";
 
 export interface LiveModelAudio {
   data: string;

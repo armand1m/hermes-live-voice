@@ -89,6 +89,21 @@ describe("AgentStateController", () => {
     expect(controller.expressionSprings.smile.target).toBe(EXPRESSIONS.error.smile);
     expect(controller.expressionSprings.concern.target).toBe(EXPRESSIONS.error.concern);
   });
+
+  it("names expression pulses through the optional onCue observer", () => {
+    const controller = new AgentStateController();
+    const cues: string[] = [];
+    controller.onCue = (cue: string) => cues.push(cue);
+
+    controller.pulseExpression("satisfied", 2.4);
+    controller.pulseExpression("uncertain", 2.6);
+    controller.pulseExpression("not-a-pose", 2.6);
+    expect(cues).toEqual(["expression:satisfied", "expression:uncertain"]);
+
+    // Without an observer nothing changes; the controller stays optional.
+    const bare = new AgentStateController();
+    expect(() => bare.pulseExpression("satisfied", 2.4)).not.toThrow();
+  });
 });
 
 function advanceSpring(spring: any, seconds = 1, dt = 1 / 60): void {

@@ -1,12 +1,12 @@
 # Client Protocol
 
-Hermes Live protocol v8 is strict JSON over WebSocket:
+Hermes Live protocol v9 is strict JSON over WebSocket:
 
 ```txt
 ws://127.0.0.1:8788/v1/live
 ```
 
-Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. Protocol v7 moved speech confirmation into the gateway (Silero VAD) and added `input.speech_started`/`input.speech_stopped` with `provider: "gateway"`. Protocol v8 adds `conversation.mode: "persistent"`: the gateway resolves the durable per-user voice thread (most recent Hermes session with the configured title, else a fresh one) and reports it back as `new` or `resume`; reconnects re-resolve the tip, so every device continues the same conversation. The gateway still accepts v3-v7 clients; new clients should send v8.
+Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. Protocol v7 moved speech confirmation into the gateway (Silero VAD) and added `input.speech_started`/`input.speech_stopped` with `provider: "gateway"`. Protocol v8 adds `conversation.mode: "persistent"`: the gateway resolves the durable per-user voice thread (most recent Hermes session with the configured title, else a fresh one) and reports it back as `new` or `resume`; reconnects re-resolve the tip, so every device continues the same conversation. Protocol v9 adds `client.audio_settings`: the agent can ask the client to resume a paused microphone and to change its interface sound settings. The gateway still accepts v3-v8 clients; new clients should send v9.
 
 The TypeScript schemas in `src/domain/protocol/` and the browser validator in `clients/browser/hermes-live-client.js` are the normative contract.
 
@@ -143,6 +143,7 @@ Server conversation events are:
 - `audio.output` with base64 data, MIME type, and optional playback correlation;
 - `input.speech_started` for OpenAI, local, or gateway VAD (the v7 gateway includes the speech probability it confirmed); `input.speech_stopped {provider: "gateway"}` after a gateway-confirmed turn ends;
 - `input.pause_requested` when the user explicitly asks the realtime model to pause listening;
+- `client.audio_settings` (v9) when the user explicitly asks the agent to change browser audio settings;
 - `response.started`, `response.completed`, `response.cancelled`, and `response.failed`;
 - bounded `log` and `session.error` messages.
 
@@ -192,6 +193,32 @@ Start a durable follow-up after a task reaches any terminal state:
 ```
 
 The new task is an independent Hermes worker seeded with the selected task's bounded retained result. Its `task.accepted` event carries `kind: "follow_up"`, `parentTaskId`, and `rootTaskId`. Follow-ups preserve explicit lineage; they do not reuse the original worker's hidden process or tool-call history.
+
+## Task Narration
+
+Authenticated HTTP route (same bearer token as the WebSocket, follows the page's subpath mount):
+
+```
+POST /v1/task-narration
+Authorization: Bearer <token>
+
+{ "taskId": "task_0123456789abcdef0123456789abcdef" }
+```
+
+The gateway resolves the task record from its own owner inbox — the client never supplies the content being summarized — and asks the configured OpenAI-compatible LLM (`HERMES_LIVE_NARRATOR_URL`, unset disables the route with `503 {"status":"narration_disabled"}`) for a concise markdown rewrite of the projected record. Responses carry the narrated revision:
+
+```json
+{
+  "taskId": "task_0123456789abcdef0123456789abcdef",
+  "sequence": 8,
+  "updatedAt": 1780000010000,
+  "markdown": "**Repository checks passed.**\n- ran `git status` …",
+  "model": "qwen3.8-27b",
+  "cached": false
+}
+```
+
+Summaries are cached server-side per `taskId:sequence:updatedAt` (bounded; a revised task summarizes again, `cached` reports hits). Unknown task ids answer `404`; upstream LLM failures answer `502 {"status":"narration_failed"}`. The narration prompt forbids inventing facts and keeps commands, paths, and numbers verbatim — treat the markdown as a rendering of the record, not a new source of truth.
 
 ## Task Lifecycle
 
@@ -328,6 +355,14 @@ When the user explicitly asks to pause or mute listening, a protocol v6 provider
 
 Clients should stop microphone capture with `endTurn: false` and keep playback, the WebSocket, and all background tasks alive. Resume must stay a visible client action: a paused microphone cannot hear a voice command.
 
+In protocol v9 sessions the provider may also call `set_client_audio` when the user explicitly asks — for example "unmute me", "listen again", "turn the sound effects off", or "make the interface sounds quieter". The gateway sends:
+
+```json
+{ "type": "client.audio_settings", "source": "voice_command", "microphone": "active", "effects": false, "effectsVolume": 0.4 }
+```
+
+Every field is optional (at least one is present). `microphone: "paused"` mirrors `input.pause_requested`; `microphone: "active"` asks the client to resume capture — the client decides, since it owns its hardware. `effects` and `effectsVolume` (0–1) address the client's interface sound cues. Delivery is fire-and-forget: the tool receipt describes the request, not a confirmed client state, and clients that do not implement the settings simply ignore them.
+
 Detach cleanly:
 
 ```json
@@ -357,6 +392,7 @@ client.on("transcript.delta", renderTranscript);
 client.on("task.completed", renderTaskUpdate);
 client.on("task.notification", renderNotification);
 client.on("input.pause_requested", () => audio.stopMicrophone({ endTurn: false }));
+client.on("client.audio_settings", (event) => applyAudioSettings(event));
 client.on("error", renderError);
 
 const audio = new HermesLiveAudio(client, { workletUrl: "/mic-worklet.js" });

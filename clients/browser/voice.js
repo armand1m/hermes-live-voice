@@ -2,6 +2,9 @@ import { HermesLiveClient, HermesLiveAudio } from "./hermes-live-client.js";
 import { AgentStateController, SpeechAnalysis, TextVisemeScheduler, VisemeEstimator } from "./entity-state.js";
 import { VoiceEntityScene } from "./entity-scene.js";
 import { createDiagnosticsOverlay } from "./diagnostics.js";
+import { createSfx, loadAudioPrefs, saveAudioPrefs, resolveModeCue, DEFAULT_MASTER_VOLUME } from "./sfx.js";
+import { renderMarkdown } from "./markdown.js";
+import { createTaskNarrator } from "./task-narrator.js";
 
 const state = document.querySelector("#state");
 const detail = document.querySelector("#detail");
@@ -28,6 +31,12 @@ const hashToken = hashParams.get("token")?.trim();
 const devMode = hashParams.has("dev") || new URLSearchParams(location.search).get("dev") === "1";
 const noDiagnostics = hashParams.has("no-diagnostics")
   || new URLSearchParams(location.search).get("no-diagnostics") === "1";
+const noSfx = hashParams.has("no-sfx")
+  || new URLSearchParams(location.search).get("no-sfx") === "1";
+// Gateway task-log narration is pure enhancement; this keeps the drawer on
+// raw gateway text per tab.
+const noTaskAi = hashParams.has("no-ai")
+  || new URLSearchParams(location.search).get("no-ai") === "1";
 let token;
 try {
   if (hashToken) sessionStorage.setItem(tokenKey, hashToken);
@@ -81,6 +90,18 @@ if (!noDiagnostics) {
   });
   window.addEventListener("pagehide", () => diagnostics.dispose(), { once: true });
 }
+
+// Interface sound cues: every entity state, task transition and mic toggle
+// gets a short synthesized signature (see sfx.js). Preferences persist across
+// sessions; ?no-sfx=1 forces silence for this tab only. The controller names
+// what happened; the cue palette decides how it sounds.
+const audioPrefs = loadAudioPrefs();
+const sfx = createSfx({
+  enabled: !noSfx && audioPrefs.effects !== false,
+  volume: audioPrefs.effectsVolume ?? DEFAULT_MASTER_VOLUME,
+  isSpeaking: () => playbackActive,
+});
+controller.onCue = (cue) => sfx.play(cue);
 
 // Mouth rig targets derived from viseme weights (see entity-facekit.js).
 const mouth = { jaw: 0, wide: 0, round: 0, narrow: 0, press: 0, teeth: 0, energy: 0 };
@@ -145,6 +166,7 @@ audio.on("microphone", (event) => {
   mute.setAttribute("aria-pressed", String(!event.active));
   if (event.active) {
     controller.resumeRequested();
+    sfx.play("unmute");
     status("armed", "Listening");
     detail.textContent = "Talk naturally. I’ll hear when you finish.";
     syncStatusDetail();
@@ -152,6 +174,9 @@ audio.on("microphone", (event) => {
     status("paused", "Listening paused");
     detail.textContent = "Resume with the microphone control.";
   } else if (event.state === "idle") {
+    // Disconnect teardown also emits a trailing idle microphone event; only
+    // a live session means the user actually muted.
+    if (client.connected) sfx.play("mute");
     status("muted", "Microphone muted");
     detail.textContent = "Unmute when you’re ready to continue.";
   }
@@ -170,6 +195,40 @@ client.on("input.speech_started", () => controller.userSpeechStarted());
 client.on("input.pause_requested", () => {
   controller.pauseRequested();
   void audio.stopMicrophone({ endTurn: false }).catch(() => undefined);
+});
+
+// Agent-requested audio settings: the gateway relays explicit voice commands
+// ("unmute me", "turn the sound effects off") as advisory requests. The
+// client stays in charge of its own hardware — and a tab booted with
+// ?no-sfx=1 stays silent no matter what is requested, while normal sessions
+// honor and persist the preferences.
+client.on("client.audio_settings", (event) => {
+  if (event.microphone === "paused") {
+    controller.pauseRequested();
+    void audio.stopMicrophone({ endTurn: false }).catch(() => undefined);
+  } else if (event.microphone === "active" && client.connected) {
+    void audio.startMicrophone().catch(showError);
+  }
+  if (event.effects !== undefined || event.effectsVolume !== undefined) {
+    if (!noSfx) {
+      // An "off" confirmation must sound while the cues still can.
+      if (event.effects === false) sfx.play("mute");
+      if (event.effects !== undefined) sfx.setEnabled(event.effects);
+      if (event.effectsVolume !== undefined) {
+        sfx.setVolume(event.effectsVolume);
+        sfx.play("taskTick");
+      }
+      if (event.effects === true) sfx.play("satisfied");
+    }
+    saveAudioPrefs({
+      ...(event.effects !== undefined ? { effects: event.effects } : {}),
+      ...(event.effectsVolume !== undefined ? { effectsVolume: event.effectsVolume } : {}),
+    });
+    const soundBits = [];
+    if (event.effects !== undefined) soundBits.push(event.effects ? "on" : "off");
+    if (event.effectsVolume !== undefined) soundBits.push(`volume ${Math.round(event.effectsVolume * 100)}%`);
+    addTaskRow(`♪ interface sounds — ${soundBits.join(", ")}`);
+  }
 });
 
 // --- agent pipeline ----------------------------------------------------------
@@ -294,10 +353,14 @@ client.on("task.updated", ({ task, message }) => {
   if (type === "task.accepted" || type === "task.started") {
     controller.toolStarted();
     scene?.toolPacketStart(task.taskId, toolLabel(task, message));
+    // "accepted" can precede "started" by seconds: cue the start only, like
+    // the transcript row does.
+    if (type === "task.started") sfx.play("taskStarted");
   } else if (type === "task.progress") {
     controller.toolActivity();
     scene?.pulse(0.3);
     scene?.toolPacketStart(task.taskId, toolLabel(task, message));
+    sfx.play("taskTick");
   } else if (type === "task.completed") {
     controller.toolEnded(true);
     controller.taskTerminal("completed");
@@ -367,6 +430,9 @@ function syncStatusDetail() {
 
 // --- connection --------------------------------------------------------------
 mute.addEventListener("click", async () => {
+  // Resume the cue context synchronously inside the gesture, before any
+  // await — the browser only unlocks audio from the gesture task itself.
+  sfx.prime();
   mute.disabled = true;
   try {
     if (audio.microphoneActive) await audio.stopMicrophone({ endTurn: true });
@@ -434,7 +500,9 @@ function frame(now) {
   for (const key of VISEME_KEYS) {
     blended[key] = w[key] + (tw[key] - w[key]) * textMix;
   }
-  mouth.jaw = blended.open * 0.88 + blended.round * 0.4 + blended.narrow * 0.12;
+  // Jaw aperture is deliberately restrained: vowels part the lips, they
+  // don't gape. Most articulation reads through the lip shape channels.
+  mouth.jaw = blended.open * 0.6 + blended.round * 0.3 + blended.narrow * 0.08;
   mouth.wide = Math.max(0, blended.wide * 0.9 + blended.teeth * 0.2 - blended.round * 0.3);
   mouth.round = blended.round + blended.narrow * 0.55;
   mouth.narrow = blended.narrow;
@@ -448,8 +516,17 @@ function frame(now) {
     canvas.dataset.state = lastCanvasState;
   }
   if (visual.mode !== lastBodyMode) {
+    const previousMode = lastBodyMode;
     lastBodyMode = visual.mode;
     document.body.dataset.mode = lastBodyMode;
+    // Mode changes are the entity's own vocabulary, so they carry the state
+    // cues (connected/disconnected/error/thinking/tool/waiting/speaking/
+    // paused/idle-return). Dev-pinned modes sound exactly like live ones.
+    const cue = resolveModeCue(previousMode, lastBodyMode, {
+      micActive: audio.microphoneActive,
+      connected: client.connected,
+    });
+    if (cue) sfx.play(cue);
   }
 
   if (scene) {
@@ -508,7 +585,7 @@ function frame(now) {
 
 if (devMode) {
   // Development introspection handle (never defined in production).
-  window.__entity = { controller, scene, audio, client, mouth, analysis };
+  window.__entity = { controller, scene, audio, client, mouth, analysis, sfx };
 }
 if (devMode && !webglFailed) {
   import("./entity-debug.js").then(({ createDebugPanel }) => {
@@ -566,6 +643,7 @@ if (reducedMotionQuery) {
 const logToggle = document.querySelector("#log-toggle");
 const logDrawer = document.querySelector("#log-drawer");
 function setLogOpen(open) {
+  if (open) setTaskOpen(false);
   logDrawer.hidden = !open;
   logToggle.classList.toggle("active", open);
   logToggle.setAttribute("aria-expanded", String(open));
@@ -577,17 +655,230 @@ logToggle?.addEventListener("keydown", (event) => {
     setLogOpen(logDrawer.hidden);
   }
 });
+
+// --- task log drawer ----------------------------------------------------------
+// The conversation archive and the task record share the right rail, so only
+// one drawer is open at a time and neither toggle ever moves.
+const taskToggle = document.querySelector("#task-toggle");
+const taskDrawer = document.querySelector("#task-drawer");
+const taskListEl = document.querySelector("#task-list");
+const taskCount = document.querySelector("#task-count");
+const taskEmpty = document.querySelector("#task-empty");
+// Retained-output fetches in flight; guards double clicks across re-renders.
+const taskOutputPending = new Set();
+// Terminal states: the record is final, so narration is worth a model pass.
+const TASK_TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
+// Markdown narration through the gateway's configured LLM (POST
+// /v1/task-narration, cached server-side per task revision). Every path is
+// null-safe, so the drawer never depends on it being present.
+const taskNarrator = noTaskAi ? null : createTaskNarrator({
+  endpoint: `${mountPath}/v1/task-narration`,
+  getToken: () => token,
+});
+// Narration only pays off on terminal records with real content to organize.
+function narratableTask(task) {
+  return TASK_TERMINAL.has(task.state)
+    && Boolean(task.result?.summary || task.result?.output || task.error);
+}
+const TASK_GLYPHS = {
+  accepted: "…",
+  queued: "…",
+  running: "▸",
+  stopping: "○",
+  completed: "✓",
+  failed: "✕",
+  cancelled: "◇",
+  unknown: "?",
+};
+// "stopping" already had its stop requested; offer no second one.
+const TASK_STOPPABLE = new Set(["accepted", "queued", "running"]);
+
+function setTaskOpen(open) {
+  if (open) setLogOpen(false);
+  taskDrawer.hidden = !open;
+  taskToggle.classList.toggle("active", open);
+  taskToggle.setAttribute("aria-expanded", String(open));
+  if (open) renderTaskLog();
+}
+taskToggle?.addEventListener("click", () => setTaskOpen(taskDrawer.hidden));
+taskToggle?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    setTaskOpen(taskDrawer.hidden);
+  }
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && logDrawer && !logDrawer.hidden) {
+  if (event.key !== "Escape") return;
+  if (logDrawer && !logDrawer.hidden) {
     setLogOpen(false);
     logToggle.focus();
+  } else if (taskDrawer && !taskDrawer.hidden) {
+    setTaskOpen(false);
+    taskToggle.focus();
   }
+});
+
+function formatClock(epoch) {
+  const date = new Date(epoch);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+function taskDuration(task) {
+  return formatDuration((task.finishedAt ?? Date.now()) - (task.startedAt ?? task.createdAt));
+}
+
+function taskMeta(task) {
+  const parts = [formatClock(task.createdAt), taskDuration(task)];
+  if (task.kind === "follow_up") {
+    parts.push(task.parentTaskId ? `follow-up of …${task.parentTaskId.slice(-4)}` : "follow-up");
+  }
+  return parts.filter(Boolean).join(" · ");
+}
+
+function taskActionButton(label, className, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", () => onClick(button));
+  return button;
+}
+
+function renderTaskEntry(task) {
+  const entry = document.createElement("article");
+  entry.className = "task-entry";
+  entry.dataset.state = task.state;
+
+  const head = document.createElement("div");
+  head.className = "task-head";
+  const glyph = document.createElement("span");
+  glyph.className = "task-glyph";
+  glyph.textContent = TASK_GLYPHS[task.state] ?? "·";
+  const title = document.createElement("h3");
+  title.textContent = task.title || `task …${task.taskId.slice(-4)}`;
+  const stateLabel = document.createElement("span");
+  stateLabel.className = "task-state";
+  stateLabel.textContent = task.state;
+  head.append(glyph, title, stateLabel);
+  entry.append(head);
+
+  const meta = document.createElement("p");
+  meta.className = "task-meta";
+  meta.textContent = taskMeta(task);
+  entry.append(meta);
+
+  // Latest live progress while the worker is still out there.
+  const active = !TASK_TERMINAL.has(task.state);
+  if (active && task.progress?.message) {
+    const progress = document.createElement("p");
+    progress.className = "task-progress";
+    progress.textContent = task.progress.message;
+    entry.append(progress);
+  }
+
+  // Terminal records: prefer the gateway's markdown narration once it exists;
+  // the raw fields below are the pre-narration and fallback view.
+  const narration = taskNarrator?.cached(task);
+  if (narration && narration.markdown) {
+    entry.append(renderMarkdown(narration.markdown));
+    meta.append(` · restructured by ${narration.model}`);
+  } else {
+    if (task.error) {
+      const error = document.createElement("p");
+      error.className = "task-error";
+      error.textContent = `${task.error.code}: ${task.error.message}`;
+      entry.append(error);
+    }
+    if (task.result?.summary) {
+      const summary = document.createElement("p");
+      summary.className = "task-summary";
+      summary.textContent = task.result.summary;
+      entry.append(summary);
+    }
+    if (task.result?.output) {
+      const output = document.createElement("div");
+      output.className = "task-output";
+      output.textContent = task.result.output;
+      entry.append(output);
+    }
+    if (taskNarrator && !taskNarrator.disabled && narration === undefined && narratableTask(task)) {
+      const pending = document.createElement("p");
+      pending.className = "task-md-pending";
+      pending.textContent = "restructuring…";
+      entry.append(pending);
+      // Resolves with the outcome cached (markdown or the brief negative
+      // entry) — exactly one repaint, never a loop.
+      taskNarrator.narrate(task).then(() => {
+        if (taskDrawer && !taskDrawer.hidden) renderTaskLog();
+      });
+    }
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "task-actions";
+  if (TASK_STOPPABLE.has(task.state)) {
+    actions.append(taskActionButton("Stop", "stop", (button) => {
+      button.disabled = true;
+      // stopTask throws synchronously when the state moved on since render.
+      try {
+        client.stopTask(task.taskId).catch(showError);
+      } catch (error) {
+        showError(error);
+      }
+    }));
+  }
+  // Snapshots omit retained output; the live completed event and task.get
+  // carry it. Offer the fetch only when it is still missing.
+  if (!active && task.result?.truncated && !task.result.output && !taskOutputPending.has(task.taskId)) {
+    actions.append(taskActionButton("Load output", "", (button) => {
+      button.disabled = true;
+      taskOutputPending.add(task.taskId);
+      try {
+        client.getTask(task.taskId)
+          .catch(showError)
+          .finally(() => taskOutputPending.delete(task.taskId));
+      } catch (error) {
+        taskOutputPending.delete(task.taskId);
+        showError(error);
+      }
+    }));
+  }
+  if (actions.children.length) entry.append(actions);
+  return entry;
+}
+
+function renderTaskLog() {
+  if (!taskListEl) return;
+  const tasks = client.tasks;
+  if (taskCount) taskCount.textContent = String(tasks.length).padStart(2, "0");
+  if (taskEmpty) taskEmpty.hidden = tasks.length > 0;
+  // Full rebuild on every bounded snapshot tick; keep the reader's scroll.
+  const scrollTop = taskListEl.scrollTop;
+  taskListEl.textContent = "";
+  for (const task of tasks) taskListEl.append(renderTaskEntry(task));
+  taskListEl.scrollTop = scrollTop;
+}
+
+client.on("tasks.changed", () => {
+  if (taskToggle) taskToggle.dataset.running = String(client.activeTasks.length > 0);
+  if (taskDrawer && !taskDrawer.hidden) renderTaskLog();
 });
 
 window.addEventListener("pagehide", (event) => {
   if (event.persisted) return;
   cancelAnimationFrame(frameHandle);
   scene?.dispose();
+  // Silence cues before the audio pipeline tears down: dispose() emits a
+  // trailing idle microphone event that must not chirp on the way out.
+  sfx.dispose();
   void audio.dispose();
   void client.disconnect();
 }, { once: true });
