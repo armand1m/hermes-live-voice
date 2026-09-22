@@ -258,6 +258,29 @@ body.no-webgl .fallback {
 #state[data-state="error"] {
   color: var(--error);
 }
+#state[data-state="reconnecting"] {
+  color: var(--warm);
+  animation: reconnect-pulse 1.6s var(--ease) infinite;
+}
+#state[data-state="gateway-down"] {
+  color: var(--error);
+  animation: reconnect-pulse 1.6s var(--ease) infinite;
+}
+@keyframes reconnect-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #state[data-state="reconnecting"],
+  #state[data-state="gateway-down"] {
+    animation: none;
+  }
+}
 #state[data-state="offline"],
 #state[data-state="paused"],
 #state[data-state="muted"] {
@@ -302,6 +325,28 @@ body.no-webgl .fallback {
     rgb(var(--accent-live))
   );
   box-shadow: 0 0 8px rgba(var(--accent-live), 0.4);
+}
+#reconnect {
+  margin: 12px 0 0;
+  padding: 8px 14px;
+  border: 1px solid rgba(255, 192, 124, 0.42);
+  color: var(--warm);
+  background: rgba(38, 26, 10, 0.55);
+  font: 500 10px/1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease);
+}
+#reconnect:hover,
+#reconnect:focus-visible {
+  border-color: var(--warm);
+  background: rgba(58, 38, 12, 0.72);
+  outline: none;
+}
+#reconnect:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .periphery {
   position: fixed;

@@ -29,7 +29,10 @@ test('page load arms continuous capture and a spoken PCM fixture reaches the tra
     await expect(page.locator('#log-drawer')).toBeHidden();
     expect(harness.observed.audioFrames).toBeGreaterThan(10);
     expect(harness.observed.chats[0]).toBe('Hello. Please say hello back.');
-    await expect(page.locator('button')).toHaveCount(1);
+    // While connected, Mute is the only visible button; the Reconnect now
+    // escape hatch stays mounted but hidden until the link is lost.
+    await expect(page.locator('button:visible')).toHaveCount(1);
+    await expect(page.locator('#reconnect')).toBeHidden();
     await page.getByRole('button', { name: 'Mute', exact: true }).click();
     await expect(page.locator('#state')).toHaveAttribute('data-state', 'muted');
     const frames = harness.observed.audioFrames;
@@ -78,6 +81,26 @@ test('history follows streaming text and final corrections without duplicating m
     await expect(page.locator('#log-drawer')).toBeVisible();
     await page.locator('#log-toggle').click();
     await expect(page.locator('#log-drawer')).toBeHidden();
+  } finally { await page.close(); await harness.close(); }
+});
+
+test('a dropped connection visibly reconnects with backoff and re-arms the microphone', async ({ page }) => {
+  const harness = await voiceHarness();
+  try {
+    await page.goto(`${harness.url}?dev=1`);
+    await expect(page.locator('#state')).toHaveAttribute('data-state', 'armed');
+
+    // The network dies under the session: an abnormal WebSocket close.
+    await page.evaluate(() => { (window as any).__entity.client.socket.close(4000, 'e2e: network dropped'); });
+    await expect(page.locator('#state')).toHaveAttribute('data-state', 'reconnecting');
+    await expect(page.locator('#reconnect')).toBeVisible();
+    await expect(page.locator('#state')).toHaveText(/Connection lost — reconnecting \(attempt 1, next in/);
+    await expect(page.locator('#detail')).toContainText('In-flight audio was lost');
+
+    // The deterministic 1s first retry lands against the still-running gateway.
+    await expect(page.locator('#state')).toHaveAttribute('data-state', 'armed', { timeout: 10_000 });
+    await expect(page.locator('#reconnect')).toBeHidden();
+    await expect(page.locator('#transcript p', { hasText: 'Reconnected. In-flight audio was lost.' })).toBeVisible();
   } finally { await page.close(); await harness.close(); }
 });
 

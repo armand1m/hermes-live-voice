@@ -425,6 +425,7 @@ async function handleHttp(
     "/entity-scene.js": ["entity-scene.js", "text/javascript; charset=utf-8"],
     "/entity-debug.js": ["entity-debug.js", "text/javascript; charset=utf-8"],
     "/diagnostics.js": ["diagnostics.js", "text/javascript; charset=utf-8"],
+    "/connection-supervisor.js": ["connection-supervisor.js", "text/javascript; charset=utf-8"],
   };
   const asset = browserFiles[url.pathname];
   if (asset) {
@@ -446,6 +447,36 @@ async function handleHttp(
       return;
     }
     json(req, res, 200, { status: "ok", service: HERMES_LIVE_SERVICE_ID });
+    return;
+  }
+  if (url.pathname === "/status.json") {
+    if (!isGetOrHead(req)) {
+      methodNotAllowed(req, res, "GET, HEAD");
+      return;
+    }
+    // Connection-health surface for reconnecting browsers: gateway liveness
+    // plus the gateway↔provider (s2s) attach state of every live session.
+    // Unauthenticated like /health — it carries no secrets or session ids.
+    const now = Date.now();
+    const providerLinks = [...options.sessions].map((session) => session.providerLinkStatus(now));
+    const providerProbe = await probeRealtimeProvider(options.config);
+    json(req, res, 200, {
+      ts: now,
+      status: "ok",
+      service: HERMES_LIVE_SERVICE_ID,
+      uptimeMs: Math.round(process.uptime() * 1_000),
+      provider: {
+        name: options.config.realtime.provider,
+        model: options.config.realtime.model,
+      },
+      sessions: {
+        browser: providerLinks.length,
+        providerAttached: providerLinks.filter((link) => link.state === "attached").length,
+        providerStarting: providerLinks.filter((link) => link.state === "starting").length,
+      },
+      providerLinks,
+      providerProbe,
+    });
     return;
   }
   if (requiresHttpAuth(url.pathname) && !isAuthorized(req, options.config, url, { allowQueryToken: false })) {
@@ -737,6 +768,61 @@ function parseHttpHost(host: string | undefined, protocol: "http:" | "https:"): 
 
 function parseRequestTarget(target: string | undefined): URL {
   return new URL(target ?? "/", "http://localhost");
+}
+
+interface RealtimeProviderProbe {
+  reachable: boolean;
+  latencyMs: number;
+  target: string;
+  checkedAt: number;
+  error?: string;
+}
+
+const PROVIDER_PROBE_CACHE_MS = 2_000;
+const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
+const providerProbeCache = new Map<string, { at: number; result: RealtimeProviderProbe }>();
+
+/** Provider endpoint whose origin can be probed over plain HTTP; null when none applies. */
+function realtimeProviderProbeTarget(config: AppConfig): string | null {
+  if (config.realtime.provider === "local") return config.local?.url ?? null;
+  if (config.realtime.provider === "openai") return config.openai?.baseUrl ?? null;
+  return null;
+}
+
+/**
+ * One cheap HTTP reachability check of the speech-to-speech origin, cached
+ * briefly so polling clients cannot turn /status.json into a probe amplifier.
+ * Any HTTP answer — even 404/426 — proves the speech service is listening;
+ * only a refused/timed-out connection reports unreachable.
+ */
+async function probeRealtimeProvider(config: AppConfig): Promise<RealtimeProviderProbe | null> {
+  const target = realtimeProviderProbeTarget(config);
+  if (!target) return null;
+  const cached = providerProbeCache.get(target);
+  if (cached && Date.now() - cached.at <= PROVIDER_PROBE_CACHE_MS) return cached.result;
+  const origin = new URL(target);
+  origin.protocol = origin.protocol === "wss:" ? "https:" : "http:";
+  origin.pathname = "/";
+  origin.search = "";
+  const beganAt = Date.now();
+  let result: RealtimeProviderProbe;
+  try {
+    await fetch(origin, {
+      signal: AbortSignal.timeout(PROVIDER_PROBE_TIMEOUT_MS),
+      headers: { Accept: "application/json" },
+    });
+    result = { reachable: true, latencyMs: Date.now() - beganAt, target: origin.origin, checkedAt: Date.now() };
+  } catch (error) {
+    result = {
+      reachable: false,
+      latencyMs: Date.now() - beganAt,
+      target: origin.origin,
+      checkedAt: Date.now(),
+      error: errorToMessage(error),
+    };
+  }
+  providerProbeCache.set(target, { at: Date.now(), result });
+  return result;
 }
 
 function rejectMalformedUpgrade(socket: Duplex): void {

@@ -148,6 +148,7 @@ For any non-loopback gateway bind, use a strong `HERMES_LIVE_AUTH_TOKEN`, an exa
 - [Setup, configuration, and Docker](docs/setup.md)
 - [Architecture](docs/architecture.md)
 - [Background tasks and recovery](docs/background-tasks.md)
+- [Connection resilience](docs/connection-resilience.md)
 - [Protocol v6](docs/client-protocol.md)
 - [UI integration](docs/ui-integration.md)
 - [Security](docs/security.md)
