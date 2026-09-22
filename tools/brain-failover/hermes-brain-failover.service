@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes brain failover controller (sglang :30000 watchdog, GLM failover, auto-diagnosis)
+Documentation=file:///home/armand1m/Projects/mine/hermes-live-voice/docs/brain-failover.md
+After=network-online.target
+Wants=network-online.target
+# Observes the sglang brain; coordinates hermes-s2s.service. Never manages the
+# container itself and never touches the hermes gateways (enforced in code:
+# ALLOWED_UNITS in brain_failover.py).
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/armand1m/Projects/mine/hermes-live-voice/tools/brain-failover/brain_failover.py serve
+Environment=PATH=/home/armand1m/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HERMES_BRAIN_FAILOVER_HOME=/home/armand1m/.hermes/hermes-live/brain-failover
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
