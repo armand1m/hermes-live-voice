@@ -1105,6 +1105,7 @@ function testConfig(
     gemini?: Partial<AppConfig["gemini"]>;
     openai?: Partial<AppConfig["openai"]>;
     narrator?: Partial<AppConfig["narrator"]>;
+    laya?: Partial<AppConfig["laya"]>;
   } = {},
 ): AppConfig {
   return {
@@ -1162,6 +1163,7 @@ function testConfig(
     filler: { enabled: false, delayMs: 2_500, intervalMs: 15_000, maxPerTool: 3 },
     tts: { requestTimeoutMs: 15_000, maxChars: 1_000 },
     narrator: { model: "qwen3.8-27b", requestTimeoutMs: 30_000, ...overrides.narrator },
+    laya: { shadowEnabled: false, timeoutMs: 1_500, ...overrides.laya },
     context: testContextConfig(),
   };
 }
