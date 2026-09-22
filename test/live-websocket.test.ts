@@ -2838,6 +2838,10 @@ function testConfig(overrides: {
       requestTimeoutMs: 30_000,
       ...overrides.narrator,
     },
+    laya: {
+      shadowEnabled: false,
+      timeoutMs: 1_500,
+    },
     context: {
       hermesHome: "/nonexistent-hermes-home",
       digestEnabled: true,

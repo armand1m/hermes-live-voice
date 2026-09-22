@@ -129,6 +129,12 @@ const EnvSchema = z.object({
   HERMES_LIVE_NARRATOR_MODEL: z.string().trim().min(1).max(128).default("qwen3.8-27b"),
   HERMES_LIVE_NARRATOR_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
   HERMES_LIVE_LOCAL_VOICE: z.string().trim().min(1).max(128).default("Aiden"),
+  HERMES_LIVE_LAYA_URL: z.string().url().refine(isSafeHttpLocalUrl, {
+    message: "HERMES_LIVE_LAYA_URL must be a credential-free local HTTP(S) URL (laya sidecar).",
+  }).optional(),
+  /** Shadow-mode logging only while piloting; unset URL disables it entirely. */
+  HERMES_LIVE_LAYA_SHADOW_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_LAYA_TIMEOUT_MS: z.coerce.number().int().min(250).max(10_000).default(1_500),
   HERMES_LIVE_LOCAL_ALLOW_REMOTE: z.string().optional(),
   HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
@@ -269,6 +275,13 @@ export interface AppConfig {
     model: string;
     requestTimeoutMs: number;
   };
+  laya: {
+    /** LAYA System-1 sidecar base URL; unset keeps the shadow client fully inert. */
+    baseUrl?: string;
+    /** Shadow logging on/off (logs only; never gates behavior). */
+    shadowEnabled: boolean;
+    timeoutMs: number;
+  };
   gemini: {
     apiKey?: string;
     model: string;
@@ -359,6 +372,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ...(parsed.HERMES_LIVE_NARRATOR_URL ? { baseUrl: parsed.HERMES_LIVE_NARRATOR_URL } : {}),
       model: parsed.HERMES_LIVE_NARRATOR_MODEL,
       requestTimeoutMs: parsed.HERMES_LIVE_NARRATOR_TIMEOUT_MS,
+    },
+    laya: {
+      ...(parsed.HERMES_LIVE_LAYA_URL ? { baseUrl: withoutTrailingSlash(parsed.HERMES_LIVE_LAYA_URL) } : {}),
+      shadowEnabled: parsed.HERMES_LIVE_LAYA_SHADOW_ENABLED === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_LAYA_SHADOW_ENABLED),
+      timeoutMs: parsed.HERMES_LIVE_LAYA_TIMEOUT_MS,
     },
     gemini: {
       ...(geminiApiKey ? { apiKey: geminiApiKey } : {}),

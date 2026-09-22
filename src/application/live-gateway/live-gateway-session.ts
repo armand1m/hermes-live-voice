@@ -38,6 +38,7 @@ import {
 } from "./ports/realtime-model.port.js";
 import { buildSystemInstruction } from "./system-instruction.js";
 import { buildContextDigest } from "./context-digest.js";
+import { buildLayaState, LAYA_SHADOW_QUESTIONS, type LayaShadowRecorder } from "./laya-shadow.js";
 import { SpeechTimingTracker, type SpeechTimingMetrics } from "./speech-timing.js";
 import { FillerSpeaker, type FillerEmit } from "./filler-speaker.js";
 import { deferredAnswerSpeech } from "./deferred-answer-speech.js";
@@ -107,6 +108,12 @@ export interface LiveGatewaySessionDeps {
   speechDetection?: SpeechDetectionService;
   /** Gateway-side TTS sidecar; omitted keeps all speech on the provider. */
   speechSink?: SpeechSink;
+  /**
+   * LAYA System-1 shadow recorder (docs/laya-system1.md): log-only per-turn
+   * classification; omitted (or its sidecar URL unset) keeps the gateway
+   * byte-for-byte on today's behavior.
+   */
+  layaShadow?: LayaShadowRecorder;
 }
 
 interface ProviderToolCallRecord {
@@ -213,6 +220,14 @@ export class LiveGatewaySession {
   // Deferred Hermes answers (async tools): receipt now, speech when ready.
   private readonly deferredAnswers = new Map<string, DeferredAnswerRecord>();
   private deferredAnswerEscalationTimer?: ReturnType<typeof setTimeout>;
+  // LAYA shadow pilot (docs/laya-system1.md): recent-transcript ring, active
+  // task titles, and the current turn's brain outcome accumulator. Log-only;
+  // nothing here may gate, rewrite, or delay a reply, task, or speech path.
+  private readonly shadowRecentTurns: Array<{ speaker: "user" | "assistant"; text: string }> = [];
+  private readonly shadowActiveTasks = new Map<string, string>();
+  private shadowTurnToolResults: Array<{ name: string; executionMode?: string; ok: boolean }> = [];
+  private shadowTurnTaskAccepted: boolean | null = null;
+  private lastTurnHadSpeech = true;
 
   constructor(
     private readonly client: ClientConnectionPort,
@@ -530,6 +545,9 @@ export class LiveGatewaySession {
         ...(this.protocolVersion >= 4 ? { conversation: this.conversation } : {}),
       });
       const initialSnapshotReason = initialTasks.length > 0 ? "reconnect" : "initial";
+      for (const record of activeTasks) {
+        if (!isTaskNotificationState(record.status)) this.shadowActiveTasks.set(record.taskId, record.title);
+      }
       if (projectedInitialTasks.length === 0) {
         this.send({
           type: "task.snapshot",
@@ -706,6 +724,7 @@ export class LiveGatewaySession {
           return;
         }
         this.userSpeaking = false;
+        this.lastTurnHadSpeech = true;
         await this.forwardRealtimeClientInput("audio turn", async () => {
           if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
         });
@@ -717,6 +736,7 @@ export class LiveGatewaySession {
           return;
         }
         this.userSpeaking = false;
+        this.lastTurnHadSpeech = false;
         await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(message.text), true);
         return;
       case "response.cancel":
@@ -1552,6 +1572,7 @@ export class LiveGatewaySession {
             this.failPublic("tool_call_failed", publicMessage, operationError, true);
           }
         }
+        if (!record.cancelled) this.recordShadowToolResult(call.name, response);
         response = boundedProviderToolResponse(response);
         record.state = "done";
         if (!record.cancelled) {
@@ -1867,11 +1888,13 @@ export class LiveGatewaySession {
       for (const input of held) {
         if (this.closing) return;
         if (input.kind === "text") {
+          this.lastTurnHadSpeech = false;
           await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(input.text), true);
           continue;
         }
         if (input.kind === "audio_end") {
           this.userSpeaking = false;
+          this.lastTurnHadSpeech = true;
           await this.forwardRealtimeClientInput("audio turn", async () => {
             if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
           });
@@ -1959,6 +1982,9 @@ export class LiveGatewaySession {
       if ((event.speaker ?? "assistant") === "user" && event.final) {
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
+        this.noteLayaShadowTurn(event.text);
+      } else if (event.final && event.speaker !== "system") {
+        this.recordShadowTurn(event.speaker ?? "assistant", event.text);
       }
       this.send({
         type: "transcript.delta",
@@ -2021,7 +2047,57 @@ export class LiveGatewaySession {
     } else {
       this.send({ type: "response.cancelled", ...(responseId ? { responseId } : {}) });
     }
+    // LAYA shadow: once the response settles with no tool output outstanding,
+    // the brain's behavior for this turn is known — join it into the pending
+    // row. The expected-turn/user-speaking guards keep a barge-in reordered
+    // event from finalizing the next turn's row before its own response ran.
+    if (this.pendingProviderToolCalls === 0 && !this.providerTurnResponseExpected && !this.userSpeaking) {
+      this.flushLayaShadowOutcome();
+    }
     this.scheduleNotificationFlush();
+  }
+
+  /**
+   * LAYA shadow pilot: classify the finalized user utterance against the
+   * budgeted recent-context state. Fire-and-forget — the sidecar fetch runs
+   * inside the recorder and must never delay this turn (docs/laya-system1.md).
+   */
+  private noteLayaShadowTurn(utterance: string): void {
+    this.flushLayaShadowOutcome();
+    const shadow = this.deps.layaShadow;
+    if (shadow) {
+      const built = buildLayaState({
+        utterance,
+        recentTurns: this.shadowRecentTurns,
+        activeTaskTitles: [...this.shadowActiveTasks.values()],
+      });
+      shadow.noteTurn(this.id, built, this.lastTurnHadSpeech, LAYA_SHADOW_QUESTIONS);
+    }
+    this.recordShadowTurn("user", utterance);
+  }
+
+  private recordShadowTurn(speaker: "user" | "assistant", text: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    this.shadowRecentTurns.push({ speaker, text: trimmed.slice(0, 400) });
+    if (this.shadowRecentTurns.length > 12) this.shadowRecentTurns.shift();
+  }
+
+  /** Join the brain's tool calls for the turn into the pending shadow row. */
+  private flushLayaShadowOutcome(): void {
+    const results = this.shadowTurnToolResults;
+    const taskAccepted = this.shadowTurnTaskAccepted;
+    this.shadowTurnToolResults = [];
+    this.shadowTurnTaskAccepted = null;
+    this.deps.layaShadow?.noteOutcome(this.id, results, taskAccepted);
+  }
+
+  private recordShadowToolResult(name: string, response: Record<string, unknown> | undefined): void {
+    const executionMode = typeof response?.execution_mode === "string" ? response.execution_mode : undefined;
+    this.shadowTurnToolResults.push({ name, ...(executionMode ? { executionMode } : {}), ok: response?.ok === true });
+    if (name === "start_background_task" || name === "follow_up_background_task" || name === "remember") {
+      this.shadowTurnTaskAccepted = this.shadowTurnTaskAccepted === true || response?.ok === true;
+    }
   }
 
   private receiveTaskRecord(record: TaskRecord): void {
@@ -2034,6 +2110,10 @@ export class LiveGatewaySession {
   }
 
   private dispatchTaskRecord(record: TaskRecord): void {
+    if (this.deps.layaShadow) {
+      if (isTaskNotificationState(record.status)) this.shadowActiveTasks.delete(record.taskId);
+      else this.shadowActiveTasks.set(record.taskId, record.title);
+    }
     const latestType = record.events.at(-1)?.type;
     const notificationMetadataOnly = latestType === "notification.announced"
       || latestType === "notification.acknowledged";
@@ -2351,6 +2431,7 @@ export class LiveGatewaySession {
 
   private async performClose(): Promise<void> {
     this.stopFiller();
+    this.flushLayaShadowOutcome();
     if (this.deferredAnswerEscalationTimer !== undefined) {
       clearTimeout(this.deferredAnswerEscalationTimer);
       this.deferredAnswerEscalationTimer = undefined;

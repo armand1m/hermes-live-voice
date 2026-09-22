@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Live Voice LAYA System-1 sidecar (shadow-mode turn classification, CPU)
+Documentation=file:///home/armand1m/Projects/mine/hermes-live-voice/docs/laya-system1.md
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__VENV_PYTHON__ __REPO__/tools/laya-sidecar/laya_sidecar.py
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=USE_TF=0
+Restart=on-failure
+RestartSec=10
+# ~2.8 GB RSS after load, 3.3 GB peak during predict; 4 GB hard fence.
+MemoryMax=4G
+# Yield cores to Parakeet STT + Qwen3-TTS (both CPU) under contention.
+Nice=10
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

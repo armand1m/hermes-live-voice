@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { cpus, loadavg } from "node:os";
+import { cpus, homedir, loadavg } from "node:os";
 import type { AddressInfo } from "node:net";
 import { basename, dirname } from "node:path";
 import type { Duplex } from "node:stream";
@@ -21,6 +21,11 @@ import type { LiveModelAdapter } from "../../../application/live-gateway/ports/r
 import { HermesClient } from "../../outbound/hermes/hermes-runs.client.js";
 import { createLiveModelAdapter } from "../../outbound/realtime/factory.js";
 import { sidecarTtsClientFromConfig } from "../../outbound/tts/local-tts.client.js";
+import {
+  defaultLayaShadowLogPath,
+  LayaShadowLog,
+  layaShadowRecorderFromConfig,
+} from "../../../application/live-gateway/laya-shadow.js";
 import { narratorClientFromConfig } from "../../outbound/narrator/narrator-llm.client.js";
 import { createTaskNarrationService, type TaskNarrationService } from "../../../application/live-gateway/task-narration.service.js";
 import { projectTaskSnapshot } from "../../../application/live-gateway/task-public-projection.js";
@@ -84,6 +89,13 @@ export async function startServer({
   const hermes = providedHermes ?? new HermesClient(config.hermes);
   const liveModel = providedLiveModel ?? createLiveModelAdapter(config);
   const speechSink = sidecarTtsClientFromConfig(config);
+  // LAYA System-1 shadow pilot: undefined (fully inert) unless HERMES_LIVE_LAYA_URL
+  // is set and shadow logging is enabled. Log-only; never gates behavior.
+  const layaShadow = layaShadowRecorderFromConfig(
+    config,
+    new LayaShadowLog({ filePath: defaultLayaShadowLogPath(homedir()), logger }),
+    logger,
+  );
   const speechDetection = providedSpeechDetection ?? createSpeechDetectionService(config, logger);
   const narrationClient = narratorClientFromConfig(config);
   const narration = providedNarration ?? (narrationClient
@@ -217,6 +229,7 @@ export async function startServer({
         logger,
         speechDetection,
         ...(speechSink ? { speechSink } : {}),
+        ...(layaShadow ? { layaShadow } : {}),
       });
       sessions.add(session);
       ws.once("close", () => {
