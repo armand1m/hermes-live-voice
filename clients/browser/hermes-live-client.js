@@ -1101,7 +1101,14 @@ export class HermesLiveAudio {
     this.playbackResumeContext = undefined;
     this.playbackResumePromise = undefined;
     this.cancelPlaybackResume = undefined;
-    this.unsubscribeClose = client.on?.("close", () => void this.dispose());
+    // A connection close used to mean a dead console, so the audio pipeline
+    // tore itself down. Reconnecting hosts pass disposeOnClientClose: false to
+    // keep the microphone warm across reconnects (frames buffer in preroll
+    // while disconnected and resume the moment the link returns).
+    this.disposeOnClientClose = options.disposeOnClientClose ?? true;
+    this.unsubscribeClose = client.on?.("close", () => {
+      if (this.disposeOnClientClose) void this.dispose();
+    });
     this.unsubscribeSpeechStarted = client.on?.("input.speech_started", (event) => {
       if (event?.provider === "gateway") this.onConfirmedSpeechStarted(event);
     });
@@ -1221,7 +1228,7 @@ export class HermesLiveAudio {
             this.inputLevel = activity.level;
             this.speechActive = activity.active;
             this.emitter.emit("input.level", activity);
-            if (activity.started) {
+            if (activity.started && this.client.connected) {
               for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
               preroll.length = 0;
             }
@@ -1241,8 +1248,10 @@ export class HermesLiveAudio {
             providerTailFrames = 0;
             this.interrupt("speech detected");
             this.emitter.emit("input.speech_started", activity);
-            for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
-            preroll.length = 0;
+            if (this.client.connected) {
+              for (const buffered of preroll) this.client.sendAudio(buffered, `audio/pcm;rate=${captureRate}`);
+              preroll.length = 0;
+            }
           }
           if (activity.stopped) providerTailFrames = 8;
           if (providerTailFrames > 0) providerTailFrames -= 1;

@@ -1,4 +1,5 @@
 import { HermesLiveClient, HermesLiveAudio } from "./hermes-live-client.js";
+import { ConnectionSupervisor, formatSeconds, isConnectionErrorCode } from "./connection-supervisor.js";
 import { AgentStateController, SpeechAnalysis, TextVisemeScheduler, VisemeEstimator } from "./entity-state.js";
 import { VoiceEntityScene } from "./entity-scene.js";
 import { createDiagnosticsOverlay } from "./diagnostics.js";
@@ -20,6 +21,7 @@ const presenceLabel = document.querySelector("#presence-label");
 const presenceDetail = document.querySelector("#presence-detail");
 const inputSignal = document.querySelector("#signal-input");
 const outputSignal = document.querySelector("#signal-output");
+const reconnectButton = document.querySelector("#reconnect");
 
 // The operator can bootstrap a tab with #token=... once. Keep it only in
 // sessionStorage so reloads do not require the secret again, while closing
@@ -37,6 +39,8 @@ const noSfx = hashParams.has("no-sfx")
 // raw gateway text per tab.
 const noTaskAi = hashParams.has("no-ai")
   || new URLSearchParams(location.search).get("no-ai") === "1";
+const noReconnect = hashParams.has("no-reconnect")
+  || new URLSearchParams(location.search).get("no-reconnect") === "1";
 let token;
 try {
   if (hashToken) sessionStorage.setItem(tokenKey, hashToken);
@@ -57,7 +61,35 @@ url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
 // Persistent mode lets the gateway resolve the durable per-user voice thread,
 // so every tab, browser restart, and device continues the same conversation.
 const client = new HermesLiveClient({ url: url.href, token, conversation: { mode: "persistent" } });
-const audio = new HermesLiveAudio(client, { workletUrl: `${mountPath}/mic-worklet.js` });
+// disposeOnClientClose keeps the microphone warm across reconnects: capture
+// frames buffer in preroll while the link is down and resume without a new
+// getUserMedia once it returns. Without auto-reconnect, a close still tears
+// the audio pipeline down as before.
+const audio = new HermesLiveAudio(client, {
+  workletUrl: `${mountPath}/mic-worklet.js`,
+  disposeOnClientClose: noReconnect,
+});
+
+// Connection supervision: the client SDK reports loss; this layer retries
+// with exponential backoff and keeps the loss visible. `#no-reconnect` /
+// `?no-reconnect=1` restores the previous single-shot connect behavior.
+const supervisor = new ConnectionSupervisor(client, {
+  conversation: { mode: "persistent" },
+  fetchStatus: () => fetch(`${mountPath}/status.json`, { headers: { Accept: "application/json" } })
+    .then(async (response) => {
+      if (!response.ok) return null;
+      const parsed = await response.json();
+      return {
+        reachable: true,
+        provider: parsed.provider?.name ?? null,
+        model: parsed.provider?.model ?? null,
+        providerReachable: typeof parsed.providerProbe?.reachable === "boolean"
+          ? parsed.providerProbe.reachable
+          : null,
+      };
+    })
+    .catch(() => null),
+});
 
 // ---------------------------------------------------------------------------
 // Visual state pipeline: voice events → AgentStateController → scene.
@@ -134,9 +166,25 @@ function showError(event) {
   showError.noticeTimer = window.setTimeout(() => { notice.hidden = true; }, 5200);
 }
 
-client.on("error", showError);
-audio.on("error", showError);
-client.on("session.error", showError);
+function handleClientError(event) {
+  if (!noReconnect) {
+    // While the supervisor owns the link, connection-class failures and
+    // mid-attempt session errors are retry outcomes, not new alarms: the
+    // reconnect status line is the honest display for them.
+    if (isConnectionErrorCode(event.code)) return;
+    if (!client.connected) return;
+  }
+  showError(event);
+}
+
+client.on("error", handleClientError);
+audio.on("error", (event) => {
+  // Speech that starts while disconnected cannot be sent; the reconnect
+  // status line already explains the outage, so do not alarm for it.
+  if (!noReconnect && event.code === "audio_send_failed" && !client.connected) return;
+  showError(event);
+});
+client.on("session.error", handleClientError);
 client.on("session.ready", (event) => {
   controller.connectionState("ready");
   const sessionId = event.conversation?.sessionId;
@@ -154,10 +202,97 @@ client.on("statechange", (event) => {
   controller.connectionState(map[event.state] || "connecting");
 });
 client.on("close", () => {
-  status("offline", "Disconnected");
-  detail.textContent = "";
   mute.disabled = true;
 });
+
+// --- reconnect status surface -------------------------------------------------
+// One renderer for both the supervisor's change events and the frame loop's
+// countdown ticks: the headline must stay truthful second by second.
+function reconnectCopy(snapshot) {
+  const attempt = Math.max(1, Number(snapshot.attempt) || 1);
+  if (snapshot.state === "connecting") {
+    return snapshot.everConnected
+      ? ["reconnecting", `Reconnecting — attempt ${attempt} in progress…`, "The voice link dropped. Reconnecting now."]
+      : ["connecting", "Connecting…", "Allow microphone access to listen continuously."];
+  }
+  const next = formatSeconds(snapshot.nextAttemptInMs ?? 0);
+  if (snapshot.everConnected && snapshot.gateway === null) {
+    return [
+      "gateway-down",
+      `Gateway not reachable — retrying; press Reconnect now to force (attempt ${attempt}, next in ${next})`,
+      "The gateway did not answer. Attempts continue automatically.",
+    ];
+  }
+  if (snapshot.gateway?.providerReachable === false) {
+    return [
+      "reconnecting",
+      `Voice pipeline down — reconnecting (attempt ${attempt}, next in ${next})`,
+      "The gateway is up, but its speech-to-speech link is not answering yet.",
+    ];
+  }
+  return snapshot.everConnected
+    ? [
+        "reconnecting",
+        `Connection lost — reconnecting (attempt ${attempt}, next in ${next})`,
+        "The voice link dropped. In-flight audio was lost.",
+      ]
+    : [
+        "connecting",
+        `Connecting — attempt ${attempt}, next in ${next}`,
+        "The voice gateway is not answering yet.",
+      ];
+}
+
+let micRequested = false;
+function renderReconnectStatus(change) {
+  const snapshot = supervisor.status;
+  if (snapshot.state === "connected") {
+    reconnectButton.hidden = true;
+    mute.disabled = false;
+    // A recovery must not leave a stale reconnect headline behind when the
+    // presence mode happened not to change across the outage.
+    if (["reconnecting", "gateway-down"].includes(state.dataset.state)) {
+      if (audio.microphoneActive) {
+        status("armed", "Listening");
+        detail.textContent = "Reconnected. You can keep talking.";
+      } else {
+        status("muted", "Reconnected");
+        detail.textContent = "The voice link is back. Unmute when you’re ready.";
+      }
+    }
+    if (!micRequested) {
+      // Auto-arm continuous capture on first connect (previous boot behavior).
+      micRequested = true;
+      audio.startMicrophone().catch(() => { micRequested = false; mute.textContent = "Unmute"; });
+    } else if (!audio.microphoneActive) {
+      audio.startMicrophone().catch(() => undefined);
+    }
+    if (change?.message) logSystemLine(change.message);
+    return;
+  }
+  if (snapshot.state !== "reconnecting" && snapshot.state !== "connecting") return;
+  const [stateValue, headline, detailText] = reconnectCopy(snapshot);
+  status(stateValue, headline);
+  detail.textContent = detailText;
+  const offerButton = snapshot.state === "reconnecting" || snapshot.attempt > 1;
+  reconnectButton.hidden = !offerButton;
+  notice.hidden = true;
+  if (change?.message) logSystemLine(change.message);
+}
+
+/** Timestamped system row in both transcript views + console, for connection history. */
+function logSystemLine(text) {
+  const clock = new Date().toTimeString().slice(0, 8);
+  addTaskRow(`⟳ ${clock} ${text}`);
+  console.info(`[hermes-live] ${clock} ${text}`);
+}
+
+reconnectButton.addEventListener("click", () => {
+  logSystemLine("Reconnect requested now.");
+  void supervisor.forceReconnect("button");
+});
+
+supervisor.on("change", renderReconnectStatus);
 
 // --- microphone ------------------------------------------------------------
 audio.on("microphone", (event) => {
@@ -435,8 +570,8 @@ mute.addEventListener("click", async () => {
   sfx.prime();
   mute.disabled = true;
   try {
-    if (audio.microphoneActive) await audio.stopMicrophone({ endTurn: true });
-    else { await audio.primePlayback(); await audio.startMicrophone(); }
+    if (audio.microphoneActive) { micRequested = false; await audio.stopMicrophone({ endTurn: true }); }
+    else { await audio.primePlayback(); micRequested = true; await audio.startMicrophone(); }
   } catch (e) { showError(e); } finally { mute.disabled = !client.connected; }
 });
 
@@ -489,6 +624,14 @@ function frame(now) {
       state.textContent = copy[0];
       detail.textContent = copy[1];
     }
+  }
+
+  // Live "next attempt in Xs" countdown while a reconnect is scheduled.
+  if (!noReconnect && !client.connected
+    && (supervisor.state === "reconnecting" || supervisor.state === "connecting")) {
+    const [stateValue, headline] = reconnectCopy(supervisor.status);
+    if (state.dataset.state !== stateValue) state.dataset.state = stateValue;
+    if (headline && headline !== state.textContent) state.textContent = headline;
   }
 
   // Visemes: real outgoing-audio analysis, overridden by the synthetic debug
@@ -585,7 +728,7 @@ function frame(now) {
 
 if (devMode) {
   // Development introspection handle (never defined in production).
-  window.__entity = { controller, scene, audio, client, mouth, analysis, sfx };
+  window.__entity = { controller, scene, audio, client, supervisor, mouth, analysis, sfx };
 }
 if (devMode && !webglFailed) {
   import("./entity-debug.js").then(({ createDebugPanel }) => {
@@ -607,19 +750,22 @@ if (devMode && !webglFailed) {
 // ---------------------------------------------------------------------------
 
 async function boot() {
-  try {
-    await client.connect();
-    mute.disabled = false;
-    await audio.startMicrophone();
-  } catch (e) {
-    // A deleted or expired thread should not strand the standalone console:
-    // the gateway re-resolves the durable thread, so retry once before erroring.
+  if (noReconnect) {
+    // Escape hatch: single-shot connect with the historical one-retry fallback.
     try {
-      await client.connect({ conversation: { mode: "persistent" } });
+      await client.connect();
       mute.disabled = false;
       await audio.startMicrophone();
-    } catch (retryError) { showError(retryError); mute.textContent = "Unmute"; }
+    } catch (e) {
+      try {
+        await client.connect({ conversation: { mode: "persistent" } });
+        mute.disabled = false;
+        await audio.startMicrophone();
+      } catch (retryError) { showError(retryError); mute.textContent = "Unmute"; }
+    }
+    return;
   }
+  supervisor.start();
 }
 
 // Pointer parallax: secondary to voice, ignored entirely for reduced motion.
@@ -879,6 +1025,7 @@ window.addEventListener("pagehide", (event) => {
   // Silence cues before the audio pipeline tears down: dispose() emits a
   // trailing idle microphone event that must not chirp on the way out.
   sfx.dispose();
+  supervisor.stop();
   void audio.dispose();
   void client.disconnect();
 }, { once: true });

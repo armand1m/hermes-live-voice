@@ -287,6 +287,13 @@ export interface HermesLiveAudioOptions {
   maxQueuedAudioFrames?: number;
   playbackResumeTimeoutMs?: number;
   playbackLeadMs?: number;
+  /**
+   * Tear the audio pipeline down when the client connection closes (default).
+   * Reconnecting hosts pass false to keep the microphone warm across
+   * reconnects: capture frames buffer in preroll while disconnected and
+   * resume the moment the link returns.
+   */
+  disposeOnClientClose?: boolean;
   mediaDevices?: Pick<MediaDevices, "getUserMedia">;
   audioContextFactory?: (options: AudioContextOptions) => AudioContext;
   audioWorkletNodeFactory?: (

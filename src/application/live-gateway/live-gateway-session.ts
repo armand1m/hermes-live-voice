@@ -150,6 +150,16 @@ export class LiveGatewaySession {
   private readySent = false;
   private closing = false;
   private closePromise?: Promise<void>;
+  /**
+   * Gateway↔provider (s2s) link state, surfaced through GET /status.json so a
+   * reconnecting browser can tell "gateway down" from "voice pipeline down".
+   */
+  private providerLink: {
+    state: "starting" | "attached" | "detached";
+    attachedAt?: number;
+    detachedAt?: number;
+    lastDetach?: { code?: number; reason: string; at: number };
+  } = { state: "detached" };
   private sessionKey?: string;
   private ownerId?: string;
   private profileId = "default";
@@ -346,6 +356,7 @@ export class LiveGatewaySession {
       void providerOpen.catch(() => undefined);
 
       const availableTools = this.availableProviderTools();
+      this.providerLink = { state: "starting", lastDetach: this.providerLink.lastDetach };
       const connect = this.deps.liveModel.connect({
         sessionId: this.id,
         systemInstruction: [
@@ -374,9 +385,31 @@ export class LiveGatewaySession {
         callbacks: {
           onOpen: () => {
             providerOpened = true;
+            this.providerLink = {
+              state: "attached",
+              attachedAt: Date.now(),
+              lastDetach: this.providerLink.lastDetach,
+            };
+            this.deps.logger.info("realtime provider attached", {
+              sessionId: this.id,
+              provider: this.deps.config.realtime.provider,
+              model: this.deps.config.realtime.model,
+            });
             resolveOpen();
           },
           onClose: (event) => {
+            this.providerLink = {
+              state: "detached",
+              attachedAt: this.providerLink.attachedAt,
+              detachedAt: Date.now(),
+              lastDetach: {
+                ...(typeof (event as { code?: unknown })?.code === "number"
+                  ? { code: (event as { code: number }).code }
+                  : {}),
+                reason: boundedText(String((event as { reason?: unknown })?.reason ?? ""), 200),
+                at: Date.now(),
+              },
+            };
             if (!this.readySent) {
               rejectOpen(new Error("Realtime provider session closed before ready."));
               return;
@@ -2436,6 +2469,31 @@ export class LiveGatewaySession {
    */
   speechTimingMetrics(): SpeechTimingMetrics {
     return this.speechTiming.metrics();
+  }
+
+  /**
+   * Gateway↔provider (s2s) link state for GET /status.json: whether this
+   * session's speech pipeline is attached, and when/why it last detached.
+   */
+  providerLinkStatus(now = Date.now()): {
+    state: "starting" | "attached" | "detached";
+    provider: string;
+    model: string;
+    attachedMsAgo: number | null;
+    detachedMsAgo: number | null;
+    lastDetach: { code?: number; reason: string; msAgo: number } | null;
+  } {
+    const link = this.providerLink;
+    return {
+      state: link.state,
+      provider: this.deps.config.realtime.provider,
+      model: this.deps.config.realtime.model,
+      attachedMsAgo: link.attachedAt === undefined ? null : Math.max(0, now - link.attachedAt),
+      detachedMsAgo: link.detachedAt === undefined ? null : Math.max(0, now - link.detachedAt),
+      lastDetach: link.lastDetach
+        ? { ...link.lastDetach, msAgo: Math.max(0, now - link.lastDetach.at) }
+        : null,
+    };
   }
 
   private handleClientMessageFailure(error: unknown, requestId?: string): void {

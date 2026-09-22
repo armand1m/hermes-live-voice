@@ -1634,6 +1634,61 @@ describe("realtime provider lifecycle boundaries", () => {
     await expect(client.messages.waitForClose()).resolves.toMatchObject({ code: 1011 });
   });
 
+  it("surfaces provider attach state on /status.json and re-attaches for the next reconnecting client", async () => {
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await readyClient(server.url);
+
+    // Attached: the surface a reconnecting browser polls reports the link.
+    const attached = await fetch(`${server.url}/status.json`).then((response) => response.json());
+    expect(attached).toMatchObject({
+      status: "ok",
+      provider: { name: "mock", model: "test-live-model" },
+      sessions: { browser: 1, providerAttached: 1, providerStarting: 0 },
+    });
+    expect(attached.uptimeMs).toEqual(expect.any(Number));
+    expect(attached.providerLinks[0]).toMatchObject({ state: "attached", provider: "mock", model: "test-live-model" });
+    expect(attached.providerProbe).toBeNull(); // mock provider has no remote target to probe
+    expect(vi.mocked(logger.info).mock.calls.some(([message]) => message === "realtime provider attached")).toBe(true);
+
+    // The speech pipeline drops: the browser link is closed with 1011 (the
+    // browser's reconnect policy owns recovery) and the dead session does not
+    // linger in the status surface.
+    provider.closeFromProvider({ code: 1011, reason: "s2s restarted" });
+    await expect(client.messages.wait("session.error", (message) => message.code === "realtime_provider_closed")).resolves
+      .toMatchObject({ recoverable: true });
+    await expect(client.messages.waitForClose()).resolves.toMatchObject({ code: 1011 });
+    await waitUntil(async () => (await fetch(`${server.url}/status.json`).then((r) => r.json())).sessions.browser === 0);
+
+    // The pipeline is back: the next browser reconnect attaches a fresh
+    // provider session — the gateway never stays dead over a restarted s2s.
+    const second = await readyClient(server.url);
+    expect(provider.connections).toHaveLength(2);
+    const reattached = await fetch(`${server.url}/status.json`).then((response) => response.json());
+    expect(reattached.sessions).toMatchObject({ browser: 1, providerAttached: 1 });
+    expect(reattached.providerLinks[0]).toMatchObject({ state: "attached" });
+    expect(second.ready).toBeTruthy();
+    expect(vi.mocked(logger.info).mock.calls.filter(([message]) => message === "realtime provider attached")).toHaveLength(2);
+  });
+
+  it("probes the configured speech-to-speech origin from /status.json for reconnecting clients", async () => {
+    const config = {
+      ...testConfig(),
+      realtime: { provider: "local", model: "local-voice" },
+      // Nothing listens on port 1: the probe must report the s2s link as down
+      // without touching the single realtime pipeline slot.
+      local: { url: "ws://127.0.0.1:1/v1/realtime" },
+    } as AppConfig;
+    const server = await startTestServer({ config, hermes: new HermesHarness(), provider: new RecordingLiveAdapter() });
+
+    const body = await fetch(`${server.url}/status.json`).then((response) => response.json());
+    expect(body.provider).toMatchObject({ name: "local", model: "local-voice" });
+    expect(body.providerProbe).toMatchObject({ reachable: false, target: "http://127.0.0.1:1" });
+    expect(typeof body.providerProbe.latencyMs).toBe("number");
+    expect(body.providerProbe.error).toEqual(expect.any(String));
+  });
+
   it("keeps accepted Hermes work durable when the realtime provider dies", async () => {
     const config = testConfig();
     const hermes = new HermesHarness();

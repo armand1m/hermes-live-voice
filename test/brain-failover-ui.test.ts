@@ -60,7 +60,7 @@ describe("createDiagnosticsOverlay brain indicator", () => {
     vi.stubGlobal("performance", { now: () => Date.now() });
 
     let statusPayload: any = { kind: "primary", brain: "qwen3.8-27b", ts: new Date().toISOString() };
-    const fetchMock = vi.fn(async (url: string) => ({
+    const fetchMock = vi.fn(async (_url: string) => ({
       ok: true,
       json: async () => statusPayload,
     }));
