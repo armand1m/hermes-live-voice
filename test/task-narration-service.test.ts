@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import {
   createTaskNarrationService,
   narrationFactSheet,
@@ -41,8 +41,8 @@ describe("narrationFactSheet", () => {
       parentTaskId: "task_ffffffffffffffff",
       state: "failed",
       result: undefined,
-      error: { code: "TASK_TIMEOUT", message: "worker exceeded its budget" },
-    };
+      error: { code: "TASK_TIMEOUT", message: "worker exceeded its budget", recoverable: false },
+    } as const;
     const sheet = narrationFactSheet(input);
     expect(sheet).toContain("state: failed");
     expect(sheet).toContain("lineage: follow-up task of task_ffffffffffffffff");
@@ -106,7 +106,7 @@ describe("createTaskNarrationService", () => {
     vi.useFakeTimers();
     try {
       const boom = fakeClient();
-      (boom as unknown as { summarize: vi.fn }).summarize
+      (boom as unknown as { summarize: Mock }).summarize
         .mockRejectedValueOnce(new Error("LLM responded 500"))
         .mockResolvedValueOnce("**Recovered**");
       const service = createTaskNarrationService({ client: boom, failureTtlMs: 1_000 });
@@ -116,11 +116,11 @@ describe("createTaskNarrationService", () => {
       // …and the revision is quarantined: the next caller fails fast without
       // touching the LLM again (a 5xx may have crashed the model server).
       await expect(service.narrate(SNAPSHOT)).rejects.toThrow("quarantined");
-      expect((boom as unknown as { summarize: vi.fn }).summarize).toHaveBeenCalledTimes(1);
+      expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(1);
 
       await vi.advanceTimersByTimeAsync(1_100);
       await expect(service.narrate(SNAPSHOT)).resolves.toMatchObject({ markdown: "**Recovered**" });
-      expect((boom as unknown as { summarize: vi.fn }).summarize).toHaveBeenCalledTimes(2);
+      expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
