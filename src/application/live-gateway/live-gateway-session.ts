@@ -49,12 +49,17 @@ import type { VoiceArbiter } from "./voice-arbiter.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
 import {
+  TASK_REVIEW_THRESHOLD_MS,
   isTaskNotificationState,
   projectSupersededTaskNotification,
   projectTaskLifecycle,
   projectTaskNotification,
   projectTaskSnapshot,
 } from "./task-public-projection.js";
+import {
+  buildQueueSupervision,
+  type TaskQueueSupervisionView,
+} from "../task-supervisor/task-queue-supervision.js";
 
 const MAX_PENDING_PROVIDER_EVENTS = 256;
 const MAX_PENDING_PROVIDER_EVENT_BYTES = 8 * 1024 * 1024;
@@ -539,7 +544,7 @@ export class LiveGatewaySession {
         ...unreadTasks,
         ...recentWindow.slice(0, MAX_PUBLIC_TASKS),
       ]);
-      const projectedInitialTasks = projectTaskList(initialTasks);
+      const projectedInitialTasks = projectTaskList(initialTasks, this.taskSupervisionContext(initialTasks));
       const initialSnapshotTruncated = recentWindow.length > MAX_PUBLIC_TASKS
         || projectedInitialTasks.length > MAX_PUBLIC_TASKS;
       this.send({
@@ -806,7 +811,7 @@ export class LiveGatewaySession {
           type: "task.snapshot",
           reason: "list",
           requestId: message.id,
-          tasks: projectTaskList(tasks),
+          tasks: projectTaskList(tasks, this.taskSupervisionContext(tasks)),
           truncated: taskWindow.length > message.limit,
         });
         return;
@@ -816,11 +821,26 @@ export class LiveGatewaySession {
           () => this.deps.taskSupervisor.get(this.ownerId!, message.taskId),
           "Unable to read that background task.",
         );
+        // A queued task's snapshot is only truthful with its queue context:
+        // position and what is holding the slot ahead of it.
+        const peers = task?.status === "queued"
+          ? await this.runTaskOperation(
+              () => this.deps.taskSupervisor.list(this.ownerId!),
+              "Unable to read the background task queue.",
+            )
+          : undefined;
+        const supervision = this.taskSupervisionContext(peers ?? (task ? [task] : []));
         this.send({
           type: "task.snapshot",
           reason: "get",
           requestId: message.id,
-          tasks: task ? [projectTaskSnapshot(task, { includeOutput: true })] : [],
+          tasks: task
+            ? [projectTaskSnapshot(task, {
+                includeOutput: true,
+                now: supervision.now,
+                ...(supervision.queue.get(task.taskId) ? { queue: supervision.queue.get(task.taskId) } : {}),
+              })]
+            : [],
           truncated: false,
         });
         return;
@@ -1406,10 +1426,16 @@ export class LiveGatewaySession {
         ).then((records) => {
           const selected = records
             .filter((record) => includeCompleted || !isTaskNotificationState(record.status));
+          const supervision = this.taskSupervisionContext(records, { forClient: false });
           return {
-            ...(summaryOnly ? { spoken_response: taskInboxSpokenSummary(selected) } : {}),
+            ...(summaryOnly ? { spoken_response: taskInboxSpokenSummary(selected, supervision.now) } : {}),
             ok: true,
-            tasks: selected.map((record) => projectTaskSnapshot(record)),
+            tasks: selected.map((record) => projectTaskSnapshot(record, {
+              now: supervision.now,
+              ...(supervision.queue.get(record.taskId)
+                ? { queue: supervision.queue.get(record.taskId) }
+                : {}),
+            })),
           };
         });
       }
@@ -1443,7 +1469,9 @@ export class LiveGatewaySession {
           ...(title ? { title } : {}),
           ...(this.conversation.sessionId ? { originConversationId: this.conversation.sessionId } : {}),
         }), "Unable to start that task follow-up.").then((task) => ({
-          spoken_response: "I've started that follow-up in the background.",
+          spoken_response: task.status === "queued"
+            ? "Your follow-up is queued. I’ll report when execution starts; you can keep talking."
+            : "Hermes has accepted your follow-up. I’ll keep you updated as it works.",
           ok: true,
           task_id: task.taskId,
           parent_task_id: task.parentTaskId,
@@ -1459,7 +1487,9 @@ export class LiveGatewaySession {
           () => this.deps.taskSupervisor.stop(this.ownerId!, taskId, optionalStringArg(call, "reason")),
           "Unable to stop that background task safely.",
         ).then((task) => ({
-          spoken_response: "I've asked Hermes to stop that task.",
+          spoken_response: task.status === "cancelled"
+            ? "That task is cancelled; it never started running."
+            : "I've asked Hermes to stop that task.",
           ok: true,
           task_id: task.taskId,
           status: projectTaskSnapshot(task).state,
@@ -2753,6 +2783,29 @@ export class LiveGatewaySession {
     });
   }
 
+  /**
+   * Supervision context for task projections (plan §A): queue placement and
+   * stall review are v11-only on the client protocol; provider tool payloads
+   * always include them so spoken status answers can distinguish queued from
+   * running work regardless of the browser client's version.
+   */
+  private taskSupervisionContext(
+    records: readonly TaskRecord[],
+    options: { forClient: boolean } = { forClient: true },
+  ): {
+    now: number;
+    queue: ReadonlyMap<string, TaskQueueSupervisionView>;
+  } {
+    if (options.forClient && this.protocolVersion < 11) return { now: 0, queue: new Map() };
+    return {
+      now: Date.now(),
+      queue: buildQueueSupervision(records, {
+        maxConcurrent: this.deps.config.tasks.maxConcurrent,
+        trustDeclaredReadOnly: this.deps.config.tasks.trustDeclaredReadOnly === true,
+      }),
+    };
+  }
+
   private runTaskOperation<T>(operation: () => Promise<T>, fallbackMessage: string): Promise<T> {
     return Promise.resolve().then(operation).catch((error) => {
       throw new PublicTaskOperationError(publicTaskOperationMessage(error, fallbackMessage), error);
@@ -2836,8 +2889,15 @@ function publicTaskOperationMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-function projectTaskList(records: TaskRecord[]): PublicTaskSnapshot[] {
-  return records.map((record) => projectTaskSnapshot(record));
+function projectTaskList(
+  records: TaskRecord[],
+  supervision: { now: number; queue: ReadonlyMap<string, TaskQueueSupervisionView> } = { now: 0, queue: new Map() },
+): PublicTaskSnapshot[] {
+  return records.map((record) =>
+    projectTaskSnapshot(record, {
+      ...(supervision.now > 0 ? { now: supervision.now } : {}),
+      ...(supervision.queue.get(record.taskId) ? { queue: supervision.queue.get(record.taskId) } : {}),
+    }));
 }
 
 function mergeTaskRecords(records: TaskRecord[]): TaskRecord[] {
@@ -2990,13 +3050,19 @@ function boundedProviderToolResponse(response: Record<string, unknown>): Record<
     : { ok: false, error: "Task result exceeded the safe provider response limit." };
 }
 
-function taskInboxSpokenSummary(records: readonly TaskRecord[]): string {
+function taskInboxSpokenSummary(records: readonly TaskRecord[], now = Date.now()): string {
   if (!records.length) return "Your background task inbox is empty.";
   const count = (states: string[]) => records.filter((record) => states.includes(record.status)).length;
+  const needsReview = records.filter((record) =>
+    record.status === "running"
+    && now - (record.lastMeaningfulProgressAt ?? record.lastActivityAt ?? record.createdAt)
+      >= TASK_REVIEW_THRESHOLD_MS).length;
+  const running = count(["running", "dispatching"]);
   const parts = [
-    [count(["running", "dispatching"]), "running"],
+    [running - needsReview, "running"],
     [count(["queued"]), "queued"],
     [count(["delegated"]), "delegated to external agents"],
+    [needsReview, "running without verified progress and needing review"],
     [count(["stopping", "waiting_for_approval"]), "awaiting attention"],
     [count(["completed", "failed", "cancelled"]), "finished"],
     [count(["unknown", "dispatch_unknown"]), "with an uncertain outcome"],

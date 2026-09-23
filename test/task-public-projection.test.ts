@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acknowledgeTaskNotification,
+  appendTaskActivity,
   appendTaskEvent,
   createTaskRecord,
   markTaskStopRequested,
@@ -8,14 +9,97 @@ import {
   transitionTask,
 } from "../src/domain/tasks/index.js";
 import {
+  TASK_REVIEW_THRESHOLD_MS,
   notificationIdForTask,
   projectSupersededTaskNotification,
   projectTaskLifecycle,
   projectTaskNotification,
   projectTaskSnapshot,
 } from "../src/application/live-gateway/task-public-projection.js";
+import { buildQueueSupervision } from "../src/application/task-supervisor/task-queue-supervision.js";
 
 describe("task public projection", () => {
+  it("exposes queue position and blockers for queued tasks (v11 supervision)", () => {
+    const running = transitionTask(
+      transitionTask(
+        createTaskRecord({ ownerIdentity: "owner", input: "Diamond indicator fix", now: 10 }),
+        "dispatching",
+        { now: 11 },
+      ),
+      "running",
+      { now: 12, runId: "run_diamond" },
+    );
+    const queuedFirst = createTaskRecord({
+      ownerIdentity: "owner",
+      input: "Archive the persona files",
+      now: 13,
+    });
+    const queuedSecond = createTaskRecord({
+      ownerIdentity: "owner",
+      input: "Inspect the Mac mini",
+      now: 14,
+    });
+    const supervision = buildQueueSupervision([running, queuedFirst, queuedSecond], {
+      maxConcurrent: 1,
+      trustDeclaredReadOnly: false,
+    });
+
+    // The active exclusive task holds the only slot: both queued tasks are
+    // behind it, and their positions are truthful FIFO placement.
+    expect(supervision.get(queuedFirst.taskId)).toEqual({
+      position: 1,
+      blockedBy: [{ taskId: running.taskId, title: running.title, reason: "capacity" }],
+    });
+    expect(supervision.get(queuedSecond.taskId)).toMatchObject({ position: 2 });
+    expect(supervision.get(running.taskId)).toBeUndefined();
+
+    const snapshot = projectTaskSnapshot(queuedFirst, {
+      queue: supervision.get(queuedFirst.taskId),
+    });
+    expect(snapshot.queue).toEqual({
+      position: 1,
+      blockedBy: [{ taskId: running.taskId, title: "Diamond indicator fix", reason: "capacity" }],
+    });
+    // Supervision fields are opt-in: a projection without them (pre-v11
+    // clients) emits neither queue placement nor attention state.
+    expect(projectTaskSnapshot(queuedFirst)).not.toHaveProperty("queue");
+    expect(JSON.stringify(projectTaskSnapshot(queuedFirst))).not.toContain("needs_review");
+  });
+
+  it("flags ten minutes without verified progress as needs_review with evidence", () => {
+    const started = 1_000_000;
+    const running = transitionTask(
+      transitionTask(
+        createTaskRecord({ ownerIdentity: "owner", input: "Long investigation", now: started }),
+        "dispatching",
+        { now: started + 1 },
+      ),
+      "running",
+      { now: started + 2, runId: "run_slow" },
+    );
+    const withActivity = appendTaskActivity(running, {
+      summary: "Hermes is using terminal: grep visualizer",
+      now: started + 3,
+      meaningfulAt: started + 3,
+    });
+
+    // Fresh task: no review flag even when the projection clock advances a bit.
+    expect(projectTaskSnapshot(withActivity, { now: started + 3 + TASK_REVIEW_THRESHOLD_MS - 1 }))
+      .not.toHaveProperty("attention");
+
+    // Past the threshold with no verified finding since: flag it, with the
+    // duration and the last retained evidence — and no claim of failure.
+    const stale = projectTaskSnapshot(withActivity, { now: started + 3 + TASK_REVIEW_THRESHOLD_MS + 120_000 });
+    expect(stale.attention).toMatchObject({
+      state: "needs_review",
+      stalledForMs: TASK_REVIEW_THRESHOLD_MS + 120_000,
+    });
+    expect(stale.attention!.evidence).toContain("No verified progress for 12 minutes");
+    expect(stale.attention!.evidence).toContain("grep visualizer");
+    expect(stale.attention!.evidence).not.toContain("failed");
+    expect(stale.state).toBe("running");
+  });
+
   it("projects retained tool activity as live progress instead of repeating task.started", () => {
     const queued = createTaskRecord({ ownerIdentity: "owner", input: "Inspect", now: 10 });
     const dispatching = transitionTask(queued, "dispatching", { now: 20 });

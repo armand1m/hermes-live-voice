@@ -145,6 +145,37 @@ export const PublicTaskErrorSchema = z
   .strict();
 export type PublicTaskError = z.infer<typeof PublicTaskErrorSchema>;
 
+/**
+ * Protocol v11 supervision fields (plan §A): truthful queue placement and
+ * stall review. Emitted only to v11 clients; the schemas accept them so the
+ * client-side contract stays one shape.
+ */
+export const TaskQueueBlockerSchema = z
+  .object({
+    taskId: TaskIdSchema,
+    title: z.string().min(1).max(PUBLIC_TASK_TITLE_MAX_CHARS),
+    reason: z.enum(["capacity", "conflicting_write"]),
+  })
+  .strict();
+export type TaskQueueBlocker = z.infer<typeof TaskQueueBlockerSchema>;
+
+export const TaskQueueSupervisionSchema = z
+  .object({
+    position: z.number().int().positive(),
+    blockedBy: z.array(TaskQueueBlockerSchema).max(4),
+  })
+  .strict();
+export type TaskQueueSupervision = z.infer<typeof TaskQueueSupervisionSchema>;
+
+export const TaskAttentionSchema = z
+  .object({
+    state: z.literal("needs_review"),
+    stalledForMs: z.number().int().nonnegative(),
+    evidence: z.string().min(1).max(500),
+  })
+  .strict();
+export type TaskAttention = z.infer<typeof TaskAttentionSchema>;
+
 export const PublicTaskSnapshotSchema = z
   .object({
     taskId: TaskIdSchema,
@@ -159,6 +190,8 @@ export const PublicTaskSnapshotSchema = z
     startedAt: PublicTimestampSchema.optional(),
     finishedAt: PublicTimestampSchema.optional(),
     progress: PublicTaskProgressSchema.optional(),
+    queue: TaskQueueSupervisionSchema.optional(),
+    attention: TaskAttentionSchema.optional(),
     result: PublicTaskResultSchema.optional(),
     error: PublicTaskErrorSchema.optional(),
   })

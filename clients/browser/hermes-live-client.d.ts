@@ -68,8 +68,27 @@ export interface HermesLiveTask {
   startedAt?: number;
   finishedAt?: number;
   progress?: HermesLiveTaskProgress;
+  /** Protocol v11: queue placement, emitted only for queued tasks. */
+  queue?: HermesLiveTaskQueueSupervision;
+  /** Protocol v11: stall review, emitted only for running tasks past the threshold. */
+  attention?: HermesLiveTaskAttention;
   result?: HermesLiveTaskResult;
   error?: HermesLiveTaskError;
+}
+
+export interface HermesLiveTaskQueueSupervision {
+  position: number;
+  blockedBy: Array<{
+    taskId: string;
+    title: string;
+    reason: "capacity" | "conflicting_write";
+  }>;
+}
+
+export interface HermesLiveTaskAttention {
+  state: "needs_review";
+  stalledForMs: number;
+  evidence: string;
 }
 
 export interface HermesLiveTaskNotification {

@@ -4,14 +4,22 @@ import type {
   PublicTaskSnapshot,
   ServerMessage,
   TaskNotification,
+  TaskQueueSupervision,
 } from "../../domain/protocol/server-protocol.js";
+import type { TaskQueueSupervisionView } from "../task-supervisor/task-queue-supervision.js";
 
 const PUBLIC_TITLE_CHARS = 200;
 const PUBLIC_PROGRESS_CHARS = 1_000;
 const PUBLIC_SUMMARY_CHARS = 4_000;
+/** Plan §A: ten minutes without meaningful progress flags the task for review. */
+export const TASK_REVIEW_THRESHOLD_MS = 10 * 60_000;
 
 export interface ProjectTaskOptions {
   includeOutput?: boolean;
+  /** Wall clock used for stall review; defaults to the record's own clock. */
+  now?: number;
+  /** Protocol v11 supervision fields: queue placement for queued tasks. */
+  queue?: TaskQueueSupervisionView;
 }
 
 export function projectTaskSnapshot(record: TaskRecord, options: ProjectTaskOptions = {}): PublicTaskSnapshot {
@@ -30,6 +38,8 @@ export function projectTaskSnapshot(record: TaskRecord, options: ProjectTaskOpti
     updatedAt: record.updatedAt,
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(finishedAt === undefined ? {} : { finishedAt }),
+    ...(state === "queued" && options.queue !== undefined ? { queue: publicQueue(options.queue) } : {}),
+    ...(state === "running" ? attentionFor(record, options.now ?? record.updatedAt) : {}),
   };
 
   if (state === "completed") {
@@ -189,6 +199,41 @@ export function notificationIdForTask(
 
 export function isTaskNotificationState(status: TaskStatus): boolean {
   return notificationKind(status) !== undefined;
+}
+
+function publicQueue(view: TaskQueueSupervisionView): TaskQueueSupervision {
+  return {
+    position: view.position,
+    blockedBy: view.blockedBy.map((blocker) => ({
+      taskId: blocker.taskId,
+      title: blocker.title.slice(0, PUBLIC_TITLE_CHARS),
+      reason: blocker.reason,
+    })),
+  };
+}
+
+/**
+ * Stall review (plan §A): flag a running task that has gone ten minutes
+ * without a verified finding. Evidence states how long and what was last
+ * seen — it never claims the task failed and never triggers intervention.
+ */
+function attentionFor(record: TaskRecord, now: number): { attention: PublicTaskSnapshot["attention"] } | {} {
+  const reference = record.lastMeaningfulProgressAt
+    ?? firstEventTimestamp(record, ["running"])
+    ?? record.createdAt;
+  const stalledForMs = Math.max(0, now - reference);
+  if (stalledForMs < TASK_REVIEW_THRESHOLD_MS) return {};
+  const minutes = Math.floor(stalledForMs / 60_000);
+  const lastActivity = record.events.at(-1)?.summary?.trim();
+  const evidence = `No verified progress for ${minutes} minute${minutes === 1 ? "" : "s"}. `
+    + `Last observed activity: ${lastActivity ? lastActivity.slice(0, 300) : "none retained"}.`;
+  return {
+    attention: {
+      state: "needs_review",
+      stalledForMs,
+      evidence: evidence.slice(0, 500),
+    },
+  };
 }
 
 function publicTaskState(record: TaskRecord): PublicTaskSnapshot["state"] {

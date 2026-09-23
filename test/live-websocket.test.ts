@@ -279,6 +279,72 @@ describe("live gateway WebSocket", () => {
     expect(client.socket.readyState).toBe(WebSocket.OPEN);
   });
 
+  it("tells v11 clients the exact queue position and blocker, and older clients neither", async () => {
+    const config = testConfig({ tasks: { maxConcurrent: 1 } });
+    const start = deferred<StartRunResult>();
+    const hermes = new HermesHarness();
+    hermes.startBehavior = () => start.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider });
+    const client = await readyClient(server.url, { protocolVersion: 11 });
+
+    provider.emit({
+      type: "tool_call",
+      call: backgroundTaskCall("queue_first", "Fix the diamond indicator"),
+    });
+    const firstReceipt = await provider.latest.toolResponses.wait(
+      (entry) => entry.call.id === "queue_first",
+    );
+    await waitForStoredTask(config.tasks.stateFile, String(firstReceipt.response.task_id), "dispatching");
+    provider.emit({
+      type: "tool_call",
+      call: backgroundTaskCall("queue_second", "Archive the persona files"),
+    });
+    const secondReceipt = await provider.latest.toolResponses.wait(
+      (entry) => entry.call.id === "queue_second",
+    );
+    const queuedTaskId = String(secondReceipt.response.task_id);
+
+    send(client.socket, { type: "task.list", id: "list_queue_supervision", limit: 10 });
+    const listed = await client.messages.wait(
+      "task.snapshot",
+      (message) => message.requestId === "list_queue_supervision",
+    );
+    const queued = listed.tasks.find((task: { taskId?: string }) => task.taskId === queuedTaskId);
+    expect(queued).toMatchObject({
+      taskId: queuedTaskId,
+      state: "queued",
+      queue: {
+        position: 1,
+        blockedBy: [{
+          taskId: firstReceipt.response.task_id,
+          reason: "capacity",
+        }],
+      },
+    });
+
+    // The spoken inbox distinguishes queued work from running work.
+    provider.emit({
+      type: "tool_call",
+      call: { id: "queue_summary", name: "list_background_tasks", args: { summary_only: true } },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "queue_summary")).resolves
+      .toMatchObject({ response: { spoken_response: "Your tasks: 1 running, 1 queued." } });
+
+    // Pre-v11 clients must not receive the new supervision fields.
+    start.resolve({ runId: hermes.runIdForInput("Fix the diamond indicator"), status: "queued" });
+    const legacy = await readyClient(server.url, { protocolVersion: 9, expectedSnapshotReason: "reconnect" });
+    send(legacy.socket, { type: "task.list", id: "legacy_list", limit: 10 });
+    const legacyListed = await legacy.messages.wait(
+      "task.snapshot",
+      (message) => message.requestId === "legacy_list",
+    );
+    for (const task of legacyListed.tasks) {
+      expect(task).not.toHaveProperty("queue");
+      expect(task).not.toHaveProperty("attention");
+    }
+  });
+
   it("returns a durable receipt immediately and keeps realtime conversation responsive during dispatch", async () => {
     const start = deferred<StartRunResult>();
     const hermes = new HermesHarness();
@@ -2922,7 +2988,7 @@ async function readyClient(
   options: {
     profileId?: string;
     userLabel?: string;
-    protocolVersion?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
+    protocolVersion?: 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
     expectedSnapshotReason?: "initial" | "reconnect";
   } = {},
 ): Promise<{

@@ -159,6 +159,11 @@ List recent tasks:
 
 The response is a correlated snapshot with `reason: "list"`. `limit` defaults to 50 and cannot exceed 100. `truncated` is true only when at least one additional recent record exists beyond the requested limit.
 
+Protocol v11 snapshots carry truthful supervision fields (older clients never receive them):
+
+- Queued tasks include `queue`: `{ position, blockedBy: [{ taskId, title, reason }] }` where `reason` is `"capacity"` (the execution slots are held) or `"conflicting_write"` (an active task owns the same lineage or resources). `position` is FIFO placement among queued tasks, not an estimate of remaining time.
+- Running tasks include `attention` when no verified progress has been recorded for ten minutes: `{ state: "needs_review", stalledForMs, evidence }`. The evidence names the duration and the last observed activity. `needs_review` is informational — the gateway never stops or restarts the task on its own.
+
 Fetch one exact task, including retained output when completed:
 
 ```json
