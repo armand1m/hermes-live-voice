@@ -150,6 +150,81 @@ export function appendTaskEvent(value: TaskRecord, input: AppendTaskEventInput):
   });
 }
 
+export interface NoteTaskFreshnessInput {
+  now?: number;
+  /** A successful poll or received run event: connectivity proof only. */
+  observed?: boolean;
+  /** Any upstream activity (tool started/completed). */
+  activity?: boolean;
+  /** Activity that produced a verified finding (tool completion). */
+  meaningful?: boolean;
+}
+
+export interface AppendTaskActivityInput {
+  summary: string;
+  /** Event and activity timestamp. */
+  now?: number;
+  /** Latest verified-finding timestamp folded into this write; never after now. */
+  meaningfulAt?: number;
+  /** Latest observation timestamp; may legitimately postdate the event. */
+  observedAt?: number;
+}
+
+/**
+ * Append one coalesced progress event and refresh activity timestamps in the
+ * same revision/sequence step. The task store advances both by exactly one per
+ * write, so buffered activity must land as a single event, never a burst.
+ */
+export function appendTaskActivity(value: TaskRecord, input: AppendTaskActivityInput): TaskRecord {
+  const record = parseTaskRecord(value);
+  const now = monotonicTaskTimestamp(record, input.now);
+  const event = createNextEvent(record, "progress", input.summary, now);
+  return TaskRecordSchema.parse({
+    ...record,
+    updatedAt: now,
+    revision: record.revision + 1,
+    sequence: event.sequence,
+    events: appendRetainedEvent(record.events, event),
+    lastObservedAt: Math.max(record.lastObservedAt ?? 0, input.observedAt ?? now),
+    lastActivityAt: Math.max(record.lastActivityAt ?? 0, now),
+    ...(input.meaningfulAt === undefined && record.lastMeaningfulProgressAt === undefined
+      ? {}
+      : { lastMeaningfulProgressAt: Math.max(record.lastMeaningfulProgressAt ?? 0, input.meaningfulAt ?? 0) }),
+  });
+}
+
+/**
+ * Record observation freshness without appending a retained event. These
+ * timestamps intentionally move independently of the event log: a poll that
+ * proves Hermes is reachable must never look like task progress, and observing
+ * a quiet task must not flood the log.
+ */
+export function noteTaskFreshness(value: TaskRecord, input: NoteTaskFreshnessInput = {}): TaskRecord {
+  const record = parseTaskRecord(value);
+  const now = Math.max(record.createdAt, parseTaskTimestamp(input.now ?? Date.now()));
+  const lastObservedAt = input.observed === true ? Math.max(record.lastObservedAt ?? 0, now) : record.lastObservedAt;
+  const lastMeaningfulProgressAt = input.meaningful === true
+    ? Math.max(record.lastMeaningfulProgressAt ?? 0, now)
+    : record.lastMeaningfulProgressAt;
+  const activityCandidate = input.activity === true ? Math.max(record.lastActivityAt ?? 0, now) : record.lastActivityAt;
+  // Meaningful progress is itself activity; activity never lags behind it.
+  const lastActivityAt = lastMeaningfulProgressAt !== undefined
+    ? Math.max(activityCandidate ?? 0, lastMeaningfulProgressAt)
+    : activityCandidate;
+  if (
+    lastObservedAt === record.lastObservedAt
+    && lastActivityAt === record.lastActivityAt
+    && lastMeaningfulProgressAt === record.lastMeaningfulProgressAt
+  ) return record;
+  return TaskRecordSchema.parse({
+    ...record,
+    revision: record.revision + 1,
+    ...(lastObservedAt !== undefined ? { lastObservedAt } : {}),
+    ...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
+    ...(lastMeaningfulProgressAt !== undefined ? { lastMeaningfulProgressAt } : {}),
+  });
+}
+
 /**
  * Persist a cancellation intent independently from the upstream stop request.
  * This marker is append-only so a gateway restart or an ambiguous stop response
@@ -246,7 +321,19 @@ function createNextEvent(record: TaskRecord, type: TaskEventType, summary: strin
 }
 
 function appendRetainedEvent(events: readonly TaskEvent[], event: TaskEvent): TaskEvent[] {
-  return [...events, event].slice(-MAX_TASK_EVENTS);
+  const appended = [...events, event];
+  if (appended.length <= MAX_TASK_EVENTS) return appended;
+  // Bounded rolling retention: evict the oldest progress events so the latest
+  // activity keeps updating for the task's whole lifetime while lifecycle
+  // events (the audit trail a restart or dispute depends on) are never lost.
+  const lifecycleCount = appended.filter((candidate) => candidate.type !== "progress").length;
+  const progress = appended.filter((candidate) => candidate.type === "progress");
+  const progressBudget = Math.max(0, MAX_TASK_EVENTS - lifecycleCount);
+  const keptProgress = new Set(progress.slice(Math.max(0, progress.length - progressBudget)));
+  const retained = appended.filter((candidate) => candidate.type !== "progress" || keptProgress.has(candidate));
+  // A pathological record with more lifecycle events than the budget can only
+  // shed its oldest audit entries; progress has already been fully evicted.
+  return retained.length > MAX_TASK_EVENTS ? retained.slice(retained.length - MAX_TASK_EVENTS) : retained;
 }
 
 function monotonicTaskTimestamp(record: TaskRecord, now = Date.now()): number {

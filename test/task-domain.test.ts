@@ -5,6 +5,7 @@ import {
   TaskRecordSchema,
   TaskTransitionError,
   acknowledgeTaskNotification,
+  appendTaskActivity,
   appendTaskEvent,
   canTransitionTask,
   createTaskRecord,
@@ -13,6 +14,7 @@ import {
   isTaskTerminal,
   markTaskNotificationAnnounced,
   markTaskStopRequested,
+  noteTaskFreshness,
   sanitizeTaskOutput,
   sanitizeTaskUsage,
   transitionTask,
@@ -138,6 +140,64 @@ describe("task domain", () => {
     });
     expect(markTaskStopRequested(requested, { now: 99 })).toEqual(requested);
     expect(() => TaskRecordSchema.parse({ ...requested, stopRequestedAt: 14 })).toThrow(/task lifetime/);
+  });
+
+  it("keeps updating latest activity past any event count with bounded rolling retention", () => {
+    let task = createTaskRecord({ ownerIdentity: "owner", input: "Diamond indicator fix", now: 1 });
+    task = transitionTask(transitionTask(task, "dispatching", { now: 2 }), "running", {
+      runId: "run_long",
+      now: 3,
+    });
+    // Plan §A regression: a task that produces far more than the old lifetime
+    // 64-event cutoff — latest activity must keep updating while retention
+    // stays bounded and lifecycle events are never evicted.
+    const total = 250;
+    for (let index = 0; index < total; index += 1) {
+      task = appendTaskActivity(task, {
+        summary: `Hermes is using tool_${index}: step ${index}`,
+        now: index + 4,
+        ...(index % 2 === 0 ? { meaningfulAt: index + 4 } : {}),
+      });
+    }
+    expect(task.events).toHaveLength(MAX_TASK_EVENTS);
+    expect(task.sequence).toBe(total + 3);
+    expect(task.events.at(-1)?.summary).toContain(`tool_${total - 1}`);
+    for (const lifecycleType of ["queued", "dispatching", "running"]) {
+      expect(task.events.some((event) => event.type === lifecycleType)).toBe(true);
+    }
+    expect(task.lastActivityAt).toBe(total + 3);
+    expect(task.lastMeaningfulProgressAt).toBe(total + 2);
+    // A later lifecycle transition still lands after the rolling window.
+    const completed = transitionTask(task, "completed", { output: "done", now: total + 4 });
+    expect(completed.events.at(-1)?.type).toBe("completed");
+    expect(completed.events).toHaveLength(MAX_TASK_EVENTS);
+  });
+
+  it("tracks observation freshness without inventing progress", () => {
+    let task = createTaskRecord({ ownerIdentity: "owner", input: "Quiet task", now: 100 });
+    task = transitionTask(transitionTask(task, "dispatching", { now: 101 }), "running", {
+      runId: "run_quiet",
+      now: 102,
+    });
+    // Poll-only observation: connectivity proof, never progress.
+    const observed = noteTaskFreshness(task, { now: 5_000, observed: true });
+    expect(observed.lastObservedAt).toBe(5_000);
+    expect(observed.lastActivityAt).toBeUndefined();
+    expect(observed.lastMeaningfulProgressAt).toBeUndefined();
+    expect(observed.events).toHaveLength(task.events.length);
+    expect(observed.sequence).toBe(task.sequence);
+    // Repeated observation at the same instant is idempotent.
+    expect(noteTaskFreshness(observed, { now: 5_000, observed: true })).toEqual(observed);
+    // Meaningful progress implies activity and cannot lag behind it.
+    const progressed = noteTaskFreshness(observed, { now: 6_000, meaningful: true });
+    expect(progressed.lastActivityAt).toBe(6_000);
+    expect(progressed.lastMeaningfulProgressAt).toBe(6_000);
+    // Backwards timestamps never regress the record.
+    const stale = noteTaskFreshness(progressed, { now: 4_000, activity: true, observed: true });
+    expect(stale.lastActivityAt).toBe(6_000);
+    expect(stale.lastObservedAt).toBe(5_000);
+    expect(() => TaskRecordSchema.parse({ ...progressed, lastMeaningfulProgressAt: 9_999, lastActivityAt: 8_000 }))
+      .toThrow(/meaningful progress cannot be newer/);
   });
 
   it("bounds and sanitizes retained events, output, error, and usage", () => {

@@ -16,7 +16,7 @@ import {
   TaskIdSchema,
   TaskOwnerIdSchema,
   TaskStatusSchema,
-  appendTaskEvent,
+  appendTaskActivity,
   acknowledgeTaskNotification,
   canTransitionTask,
   createTaskRecord,
@@ -24,6 +24,7 @@ import {
   isTaskTerminal,
   markTaskStopRequested,
   markTaskNotificationAnnounced,
+  noteTaskFreshness,
   sanitizeTaskEventSummary,
   transitionTask,
   type TaskRecord,
@@ -38,7 +39,12 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_RETRY_BASE_MS = 500;
 const DEFAULT_RETRY_MAX_MS = 30_000;
 const STARTUP_RECONCILIATION_CONCURRENCY = 4;
-const MAX_PROGRESS_EVENTS_PER_TASK = 64;
+/** Plan §A: coalesce repeated activity updates and persist at most once per second. */
+const ACTIVITY_COALESCE_MS = 1_000;
+/** Freshness-only heartbeat for quiet tasks: proves observability, not progress. */
+const OBSERVATION_PERSIST_MS = 10_000;
+/** Bounded number of pending activity summaries folded into one progress event. */
+const MAX_PENDING_ACTIVITY_SUMMARIES = 8;
 const ACTIVE_TASK_STATUSES = new Set<TaskStatus>([
   "dispatching",
   "running",
@@ -56,6 +62,13 @@ export interface TaskSupervisorScheduler {
   clearTimeout(handle: unknown): void;
 }
 
+interface PendingTaskActivity {
+  summaries: string[];
+  observedAt?: number;
+  activityAt?: number;
+  meaningfulAt?: number;
+}
+
 export interface TaskSupervisorOptions {
   store: TaskStorePort;
   hermes: HermesRunsPort;
@@ -65,6 +78,8 @@ export interface TaskSupervisorOptions {
   pollIntervalMs?: number;
   retryBaseMs?: number;
   retryMaxMs?: number;
+  activityCoalesceMs?: number;
+  observationPersistMs?: number;
   runInstructions?: string;
   now?: () => number;
   scheduler?: TaskSupervisorScheduler;
@@ -105,6 +120,8 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private readonly pollIntervalMs: number;
   private readonly retryBaseMs: number;
   private readonly retryMaxMs: number;
+  private readonly activityCoalesceMs: number;
+  private readonly observationPersistMs: number;
   private readonly runInstructions?: string;
   private readonly now: () => number;
   private readonly scheduler: TaskSupervisorScheduler;
@@ -117,7 +134,16 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private readonly retryNotBefore = new Map<string, number>();
   private readonly acceptedRunsAwaitingPersistence = new Map<string, { runId: string; attempt: number }>();
   private readonly taskStateFailures = new Map<string, Error>();
-  private readonly progressEventCounts = new Map<string, number>();
+  /**
+   * Buffered run activity (plan §A). Summaries are folded into one progress
+   * event and persisted at most once per second, or immediately when a
+   * lifecycle change writes the task anyway. Retention itself is bounded
+   * rolling eviction in the domain, so activity keeps updating for the task's
+   * whole lifetime instead of stopping at a fixed event count.
+   */
+  private readonly pendingActivity = new Map<string, PendingTaskActivity>();
+  /** Wall clock of the last activity-bearing write, for coalescing windows. */
+  private readonly lastActivityPersistAt = new Map<string, number>();
   private readonly watching = new Set<string>();
   private readonly pollSuppressed = new Set<string>();
   private readonly confirmedStopRequests = new Set<string>();
@@ -144,6 +170,8 @@ export class TaskSupervisor implements TaskSupervisorPort {
     this.pollIntervalMs = positiveInteger(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS, "pollIntervalMs");
     this.retryBaseMs = positiveInteger(options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS, "retryBaseMs");
     this.retryMaxMs = positiveInteger(options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS, "retryMaxMs");
+    this.activityCoalesceMs = positiveInteger(options.activityCoalesceMs ?? ACTIVITY_COALESCE_MS, "activityCoalesceMs");
+    this.observationPersistMs = positiveInteger(options.observationPersistMs ?? OBSERVATION_PERSIST_MS, "observationPersistMs");
     if (this.retryMaxMs < this.retryBaseMs) throw new Error("retryMaxMs must be at least retryBaseMs.");
     this.runInstructions = options.runInstructions;
     this.now = options.now ?? Date.now;
@@ -168,6 +196,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
     for (const handle of this.timers.values()) this.scheduler.clearTimeout(handle);
     this.timers.clear();
     this.watching.clear();
+    this.pendingActivity.clear();
     this.subscribers.clear();
     this.ownerSessionKeys.clear();
     this.notificationAnnouncementClaims.clear();
@@ -832,6 +861,9 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private async handleRunEvent(taskId: string, runId: string, event: HermesRunEvent): Promise<void> {
     const current = await this.store.load(taskId);
     if (!current || isTaskOperationallyClosed(current)) return;
+    // Any received run event proves the subscription is alive; that is
+    // connectivity evidence, deliberately distinct from progress.
+    this.noteRunObservation(taskId);
     if (event.run_id !== undefined && event.run_id !== runId) {
       await this.markUnknown(taskId, "Hermes sent an event for a different run.");
       throw new Error("Hermes run-event correlation mismatch.");
@@ -872,10 +904,15 @@ export class TaskSupervisor implements TaskSupervisorPort {
         await this.handleApprovalRequest(taskId, runId);
         return;
       case "tool.started":
-        await this.appendBoundedProgress(taskId, runActivitySummary(event, "started"));
+        // Activity is buffered and coalesced (plan §A): repeated updates
+        // persist at most once per second; the run event below still proves
+        // observation freshness immediately.
+        this.noteRunActivity(taskId, runActivitySummary(event, "started"), false);
         return;
       case "tool.completed":
-        await this.appendBoundedProgress(taskId, runActivitySummary(event, "completed"));
+        // A completed tool call is the cheapest verified-finding signal
+        // available without interpreting tool payloads.
+        this.noteRunActivity(taskId, runActivitySummary(event, "completed"), true);
         return;
       default:
         // Deltas, reasoning, raw tool payloads, and unknown event fields are
@@ -923,14 +960,80 @@ export class TaskSupervisor implements TaskSupervisorPort {
     }
   }
 
-  private async appendBoundedProgress(taskId: string, summary: string): Promise<void> {
-    const count = this.progressEventCounts.get(taskId) ?? 0;
-    if (count >= MAX_PROGRESS_EVENTS_PER_TASK) return;
-    const updated = await this.mutatePersist(taskId, (record) => {
-      if (isTaskOperationallyClosed(record)) return record;
-      return appendTaskEvent(record, { summary, now: this.now() });
+  private noteRunActivity(taskId: string, summary: string, meaningful: boolean): void {
+    if (this.closed) return;
+    const entry = this.pendingActivity.get(taskId) ?? { summaries: [] };
+    entry.summaries.push(summary);
+    if (entry.summaries.length > MAX_PENDING_ACTIVITY_SUMMARIES) {
+      entry.summaries.splice(0, entry.summaries.length - MAX_PENDING_ACTIVITY_SUMMARIES);
+    }
+    const now = this.now();
+    entry.activityAt = Math.max(entry.activityAt ?? 0, now);
+    if (meaningful) entry.meaningfulAt = Math.max(entry.meaningfulAt ?? 0, now);
+    this.pendingActivity.set(taskId, entry);
+    const lastPersist = this.lastActivityPersistAt.get(taskId);
+    if (lastPersist !== undefined && now - lastPersist < this.activityCoalesceMs) {
+      // Trailing edge of the coalescing window: bursts fold into the flush
+      // that closes the window, keeping the persist rate at most once per
+      // coalescing interval under sustained load.
+      const wait = Math.max(0, this.activityCoalesceMs - (now - lastPersist));
+      if (!this.timers.has(activityTimerKey(taskId))) {
+        this.scheduleTimer(activityTimerKey(taskId), wait, () => {
+          this.trackBackground(this.flushTaskActivity(taskId).catch((error) => this.reportError(error)));
+        });
+      }
+      return;
+    }
+    // Leading edge: the first activity after a quiet period persists
+    // immediately so a single update never waits behind the window.
+    this.trackBackground(this.flushTaskActivity(taskId).catch((error) => this.reportError(error)));
+  }
+
+  private noteRunObservation(taskId: string): void {
+    if (this.closed) return;
+    const entry = this.pendingActivity.get(taskId) ?? { summaries: [] };
+    entry.observedAt = Math.max(entry.observedAt ?? 0, this.now());
+    this.pendingActivity.set(taskId, entry);
+    // Quiet tasks still prove observability on a slow heartbeat; busy tasks
+    // persist their freshness together with their activity writes.
+    if (this.timers.has(observationTimerKey(taskId))) return;
+    this.scheduleTimer(observationTimerKey(taskId), this.observationPersistMs, () => {
+      this.trackBackground(this.flushTaskActivity(taskId).catch((error) => this.reportError(error)));
     });
-    if (!isTaskOperationallyClosed(updated)) this.progressEventCounts.set(taskId, count + 1);
+  }
+
+  private async flushTaskActivity(taskId: string): Promise<void> {
+    if (!this.pendingActivity.has(taskId)) return;
+    // The identity updater still applies buffered activity inside
+    // mutatePersist's serialized write path.
+    await this.mutatePersist(taskId, (record) => record);
+  }
+
+  /**
+   * Fold buffered activity into a record as a single store write. The task
+   * store advances revision and sequence by exactly one per write, so buffered
+   * activity lands as one coalesced progress event (or a freshness-only
+   * update), never a burst.
+   */
+  private applyPendingTaskActivity(record: TaskRecord, entry: PendingTaskActivity): TaskRecord {
+    if (isTaskOperationallyClosed(record)) return record;
+    if (entry.summaries.length > 0 && entry.activityAt !== undefined) {
+      return appendTaskActivity(record, {
+        summary: entry.summaries.join("; "),
+        now: entry.activityAt,
+        ...(entry.meaningfulAt !== undefined ? { meaningfulAt: entry.meaningfulAt } : {}),
+        ...(entry.observedAt !== undefined ? { observedAt: entry.observedAt } : {}),
+      });
+    }
+    if (entry.observedAt !== undefined || entry.activityAt !== undefined || entry.meaningfulAt !== undefined) {
+      return noteTaskFreshness(record, {
+        now: Math.max(entry.observedAt ?? 0, entry.activityAt ?? 0, entry.meaningfulAt ?? 0),
+        observed: entry.observedAt !== undefined,
+        activity: entry.activityAt !== undefined,
+        meaningful: entry.meaningfulAt !== undefined,
+      });
+    }
+    return record;
   }
 
   private async reconcileTask(taskId: string): Promise<void> {
@@ -1084,6 +1187,37 @@ export class TaskSupervisor implements TaskSupervisorPort {
           this.taskStateFailures.delete(taskId);
           throw new TaskNotFoundError(taskId);
         }
+        // Persist buffered activity first, as its own single-event write, so
+        // it can never be lost to or reordered after the requested update.
+        const pending = this.pendingActivity.get(taskId);
+        if (pending) {
+          if (isTaskOperationallyClosed(current)) {
+            // Late activity for an operationally closed task is dropped, not
+            // appended to a finalized audit trail.
+            this.pendingActivity.delete(taskId);
+          } else {
+            const activityApplied = this.applyPendingTaskActivity(current, pending);
+            if (activityApplied.revision !== current.revision) {
+              try {
+                const persistedActivity = await this.store.update(
+                  taskId,
+                  () => activityApplied,
+                  { expectedRevision: current.revision },
+                );
+                this.lastActivityPersistAt.set(taskId, this.now());
+                this.pendingActivity.delete(taskId);
+                this.publish(persistedActivity);
+                current = persistedActivity;
+              } catch (error) {
+                if (errorName(error) === "TaskStoreConflictError" && attempt < 3) continue;
+                this.recordTaskStateFailure(taskId, error);
+                throw error;
+              }
+            } else {
+              this.pendingActivity.delete(taskId);
+            }
+          }
+        }
         // Keep updater validation and authorization errors outside the durable
         // failure path. They did not prove any inability to read or write state.
         const updated = updater(current);
@@ -1132,6 +1266,10 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private async pollTask(taskId: string): Promise<void> {
     try {
       await this.reconcileTask(taskId);
+      // A completed poll cycle proves the task is still observable. It is
+      // deliberately not progress: quiet-but-connected tasks must be
+      // distinguishable from ones actually doing work.
+      this.noteRunObservation(taskId);
       const current = await this.store.load(taskId);
       if (!current || isTaskOperationallyClosed(current)) {
         this.scheduleDrain();
@@ -1276,6 +1414,14 @@ function isTaskOperationallyClosed(record: TaskRecord): boolean {
   return isTaskTerminal(record.status)
     || record.upstreamRunMissingAt !== undefined
     || record.operatorContainedAt !== undefined;
+}
+
+function activityTimerKey(taskId: string): string {
+  return `activity:${taskId}`;
+}
+
+function observationTimerKey(taskId: string): string {
+  return `observation:${taskId}`;
 }
 
 function validateSessionKey(value: string): string {

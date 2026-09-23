@@ -13,7 +13,6 @@ import type {
   TaskUpdateOptions,
 } from "../../../application/task-supervisor/ports/task-store.port.js";
 import {
-  MAX_TASK_EVENTS,
   TASK_RECORD_SCHEMA_VERSION,
   TaskIdSchema,
   TaskOwnerIdSchema,
@@ -266,7 +265,7 @@ export class FileTaskStore implements TaskStorePort {
       if (updated.revision !== current.revision + 1) {
         throw new TaskStoreConflictError("Task updates must advance revision by exactly one.");
       }
-      if (updated.sequence !== current.sequence + 1) {
+      if (updated.sequence !== current.sequence + 1 && !isFreshnessOnlyTaskUpdate(current, updated)) {
         throw new TaskStoreConflictError("Non-idempotent task updates must advance sequence by exactly one.");
       }
       if (updated.updatedAt < current.updatedAt) {
@@ -319,11 +318,22 @@ export class FileTaskStore implements TaskStorePort {
           );
         }
       }
-      const expectedPriorEvents = current.events.length === MAX_TASK_EVENTS
-        ? current.events.slice(1)
-        : current.events;
-      if (!isDeepStrictEqual(updated.events.slice(0, -1), expectedPriorEvents)) {
-        throw new TaskStoreConflictError("Task event history is append-only.");
+      // History is append-only: a write may append exactly one event and, at
+      // capacity, evict the single oldest progress event (rolling retention,
+      // plan §A) — or, for a freshness-only write, append nothing at all.
+      if (updated.sequence === current.sequence) {
+        if (!isDeepStrictEqual(updated.events, current.events)) {
+          throw new TaskStoreConflictError("Task event history is append-only.");
+        }
+      } else {
+        const appendedPrior = updated.events.slice(0, -1);
+        const evictOne = evictOldestProgressEvent(current.events);
+        if (
+          !isDeepStrictEqual(appendedPrior, current.events)
+          && !isDeepStrictEqual(appendedPrior, evictOne)
+        ) {
+          throw new TaskStoreConflictError("Task event history is append-only.");
+        }
       }
       const next = new Map(this.records);
       next.set(id, cloneTask(updated)!);
@@ -875,6 +885,33 @@ function buildTaskStoreDocument(records: Map<string, TaskRecord>, updatedAt: num
       .map((task) => parseTaskRecord(task))
       .sort((left, right) => left.createdAt - right.createdAt || left.taskId.localeCompare(right.taskId)),
   };
+}
+
+/**
+ * Freshness-only writes (plan §A): observation/activity timestamps that prove
+ * observability without recording an event. Everything except revision and the
+ * three freshness fields must be byte-identical, so a sequence-preserving
+ * write can never smuggle a status, event, or payload change.
+ */
+function isFreshnessOnlyTaskUpdate(current: TaskRecord, updated: TaskRecord): boolean {
+  if (updated.sequence !== current.sequence) return false;
+  const strip = (record: TaskRecord) => {
+    const {
+      revision,
+      lastObservedAt,
+      lastActivityAt,
+      lastMeaningfulProgressAt,
+      ...rest
+    } = structuredClone(record);
+    return rest;
+  };
+  return isDeepStrictEqual(strip(current), strip(updated));
+}
+
+/** Mirror of the domain's rolling-retention eviction for the append-only check. */
+function evictOldestProgressEvent(events: TaskRecord["events"]): TaskRecord["events"] {
+  const index = events.findIndex((event) => event.type === "progress");
+  return index < 0 ? events.slice(1) : [...events.slice(0, index), ...events.slice(index + 1)];
 }
 
 function hasSameTaskDefinition(current: TaskRecord, updated: TaskRecord): boolean {

@@ -24,6 +24,7 @@ import {
 import type { ApprovalChoice } from "../src/domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../src/domain/protocol/server-protocol.js";
 import {
+  MAX_TASK_EVENTS,
   acknowledgeTaskNotification,
   containIndeterminateTask,
   createTaskRecord,
@@ -101,6 +102,117 @@ describe("TaskSupervisor", () => {
     expect(summary).toContain("[redacted]");
     expect(summary).not.toContain("secret-value");
     expect(summary).not.toContain("examplecredential123");
+    await supervisor.close();
+  });
+
+  it("keeps updating latest activity past the old 64-event cutoff with bounded rolling retention", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes, activityCoalesceMs: 1 });
+    await supervisor.initialize();
+    const task = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Long-running implementation task",
+    });
+    await waitFor(async () => Boolean((await store.load(task.taskId))?.runId));
+    const runId = (await store.load(task.taskId))?.runId!;
+    // Plan §A regression: the diamond task froze at sequence 67 while Hermes
+    // kept working. Latest activity must keep updating for the whole lifetime.
+    for (let index = 0; index < 210; index += 1) {
+      hermes.pushEvent(runId, {
+        event: "tool.started",
+        run_id: runId,
+        tool: `tool_${index}`,
+        preview: `step ${index}`,
+      });
+      await waitFor(async () =>
+        (await store.load(task.taskId))?.events.at(-1)?.summary?.includes(`tool_${index}`) === true);
+    }
+    const final = (await store.load(task.taskId))!;
+    expect(final.events.length).toBeLessThanOrEqual(MAX_TASK_EVENTS);
+    expect(final.sequence).toBeGreaterThan(210);
+    expect(final.events.at(-1)?.summary).toContain("tool_209");
+    // Lifecycle events survive the rolling window.
+    expect(final.events.some((event) => event.type === "queued")).toBe(true);
+    expect(final.events.some((event) => event.type === "running")).toBe(true);
+    await supervisor.close();
+  });
+
+  it("coalesces burst activity into one persisted event per window and flushes on lifecycle change", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes, activityCoalesceMs: 60_000 });
+    await supervisor.initialize();
+    const task = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Bursty task",
+    });
+    await waitFor(async () => Boolean((await store.load(task.taskId))?.runId));
+    const runId = (await store.load(task.taskId))?.runId!;
+    hermes.pushEvent(runId, { event: "tool.started", run_id: runId, tool: "alpha" });
+    await waitFor(async () =>
+      (await store.load(task.taskId))?.events.at(-1)?.summary?.includes("alpha") === true);
+    const afterLeading = (await store.load(task.taskId))!;
+    const progressCount = afterLeading.events.filter((event) => event.type === "progress").length;
+
+    // Burst inside the coalescing window: buffered, not persisted.
+    hermes.pushEvent(runId, { event: "tool.completed", run_id: runId, tool: "alpha" });
+    hermes.pushEvent(runId, { event: "tool.started", run_id: runId, tool: "beta" });
+    await delay(50);
+    const duringWindow = (await store.load(task.taskId))!;
+    expect(duringWindow.events.filter((event) => event.type === "progress")).toHaveLength(progressCount);
+
+    // A lifecycle change persists immediately and folds the buffered burst in
+    // ahead of the terminal event — never after it, never lost.
+    hermes.pushEvent(runId, { event: "run.completed", run_id: runId, output: "burst result" });
+    hermes.setSnapshot(runId, { object: "hermes.run", run_id: runId, status: "completed", output: "burst result", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    const completed = await waitForRecord(store, task.taskId, "completed");
+    const summaries = completed.events.map((event) => event.summary ?? "");
+    const terminalIndex = completed.events.findIndex((event) => event.type === "completed");
+    expect(terminalIndex).toBeGreaterThan(0);
+    expect(summaries.slice(0, terminalIndex).some((summary) => summary.includes("beta"))).toBe(true);
+    expect(completed.events.at(-1)?.type).toBe("completed");
+    await supervisor.close();
+  });
+
+  it("tracks observed, activity, and meaningful progress freshness separately", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({
+      store,
+      hermes,
+      activityCoalesceMs: 1,
+      observationPersistMs: 20,
+      pollIntervalMs: 5,
+    });
+    await supervisor.initialize();
+    const task = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Quiet then busy task",
+    });
+    await waitFor(async () => Boolean((await store.load(task.taskId))?.runId));
+    const runId = (await store.load(task.taskId))?.runId!;
+
+    // Poll-only observation proves connectivity without recording activity.
+    const observed = await waitForRecordField(store, task.taskId, "lastObservedAt");
+    expect(observed.lastActivityAt).toBeUndefined();
+    expect(observed.lastMeaningfulProgressAt).toBeUndefined();
+
+    hermes.pushEvent(runId, { event: "tool.started", run_id: runId, tool: "reader" });
+    const afterStart = await waitForRecordField(store, task.taskId, "lastActivityAt");
+    expect(afterStart.lastActivityAt).toBeGreaterThanOrEqual(observed.lastObservedAt!);
+    expect(afterStart.lastMeaningfulProgressAt).toBeUndefined();
+
+    hermes.pushEvent(runId, { event: "tool.completed", run_id: runId, tool: "reader" });
+    const afterCompletion = await waitForRecordField(store, task.taskId, "lastMeaningfulProgressAt");
+    expect(afterCompletion.lastMeaningfulProgressAt).toBeGreaterThanOrEqual(afterStart.lastActivityAt!);
+
+    hermes.pushEvent(runId, { event: "run.completed", run_id: runId, output: "done" });
+    hermes.setSnapshot(runId, { object: "hermes.run", run_id: runId, status: "completed", output: "done", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    await waitForRecord(store, task.taskId, "completed");
     await supervisor.close();
   });
 
@@ -1263,6 +1375,11 @@ class MemoryTaskStore implements TaskStorePort {
     const updated = parseTaskRecord(updater(clone(current)!));
     if (updated.revision === current.revision) return clone(current)!;
     if (updated.revision !== current.revision + 1) throw new Error("invalid revision");
+    if (updated.sequence !== current.sequence + 1) {
+      const { revision: _r, lastObservedAt: _o, lastActivityAt: _a, lastMeaningfulProgressAt: _m, ...rest } = updated;
+      const { revision: _r2, lastObservedAt: _o2, lastActivityAt: _a2, lastMeaningfulProgressAt: _m2, ...restCurrent } = current;
+      if (JSON.stringify(rest) !== JSON.stringify(restCurrent)) throw new Error("sequence-preserving write changed more than freshness");
+    }
     this.records.set(taskId, clone(updated)!);
     this.writes.push(clone(updated)!);
     return clone(updated)!;
@@ -1581,4 +1698,28 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, attempts = 2
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   throw new Error("Timed out waiting for task-supervisor test condition.");
+}
+
+async function waitForRecord(
+  store: MemoryTaskStore,
+  taskId: string,
+  status: TaskRecord["status"],
+): Promise<TaskRecord> {
+  // Coalescing windows and heartbeat timers are real-time bound; the default
+  // setImmediate budget can elapse inside one timer tick.
+  await waitFor(async () => (await store.load(taskId))?.status === status, 50_000);
+  return (await store.load(taskId))!;
+}
+
+async function waitForRecordField<K extends "lastObservedAt" | "lastActivityAt" | "lastMeaningfulProgressAt">(
+  store: MemoryTaskStore,
+  taskId: string,
+  field: K,
+): Promise<TaskRecord> {
+  await waitFor(async () => (await store.load(taskId))?.[field] !== undefined, 50_000);
+  return (await store.load(taskId))!;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

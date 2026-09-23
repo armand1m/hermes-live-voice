@@ -139,6 +139,15 @@ export const TaskRecordSchema = z.object({
   sequence: TaskCounterSchema,
   events: z.array(TaskEventSchema).min(1).max(MAX_TASK_EVENTS),
   stopRequestedAt: TaskTimestampSchema.optional(),
+  /**
+   * Freshness tracking (plan §A): a successful poll proves connectivity, not
+   * progress. These three timestamps are maintained independently of the
+   * retained event log and may legitimately run ahead of updatedAt when the
+   * gateway observes a task without recording an event for it.
+   */
+  lastObservedAt: TaskTimestampSchema.optional(),
+  lastActivityAt: TaskTimestampSchema.optional(),
+  lastMeaningfulProgressAt: TaskTimestampSchema.optional(),
   upstreamRunMissingAt: TaskTimestampSchema.optional(),
   operatorContainedAt: TaskTimestampSchema.optional(),
   output: TaskOutputSchema.optional(),
@@ -168,6 +177,28 @@ export const TaskRecordSchema = z.object({
   }
   if (new Set(record.resourceKeys).size !== record.resourceKeys.length) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "Task resource keys must be unique." });
+  }
+  for (const [field, value] of [
+    ["lastObservedAt", record.lastObservedAt],
+    ["lastActivityAt", record.lastActivityAt],
+    ["lastMeaningfulProgressAt", record.lastMeaningfulProgressAt],
+  ] as const) {
+    if (value !== undefined && value < record.createdAt) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Task ${field} cannot precede task creation.`,
+      });
+    }
+  }
+  if (
+    record.lastMeaningfulProgressAt !== undefined
+    && record.lastActivityAt !== undefined
+    && record.lastMeaningfulProgressAt > record.lastActivityAt
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Task meaningful progress cannot be newer than the activity it belongs to.",
+    });
   }
   let previousSequence = 0;
   let previousTimestamp = 0;
