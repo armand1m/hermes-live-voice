@@ -20,17 +20,25 @@ describe("deferredAnswerSpeech", () => {
     expect(speech.endsWith("…")).toBe(true);
   });
 
-  it("strips code fences, inline code markers, and URLs", () => {
+  it("replaces code fences with the on-screen cue and strips inline code markers and URLs", () => {
     const answer = "I fixed it. ```python\nprint('hi')\n``` Run `npm test` now. See https://example.com/docs for more.";
-    expect(deferredAnswerSpeech(answer)).toBe("I fixed it.  Run npm test now. See for more.".replace(/\s+/gu, " ").trim());
+    expect(deferredAnswerSpeech(answer)).toBe(
+      "I fixed it. The details are available on screen. Run npm test now.",
+    );
   });
 
   it("collapses control characters and whitespace", () => {
     expect(deferredAnswerSpeech("Line one.\n\n\tLine two.   ")).toBe("Line one. Line two.");
   });
 
-  it("falls back to a spoken placeholder when nothing speakable remains", () => {
+  it("says where code-only results live instead of a vague placeholder", () => {
     expect(deferredAnswerSpeech("```js\nonly code\n```")).toBe(
+      "The details are available on screen.",
+    );
+  });
+
+  it("falls back to a spoken placeholder when nothing speakable remains", () => {
+    expect(deferredAnswerSpeech("https://example.com/only-a-link")).toBe(
       "I have the result, but it is not easy to say out loud.",
     );
   });

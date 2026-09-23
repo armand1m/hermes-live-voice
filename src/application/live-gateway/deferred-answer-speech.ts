@@ -2,22 +2,18 @@
 // instant spoken receipt and delivers the real answer later through the
 // provider's exact-speech channel, which is bounded to short speakable text.
 
+import { prepareSpokenContent } from "../../domain/speech/spoken-content.js";
+
 const MAX_SPEECH_CHARS = 500;
 const MAX_SENTENCES = 3;
 
 /**
  * Reduce a Hermes answer to at most three sentences and 500 chars of
- * speakable text: control characters collapse, fenced code blocks and inline
- * code markers drop out, and bare URLs are skipped (painful to hear aloud).
+ * speakable text. Structure removal is the shared spoken-content cleanup
+ * (plan §E) — this shaper only bounds length and adds the truncation cue.
  */
 export function deferredAnswerSpeech(answer: string): string {
-  const flat = answer
-    .replace(/```[\s\S]*?```/gu, " ")
-    .replace(/`([^`]*)`/gu, "$1")
-    .replace(/https?:\/\/\S+/gu, " ")
-    .replace(/[\u0000-\u001f\u007f]/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
+  const flat = prepareSpokenContent(answer, { maxChars: 4 * MAX_SPEECH_CHARS });
   if (!flat) return "I have the result, but it is not easy to say out loud.";
   const sentences = flat.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/gu) ?? [flat];
   let speech = "";

@@ -91,6 +91,42 @@ describe("Riva realtime bridge", () => {
     await session.close();
   });
 
+  it("prepares spoken content at the TTS boundary: transcript, echo guard, and synthesis see the same plain text", async () => {
+    const markdown = "## Status\n\nThe **fix** landed. See [the log](https://example.com/log). ```git\npush origin main\n```";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("_sessions")) {
+        return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: markdown } }] }), { status: 200 });
+    });
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter({
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0, brainMaxTokens: 2048, brainReasoningEffort: "off", echoGuard: true,
+    }).connect({ sessionId: "test", systemInstruction: "Help the user.", availableTools: [], callbacks: { onEvent: (event) => events.push(event) } });
+    await session.sendText("status please");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "text" && event.speaker === "assistant")).toBe(true));
+
+    const spoken = events.find((event): event is Extract<LiveModelEvent, { type: "text" }> =>
+      event.type === "text" && event.speaker === "assistant")!.text;
+    expect(spoken).toBe("Status. The fix landed. See the log. The details are available on screen.");
+    expect(spoken).not.toContain("**");
+    expect(spoken).not.toContain("http");
+    expect(spoken).not.toContain("```");
+    const tts = mock.sockets.find((socket) => socket.intent === "synthesize")!;
+    const appended = tts.sent.find((event) => event.type === "input_text.append");
+    // The synthesized text is exactly the prepared spoken transcript.
+    expect(appended?.text).toBe(spoken);
+    // The echo guard learned the prepared text, not the markdown source.
+    const guardDrop = events.some((event) => event.type === "text" && event.speaker === "user");
+    expect(guardDrop).toBe(false);
+    await session.close();
+  });
+
   it("collapses near-duplicate ASR re-emissions into one user turn", async () => {
     const brainRequests: Record<string, unknown>[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {

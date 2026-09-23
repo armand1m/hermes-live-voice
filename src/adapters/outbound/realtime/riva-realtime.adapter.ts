@@ -8,6 +8,7 @@ import type {
 } from "../../../application/live-gateway/ports/realtime-model.port.js";
 import { RivaEchoGuard } from "./riva-echo-guard.js";
 import { normalizePcm16Audio } from "../../../domain/audio/pcm.js";
+import { prepareSpokenContent } from "../../../domain/speech/spoken-content.js";
 import type { RealtimeResponseTruncation } from "../../../domain/protocol/client-protocol.js";
 
 const ASR_RATE = 16_000;
@@ -16,6 +17,7 @@ const MAX_EVENT_BYTES = 16 * 1024 * 1024;
 const MAX_TTS_BYTES = 16 * 1024 * 1024;
 /** Thinking models may emit <think> blocks; only the answer is spoken. */
 const THINK_BLOCK = /<think>[\s\S]*?<\/think>/g;
+/** Deterministic spoken-content cleanup happens at this TTS boundary (plan §E). */
 /** Cap for the doubled-budget empty-answer retry (matches the config ceiling). */
 const BRAIN_RETRY_TOKEN_CEILING = 8_192;
 const BRAIN_TIMEOUT_MS = 90_000;
@@ -350,9 +352,7 @@ class RivaRealtimeSession implements LiveModelSession {
           this.params.callbacks.onEvent({ type: "tool_call", call });
         }
       } else if (content) {
-        this.echoGuard?.note(content);
-        this.params.callbacks.onEvent({ type: "text", speaker: "assistant", text: content, final: true });
-        await this.synthesize(content, generation);
+        await this.speakBrainAnswer(content, generation);
       }
       if (this.generation === generation) this.finish(responseId, "completed");
     } catch (error) {
@@ -390,17 +390,34 @@ class RivaRealtimeSession implements LiveModelSession {
     const responseId = randomUUID();
     const generation = this.generation;
     this.activeResponseId = responseId;
-    this.echoGuard?.note(text);
+    // One preparation funnel: the spoken transcript, the echo-guard entry, and
+    // the synthesized audio all carry the same prepared text.
+    const spoken = prepareSpokenContent(text);
+    this.echoGuard?.note(spoken);
     this.params.callbacks.onEvent({ type: "response", status: "started", responseId, scope });
     try {
-      this.params.callbacks.onEvent({ type: "text", speaker: "assistant", text, final: true });
-      await this.synthesize(text, generation);
+      this.emitSpokenText(spoken);
+      await this.synthesize(spoken, generation);
       if (this.generation === generation) this.finish(responseId, "completed", scope);
     } catch (error) {
       if (this.generation === generation && !this.closed) {
         this.params.callbacks.onError?.(error);
         this.finish(responseId, "failed", scope);
       }
+    }
+  }
+
+  /** Brain answers share the receipt/notification preparation funnel. */
+  private async speakBrainAnswer(content: string, generation: number): Promise<void> {
+    const spoken = prepareSpokenContent(content);
+    this.echoGuard?.note(spoken);
+    this.emitSpokenText(spoken);
+    await this.synthesize(spoken, generation);
+  }
+
+  private emitSpokenText(spoken: string): void {
+    if (spoken) {
+      this.params.callbacks.onEvent({ type: "text", speaker: "assistant", text: spoken, final: true });
     }
   }
 

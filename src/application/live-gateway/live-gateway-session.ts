@@ -43,6 +43,7 @@ import { buildLayaState, LAYA_SHADOW_QUESTIONS, type LayaShadowRecorder } from "
 import { SpeechTimingTracker, type SpeechTimingMetrics } from "./speech-timing.js";
 import { FillerSpeaker, type FillerEmit } from "./filler-speaker.js";
 import { deferredAnswerSpeech } from "./deferred-answer-speech.js";
+import { prepareSpokenContent } from "../../domain/speech/spoken-content.js";
 import { SpeechMux } from "./speech-mux.js";
 import type { SpeechSink } from "./ports/speech-sink.port.js";
 import type { VoiceArbiter } from "./voice-arbiter.js";
@@ -2375,7 +2376,10 @@ export class LiveGatewaySession {
       }
 
       this.notificationResponsePending = true;
-      const announcement = notificationDigest(records);
+      // Spoken-content preparation at the notification TTS boundary (plan §E):
+      // task titles and result excerpts arrive as Markdown and must never
+      // reach synthesis with structure markers intact.
+      const announcement = prepareSpokenContent(notificationDigest(records));
       const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
       this.activeNotificationId = notificationId;
       const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
