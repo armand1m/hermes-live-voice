@@ -36,13 +36,13 @@ describe("HermesLiveClient", () => {
     expect(socket.sent[0]).toEqual({
       type: "session.start",
       id: "req_1",
-      protocolVersion: 9,
+      protocolVersion: 11,
       profileId: "demo",
       conversation: { mode: "new" },
     });
     socket.message(readyMessage("live_1"));
 
-    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 9 });
+    await expect(connection).resolves.toMatchObject({ sessionId: "live_1", protocolVersion: 11 });
     expect(client.connected).toBe(true);
     expect(client.getSnapshot()).toMatchObject({
       connection: "ready",
@@ -78,7 +78,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     expect(socket.sent[0]).toMatchObject({
       type: "session.start",
-      protocolVersion: 9,
+      protocolVersion: 11,
       conversation: { mode: "resume", sessionId: "saved_chat" },
     });
     socket.message({
@@ -104,6 +104,18 @@ describe("HermesLiveClient", () => {
       reason: "voice_command",
       arbitrary: true,
     })).toThrow(/unsupported field/i);
+  });
+
+  it("validates response scopes and deferred-answer signals (protocol v11)", () => {
+    expect(() => validateServerMessage({ type: "response.started", responseId: "r1", scope: "task_notification" })).not.toThrow();
+    expect(() => validateServerMessage({ type: "response.completed", scope: "conversation" })).not.toThrow();
+    expect(() => validateServerMessage({ type: "response.failed", error: "broken", scope: "task_notification" })).not.toThrow();
+    expect(() => validateServerMessage({ type: "response.started", scope: "bogus" })).toThrow(/scope/i);
+    expect(() => validateServerMessage({ type: "session.demoted", reason: "superseded" })).not.toThrow();
+    expect(() => validateServerMessage({ type: "session.demoted", reason: "other" })).toThrow(/reason/i);
+    expect(() => validateServerMessage({ type: "deferred.pending", pendingId: "defer_1", kind: "conversation" })).not.toThrow();
+    expect(() => validateServerMessage({ type: "deferred.pending", pendingId: "defer_1", kind: "nope" })).toThrow(/kind/i);
+    expect(() => validateServerMessage({ type: "deferred.delivered", pendingId: "defer_1" })).not.toThrow();
   });
 
   it("validates and emits agent-requested client audio settings", async () => {
@@ -995,7 +1007,7 @@ describe("HermesLiveClient", () => {
     const connection = client.connect();
     const socket = await nextSocket();
     socket.open();
-    socket.message({ type: "session.ready", protocolVersion: 9 });
+    socket.message({ type: "session.ready", protocolVersion: 11 });
 
     await expect(connection).rejects.toThrow(/requires sessionId/);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
@@ -1234,7 +1246,7 @@ describe("HermesLiveClient", () => {
     socket.open();
     socket.message({ ...readyMessage("legacy"), protocolVersion: 2 });
 
-    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v9.*upgrade/i);
+    await expect(connection).rejects.toThrow(/protocol version 2.*protocol v11.*upgrade/i);
     expect(socket.closeCalls.at(-1)).toMatchObject({ code: 4000, reason: "invalid server message" });
   });
 });
@@ -1904,7 +1916,7 @@ function createClient(overrides: Record<string, unknown> = {}): HermesLiveClient
 function readyMessage(sessionId: string) {
   return {
     type: "session.ready",
-    protocolVersion: 9,
+    protocolVersion: 11,
     sessionId,
     model: "mock-live",
     hermes: {},

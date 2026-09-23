@@ -301,7 +301,7 @@ describe("live gateway WebSocket", () => {
       status: "queued",
       message: expect.stringContaining("keep talking"),
       spoken_response:
-        "Nice, I just spun up that task and started a watcher to keep an eye on it. I’ll let you know when it finishes or needs attention, and you can keep talking.",
+        "Your task is queued. I’ll report when execution starts; you can keep talking.",
     });
     expect(Object.keys(receipt.response)[0]).toBe("spoken_response");
     await waitUntil(() => hermes.startCalls.length === 1);
@@ -398,6 +398,94 @@ describe("live gateway WebSocket", () => {
     expect(provider.latest.notificationCalls).toEqual([]);
   }, 15_000);
 
+  it("surfaces response scope and deferred signals to v11 clients only", async () => {
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    hermes.chatBehavior = async () => ({ sessionId: "session_tip", content: "Scoped answer." });
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({ hermes: { asyncTools: true } }),
+      hermes,
+      provider,
+    });
+    // The v9 client goes first: its assertions finish before the v11 client
+    // connects, because a newer session demotes the older one (same owner).
+    const v9 = await readyClient(server.url, { protocolVersion: 9 });
+    provider.emit({ type: "response", status: "started", responseId: "resp_v9", scope: "task_notification" }, 0);
+    const v9Started = await v9.messages.wait("response.started");
+    expect(v9Started.scope).toBeUndefined();
+    provider.emit({ type: "response", status: "completed", responseId: "resp_v9", scope: "task_notification" }, 0);
+    await v9.messages.wait("response.completed");
+
+    const v11 = await connectClient(server.url);
+    send(v11.socket, {
+      type: "session.start",
+      protocolVersion: 11,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await v11.messages.wait("session.ready");
+    await v11.messages.wait("task.snapshot");
+
+    // Scoped notification responses: the v11 client sees the scope.
+    provider.emit({ type: "response", status: "started", responseId: "resp_v11", scope: "task_notification" }, 1);
+    await expect(v11.messages.wait("response.started")).resolves.toMatchObject({ scope: "task_notification" });
+    provider.emit({ type: "response", status: "completed", responseId: "resp_v11", scope: "task_notification" }, 1);
+    await v11.messages.wait("response.completed");
+
+    // Deferred answers: pending/delivered reach the v11 client only; the
+    // demoted v9 session never sees them.
+    provider.emit({
+      type: "tool_call",
+      call: { id: "scoped_chat", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+    }, 1);
+    const pending = await v11.messages.wait("deferred.pending");
+    expect(pending).toMatchObject({ type: "deferred.pending", kind: "conversation" });
+    await provider.connection(1).toolResponses.wait((entry) => entry.call.id === "scoped_chat");
+    await expect(v11.messages.wait("deferred.delivered")).resolves.toMatchObject({
+      type: "deferred.delivered",
+      pendingId: pending.pendingId,
+    });
+    await v9.messages.expectNone("deferred.pending", 100);
+    await v9.messages.expectNone("deferred.delivered", 50);
+  });
+
+  it("demotes the older session when a newer page claims the same owner", async () => {
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes, provider });
+    const first = await readyClient(server.url, { protocolVersion: 7 });
+    const second = await readyClient(server.url, { protocolVersion: 7 });
+
+    // The first page is view-only from the moment the second page starts.
+    await expect(first.messages.wait("session.demoted")).resolves.toEqual({
+      type: "session.demoted",
+      reason: "superseded",
+    });
+
+    // Its turns are dropped server-side…
+    send(first.socket, { type: "text.input", id: "old_tab_turn", text: "hello from the old tab" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(provider.connections.flatMap((connection) => connection.textInputs)).toEqual([]);
+
+    // …while the newest page speaks normally.
+    send(second.socket, { type: "text.input", id: "new_tab_turn", text: "hello from the new tab" });
+    await waitUntil(() => provider.connection(1).textInputs.includes("hello from the new tab"));
+
+    // Closing the newest page frees the key for the next claimer.
+    second.socket.terminate();
+    await waitUntil(() => provider.connections[1]!.closeCalls > 0);
+    const third = await readyClient(server.url, { protocolVersion: 7 });
+    send(third.socket, { type: "text.input", id: "third_turn", text: "hello again" });
+    await waitUntil(() => provider.connection(2).textInputs.includes("hello again"));
+  });
+
   it("forces an overdue deferred answer through a wedged expected-turn gate", async () => {
     const hermes = new HermesHarness();
     hermes.sessions.set("session_tip", {
@@ -415,7 +503,7 @@ describe("live gateway WebSocket", () => {
     const provider = new RecordingLiveAdapter();
     const server = await startTestServer({
       config: testConfig({
-        hermes: { asyncTools: true, announceMaxDelayMs: 5_000 },
+        hermes: { asyncTools: true, announceMaxDelayMs: 5_000, deferredAnswerMaxDelayMs: 5_000 },
       }),
       hermes,
       provider,
@@ -562,6 +650,76 @@ describe("live gateway WebSocket", () => {
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "slow_chat_filler"))
       .resolves.toMatchObject({ response: { ok: true, message: "Hermes answered." } });
   });
+
+  it("re-arms filler after the receipt settles and forces a ready deferred answer past user chatter", async () => {
+    const fillerDirectory = mkdtempSync(join(temporaryRoot, "filler-clips-"));
+    stateDirectories.push(fillerDirectory);
+    const clip = Buffer.alloc(2 * 24_000 * 2 * 100 / 1_000);
+    for (let index = 0; index < clip.length; index += 1) clip[index] = index % 251;
+    writeFileSync(join(fillerDirectory, "hold_on.pcm"), clip);
+    writeFileSync(join(fillerDirectory, "hold_on.txt"), "Still working on it.");
+
+    const hermes = new HermesHarness();
+    hermes.sessions.set("session_tip", {
+      id: "session_tip",
+      title: "Release planning",
+      source: "web",
+      preview: "Continue the release",
+      lastActive: 1_784_131_300_000,
+    });
+    hermes.historyBehavior = async () => ({ sessionId: "session_tip", messages: [] });
+    const answer = deferred<HermesSessionChatResult>();
+    hermes.chatBehavior = async () => answer.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({
+        hermes: { asyncTools: true, deferredAnswerMaxDelayMs: 5_000 },
+        filler: { enabled: true, delayMs: 400, intervalMs: 1_000, maxPerTool: 5, directory: fillerDirectory },
+      }),
+      hermes,
+      provider,
+    });
+    const client = await connectClient(server.url);
+    send(client.socket, {
+      type: "session.start",
+      protocolVersion: 4,
+      conversation: { mode: "resume", sessionId: "session_tip" },
+    });
+    await client.messages.wait("session.ready");
+    await client.messages.wait("task.snapshot");
+
+    let chatter: ReturnType<typeof setInterval> | undefined;
+    try {
+      provider.emit({
+        type: "tool_call",
+        call: { id: "starved_chat", name: "continue_hermes_conversation", args: { message: "What changed?" } },
+      });
+      await provider.latest.toolResponses.wait((entry) => entry.call.id === "starved_chat");
+
+      // The provider speaks the receipt: started silences filler, and the
+      // settle re-arms the sequence because the deferred answer is outstanding.
+      provider.emit({ type: "response", status: "started" });
+      provider.emit({ type: "response", status: "completed" });
+      const reArmed = await client.messages.wait("audio.output");
+      expect(reArmed).toMatchObject({ type: "audio.output", mimeType: "audio/pcm;rate=24000" });
+
+      // The answer becomes ready while the user keeps talking: every frame
+      // re-arms userSpeaking on the ungated path, which used to starve the
+      // delivery forever. The deferred deadline forces it through.
+      answer.resolve({ sessionId: "session_tip", content: "Finally delivered." });
+      chatter = setInterval(() => send(client.socket, {
+        type: "audio.input",
+        data: Buffer.alloc(2 * 1_200).toString("base64"),
+        mimeType: "audio/pcm;rate=24000",
+      }), 400);
+      await expect(provider.latest.notifications.wait(() => true, 14_000)).resolves.toMatchObject({
+        speech: "Finally delivered.",
+      });
+    } finally {
+      if (chatter) clearInterval(chatter);
+      answer.resolve({ sessionId: "session_tip", content: "Finally delivered." });
+    }
+  }, 25_000);
 
   it("projects a stop during blocked dispatch as stopping until the exact Hermes run can be stopped", async () => {
     const start = deferred<StartRunResult>();
@@ -769,11 +927,9 @@ describe("live gateway WebSocket", () => {
       new RegExp(`^notification_${taskId}_[0-9]+$`),
     );
     const spoken = await provider.latest.notifications.wait();
-    expect(spoken.announcement).toBe("Your background task is finished. The result is ready in the task inbox.");
-    expect(spoken.context).not.toContain(secretTitle);
-    expect(spoken.context).not.toContain(secretOutput);
-    expect(spoken.announcement).not.toContain(secretTitle);
-    expect(spoken.announcement).not.toContain(secretOutput);
+    expect(spoken.announcement).toBe(`${secretTitle} is complete. ${secretOutput}`);
+    expect(spoken.context).toContain(secretTitle);
+    expect(spoken.context).toContain(secretOutput);
     await waitUntil(() => storedTask(config.tasks.stateFile, taskId)?.notification?.announcedAt !== undefined);
     const preAckNotifications = second.messages.observed.filter(
       (message) => message.type === "task.notification" && message.taskId === taskId,
@@ -1727,7 +1883,7 @@ describe("realtime provider lifecycle boundaries", () => {
       (message) => message.taskId === taskId && message.notification.acknowledged === false,
     )).resolves.toMatchObject({ taskId });
     await expect(provider.latest.notifications.wait()).resolves.toMatchObject({
-      announcement: "Your background task is finished. The result is ready in the task inbox.",
+      announcement: "Finish after the voice provider dies is complete. Completed while voice was offline",
     });
     expect(hermes.stopCalls).toEqual([]);
   });
@@ -1966,7 +2122,7 @@ describe("transport, tool-call, and notification safety", () => {
       },
     });
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "summary_with_active")).resolves
-      .toMatchObject({ response: { spoken_response: "One background task is active." } });
+      .toMatchObject({ response: { spoken_response: expect.stringMatching(/^Your tasks: 1 (queued|running)\.$/) } });
 
     provider.emit({
       type: "tool_call",
@@ -2081,7 +2237,7 @@ describe("transport, tool-call, and notification safety", () => {
       .toMatchObject({ result: { output: "Still completed" } });
   });
 
-  it("waits for provider idle before injecting a generic notification with no raw task data", async () => {
+  it("waits for provider idle before injecting a notification with a substantive digest", async () => {
     const hermes = new HermesHarness();
     const provider = new RecordingLiveAdapter();
     const server = await startTestServer({ config: testConfig(), hermes, provider });
@@ -2101,11 +2257,9 @@ describe("transport, tool-call, and notification safety", () => {
 
     provider.emit({ type: "response", status: "completed", responseId: "busy_response" });
     const notification = await provider.latest.notifications.wait();
-    expect(notification.announcement).toBe("Your background task is finished. The result is ready in the task inbox.");
+    expect(notification.announcement).toBe("Secret task title is complete. Secret task output");
     expect(notification.context).toMatch(/^\[HERMES_LIVE_TASK_EVENT_V1:[a-f0-9]{32}\]/);
     expect(JSON.stringify(notification)).not.toContain("Secret task input");
-    expect(JSON.stringify(notification)).not.toContain("Secret task title");
-    expect(JSON.stringify(notification)).not.toContain("Secret task output");
   });
 
   it.each(["user speech", "provider response"] as const)(
@@ -2176,7 +2330,7 @@ describe("transport, tool-call, and notification safety", () => {
         provider.emit({ type: "response", status: "completed", responseId: "claim_race_response" });
       }
       await expect(provider.latest.notifications.wait()).resolves.toMatchObject({
-        announcement: "Your background task is finished. The result is ready in the task inbox.",
+        announcement: "Finish during claim is complete. done",
       });
     },
   );
@@ -2205,7 +2359,7 @@ describe("transport, tool-call, and notification safety", () => {
     provider.emit({ type: "response", status: "started", responseId: "vad_turn_response" });
     provider.emit({ type: "response", status: "completed", responseId: "vad_turn_response" });
     await expect(provider.latest.notifications.wait()).resolves.toMatchObject({
-      announcement: "Your background task is finished. The result is ready in the task inbox.",
+      announcement: "Finish while the user is speaking is complete. done",
     });
   });
 
@@ -2295,7 +2449,7 @@ describe("transport, tool-call, and notification safety", () => {
 
     provider.emit({ type: "text", speaker: "user", text: "final transcript", final: true });
     await expect(provider.latest.notifications.wait()).resolves.toMatchObject({
-      announcement: "Your background task is finished. The result is ready in the task inbox.",
+      announcement: "Finish before the final transcript is complete. done",
     });
   });
 
@@ -2364,6 +2518,41 @@ describe("gateway speech detection", () => {
       type: "input.speech_stopped",
       provider: "gateway",
     });
+  });
+
+  it("suppresses echo turns in half-duplex mode while provider audio drains", async () => {
+    const config = gatewayVoiceConfig({ halfDuplex: true, turnTailMs: 150 });
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider, speechDetection: energyDetection(config) });
+    const client = await readyClient(server.url, { protocolVersion: 7 });
+
+    // A provider utterance starts playing: 600 ms of PCM announced in one burst.
+    provider.emit({
+      type: "audio",
+      audio: { data: Buffer.alloc(2 * 14_400).toString("base64"), mimeType: "audio/pcm;rate=24000" },
+    });
+    await client.messages.wait("audio.output");
+
+    // Loud mic frames during the drain are never confirmed and never forwarded.
+    for (let i = 0; i < 8; i += 1) send(client.socket, audioInputFrame(0.05, 10 + i));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(provider.latest.audioInputs).toHaveLength(0);
+    expect(client.messages.observed.some((message) => message.type === "input.speech_started")).toBe(false);
+
+    // The client's own VAD closing the turn during suppression commits nothing.
+    send(client.socket, { type: "audio.end", id: "echo-end" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(provider.latest.streamEnds).toHaveLength(0);
+
+    // Past the drain + tail, the same loud speech starts a clean turn.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    for (let i = 0; i < 8; i += 1) send(client.socket, audioInputFrame(0.05, 100 + i));
+    await expect(client.messages.wait("input.speech_started")).resolves.toMatchObject({
+      type: "input.speech_started",
+      provider: "gateway",
+    });
+    await waitUntil(() => provider.latest.audioInputs.length > 0);
   });
 
   it("keeps protocol v6 sessions on the legacy ungated audio path", async () => {
@@ -3074,7 +3263,10 @@ class RecordingLiveSession implements LiveModelSession {
     await this.textBehavior?.(text);
   }
 
+  readonly streamEnds: number[] = [];
+
   async sendAudioStreamEnd(): Promise<boolean> {
+    this.streamEnds.push(this.streamEnds.length);
     return false;
   }
 

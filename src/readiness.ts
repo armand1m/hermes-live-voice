@@ -199,6 +199,16 @@ function realtimeCheckSummary(config: AppConfig): Record<string, unknown> {
       implementation: "huggingface/speech-to-speech",
     };
   }
+  if (config.realtime.provider === "riva") {
+    return {
+      ...base,
+      asrEndpoint: publicBaseUrl(config.riva.asrUrl),
+      ttsEndpoint: publicBaseUrl(config.riva.ttsUrl),
+      brainEndpoint: publicBaseUrl(config.riva.brainUrl),
+      voice: config.riva.voice,
+      implementation: "nvidia/speech-nim",
+    };
+  }
   if (config.realtime.provider === "openai") {
     return {
       ...base,

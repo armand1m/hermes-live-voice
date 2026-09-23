@@ -22,6 +22,7 @@ const presenceDetail = document.querySelector("#presence-detail");
 const inputSignal = document.querySelector("#signal-input");
 const outputSignal = document.querySelector("#signal-output");
 const reconnectButton = document.querySelector("#reconnect");
+const takeoverButton = document.querySelector("#takeover");
 
 // The operator can bootstrap a tab with #token=... once. Keep it only in
 // sessionStorage so reloads do not require the secret again, while closing
@@ -294,6 +295,25 @@ reconnectButton.addEventListener("click", () => {
 
 supervisor.on("change", renderReconnectStatus);
 
+// --- voice ownership (newest page wins) ----------------------------------------
+// A newer tab claimed this owner's voice: this page becomes view-only. Turns
+// are already dropped server-side; stop the mic so we neither transcribe nor
+// answer, and offer a one-click take-over that reconnects as the newest page.
+client.on("session.demoted", () => {
+  logSystemLine("Voice is active in a newer tab — this page is view-only.");
+  status("muted", "Voice active elsewhere");
+  detail.textContent = "A newer tab owns the microphone. This page stays view-only; take over to bring the voice here.";
+  takeoverButton.hidden = false;
+  void audio.stopMicrophone({ endTurn: false }).catch(() => undefined);
+});
+client.on("session.ready", () => {
+  takeoverButton.hidden = true;
+});
+takeoverButton.addEventListener("click", () => {
+  logSystemLine("Take-over requested: reconnecting as the newest session.");
+  void supervisor.forceReconnect("takeover");
+});
+
 // --- microphone ------------------------------------------------------------
 audio.on("microphone", (event) => {
   controller.microphoneState(event.state);
@@ -483,6 +503,18 @@ function toolLabel(task, message) {
   return task.title || "task";
 }
 
+// Deferred answers: the receipt completed the response, but Hermes' answer is
+// still computing. Keep the "making sense of it" presence alive until it lands
+// (entity-state's thinking would otherwise decay after ~30 s).
+let deferredPendingCount = 0;
+client.on("deferred.pending", () => {
+  deferredPendingCount += 1;
+  controller.responseActivity();
+});
+client.on("deferred.delivered", () => {
+  deferredPendingCount = Math.max(0, deferredPendingCount - 1);
+});
+
 client.on("task.updated", ({ task, message }) => {
   const type = message.type;
   if (type === "task.accepted" || type === "task.started") {
@@ -493,6 +525,7 @@ client.on("task.updated", ({ task, message }) => {
     if (type === "task.started") sfx.play("taskStarted");
   } else if (type === "task.progress") {
     controller.toolActivity();
+    controller.responseActivity();
     scene?.pulse(0.3);
     scene?.toolPacketStart(task.taskId, toolLabel(task, message));
     sfx.play("taskTick");
@@ -614,9 +647,13 @@ function frame(now) {
   controller.update(dt, { speakingNow, micActive: audio.microphoneActive });
   const visual = controller.readout();
   const presenceMode = visual.mode === "idle" && !audio.microphoneActive ? "paused" : visual.mode;
-  if (presenceMode !== lastPresence) {
-    lastPresence = presenceMode;
-    const copy = presenceCopy[presenceMode] || presenceCopy.idle;
+  const deferredWaiting = deferredPendingCount > 0 && !["speaking", "tool"].includes(presenceMode);
+  const presenceKey = presenceMode + (deferredWaiting ? "+deferred" : "");
+  if (presenceKey !== lastPresence) {
+    lastPresence = presenceKey;
+    const copy = deferredWaiting
+      ? ["Making sense of it", "Hermes is preparing your answer."]
+      : (presenceCopy[presenceMode] || presenceCopy.idle);
     if (presenceLabel) presenceLabel.textContent = copy[0];
     if (presenceDetail) presenceDetail.textContent = copy[1];
     if (client.connected && presenceMode !== "error") {
@@ -785,6 +822,28 @@ if (reducedMotionQuery) {
     if (scene) scene.reducedMotion = Boolean(event.matches);
   });
 }
+
+// --- minimal chrome (wordmark toggle) -----------------------------------------
+// Clicking the wordmark folds the caption box and the diagnostics panel away
+// for an unobstructed view of the entity. Presence, channel state and the
+// mute control stay; the preference persists per browser like audio prefs.
+const chromeToggle = document.querySelector("#chrome-toggle");
+const chromePrefKey = "hermes-live-chrome";
+function setChromeMinimal(minimal) {
+  document.body.dataset.chrome = minimal ? "minimal" : "full";
+  chromeToggle?.setAttribute("aria-pressed", String(minimal));
+  try { localStorage.setItem(chromePrefKey, document.body.dataset.chrome); } catch { /* storage may be blocked */ }
+}
+chromeToggle?.addEventListener("click", () => setChromeMinimal(document.body.dataset.chrome !== "minimal"));
+chromeToggle?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    setChromeMinimal(document.body.dataset.chrome !== "minimal");
+  }
+});
+try {
+  if (localStorage.getItem(chromePrefKey) === "minimal") setChromeMinimal(true);
+} catch { /* storage may be blocked */ }
 
 const logToggle = document.querySelector("#log-toggle");
 const logDrawer = document.querySelector("#log-drawer");

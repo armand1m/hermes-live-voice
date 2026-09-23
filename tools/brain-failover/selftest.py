@@ -229,6 +229,24 @@ def dryrun_layer(tmp: Path) -> None:
     check("status file still tracks state", json.loads(status.read_text())["state"] == "up")
 
 
+def retired_voice_layer(tmp: Path) -> None:
+    print("layer 3: retired speech-to-speech service is never restarted")
+    home = tmp / "retired-home"
+    status = tmp / "retired-brain-status.json"
+    os.environ["HERMES_BRAIN_FAILOVER_HOME"] = str(home)
+    config = make_config(home, status)
+    config["s2s"]["enabled"] = False
+    controller = RecordingController(config)
+    controller.probe_impl = lambda: {"ok": False, "detail": "scripted outage"}
+    for _ in range(3):
+        controller.tick()
+    check("retired voice not switched on outage", not any(call[0] == "apply_brain" for call in controller.calls))
+    controller.probe_impl = lambda: {"ok": True, "detail": "scripted recovery"}
+    for _ in range(3):
+        controller.tick()
+    check("retired voice not restarted on recovery", not any(call[0] == "apply_brain" for call in controller.calls))
+
+
 class FakeSock:
     def __init__(self, data: bytes):
         self.data = data
@@ -239,7 +257,7 @@ class FakeSock:
 
 
 def ws_codec_layer() -> None:
-    print("layer 3: websocket framer round-trip")
+    print("layer 4: websocket framer round-trip")
     payload = json.dumps({"type": "response.audio_transcript.delta", "delta": "héllo ✓"}).encode()
     frame = bf._ws_frame(0x1, payload)
     sock = FakeSock(frame)
@@ -261,6 +279,7 @@ def main() -> int:
         tmp = Path(tmp_name)
         fsm_layer(tmp)
         dryrun_layer(tmp)
+        retired_voice_layer(tmp)
     ws_codec_layer()
     print(f"\nselftest summary: {PASS} passed, {FAIL} failed")
     print(json.dumps({"passed": PASS, "failed": FAIL}))

@@ -60,6 +60,18 @@ describe("realtime client capabilities", () => {
       },
     });
   });
+
+  it("advertises Riva PCM rates and manual audio commit", () => {
+    expect(realtimeClientCapabilities(config({ provider: "riva", model: "nvidia/speech-nim" }))).toEqual({
+      provider: "riva",
+      model: "nvidia/speech-nim",
+      audio: {
+        input: { enabled: true, mimeType: "audio/pcm;rate=16000", recommendedFrameMs: 80 },
+        output: { enabled: true, mimeType: "audio/pcm;rate=22050" },
+        turnDetection: "disabled",
+      },
+    });
+  });
 });
 
 function config(realtime: AppConfig["realtime"]): Pick<AppConfig, "realtime" | "openai"> {

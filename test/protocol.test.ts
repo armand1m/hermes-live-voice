@@ -14,9 +14,9 @@ import {
 
 const NOW = 1_784_131_200_000;
 
-describe("protocol v9", () => {
+describe("protocol v11", () => {
   it("binds current sessions to a new, resumed, or unbound Hermes conversation", () => {
-    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(9);
+    expect(HERMES_LIVE_PROTOCOL_VERSION).toBe(11);
     expect(
       parseClientMessage({
         type: "session.start",

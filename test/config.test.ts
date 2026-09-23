@@ -57,6 +57,8 @@ describe("config", () => {
       echoStartSustainMs: 200,
       prerollMs: 250,
       tailMs: 400,
+      halfDuplex: false,
+      turnTailMs: 1_000,
     });
     expect(config.context).toEqual({
       hermesHome: loadConfig({}).context.hermesHome,
@@ -66,6 +68,19 @@ describe("config", () => {
       recallTimeoutMs: 30_000,
     });
     expect(config.context.hermesHome).toMatch(/\.hermes$/u);
+  });
+
+  it("configures Riva speech sockets and rejects cleartext remote speech", () => {
+    const config = loadConfig({ HERMES_LIVE_PROVIDER: "riva" });
+    expect(config.realtime.model).toBe("nvidia/speech-nim");
+    expect(config.riva.asrUrl).toBe("ws://127.0.0.1:19000/v1/realtime?intent=transcription");
+    expect(config.riva.ttsUrl).toBe("ws://127.0.0.1:19001/v1/realtime?intent=synthesize");
+    expect(realtimeProviderConfigured(config)).toBe(true);
+    expect(() => assertRuntimeConfig(loadConfig({
+      HERMES_LIVE_PROVIDER: "riva",
+      HERMES_AGENT_API_SERVER_KEY: "test-key",
+      HERMES_LIVE_RIVA_ASR_URL: "ws://10.0.0.2:9000/v1/realtime?intent=transcription",
+    }))).toThrow(/wss/u);
   });
 
   it("configures voice memory context and rejects non-absolute Hermes homes", () => {

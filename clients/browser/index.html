@@ -21,7 +21,7 @@
 <div class="viewport-frame" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
 
 <header class="bar">
-  <span class="mark"><i aria-hidden="true"></i>HERMES <b>/</b> LIVE</span>
+  <span id="chrome-toggle" class="mark" role="button" tabindex="0" aria-pressed="false" aria-label="Toggle captions and diagnostics" title="Toggle captions and diagnostics"><i aria-hidden="true"></i>HERMES <b>/</b> LIVE</span>
   <span id="meta-line" class="meta">VOICE INTERFACE · DIRECT CHANNEL</span>
 </header>
 
@@ -40,6 +40,7 @@
     <span>OUT</span><div class="output-meter"><i id="signal-output"></i></div>
   </div>
   <button id="reconnect" hidden>Reconnect now</button>
+  <button id="takeover" hidden>Take over voice</button>
 </section>
 
 <aside class="periphery" aria-label="Background work">

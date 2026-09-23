@@ -219,8 +219,8 @@ describe("HTTP server", () => {
     });
     await expect(fetch(`${server.url}/v1/capabilities`).then((res) => res.json())).resolves.toMatchObject({
       object: "hermes_live.capabilities",
-      protocolVersion: 9,
-      supportedProtocolVersions: [3, 4, 5, 6, 7, 8, 9],
+      protocolVersion: 11,
+      supportedProtocolVersions: [3, 4, 5, 6, 7, 8, 9, 10, 11],
       realtime: {
         provider: "openai",
         model: "gpt-realtime-2",
@@ -1147,6 +1147,17 @@ function testConfig(
       allowRemote: false,
       ...overrides.local,
     },
+    riva: {
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0,
+      brainMaxTokens: 2_048,
+      brainReasoningEffort: "off",
+      echoGuard: true,
+    },
     gemini: { model: "gemini-3.1-flash-live-preview", enterprise: false, location: "us-central1", ...overrides.gemini },
     openai: {
       apiKey: "test",
@@ -1203,6 +1214,8 @@ function testVadConfig(): AppConfig["vad"] {
     echoStartSustainMs: 200,
     prerollMs: 250,
     tailMs: 400,
+    halfDuplex: false,
+    turnTailMs: 1_000,
   };
 }
 

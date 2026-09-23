@@ -454,7 +454,7 @@ export function printSetupHelp(): void {
 Configure voice, install the Hermes plugin, verify both runtimes, and start the gateway.
 
 Options:
-  --provider <local|gemini|openai|mock>  Realtime voice provider
+  --provider <local|riva|gemini|openai|mock>  Realtime voice provider
   --hermes-url <url>               Hermes API Server URL
   --config <path>                  Managed config path
   --plugins-dir <path>             Hermes plugins directory
@@ -496,14 +496,14 @@ async function selectProvider(
 ): Promise<RealtimeProvider> {
   if (options.provider) return options.provider;
   const configured = inherited.HERMES_LIVE_PROVIDER;
-  if (configured === "local" || configured === "gemini" || configured === "openai" || configured === "mock") return configured;
+  if (configured === "local" || configured === "riva" || configured === "gemini" || configured === "openai" || configured === "mock") return configured;
   if ((dependencies.platform ?? process.platform) === "darwin" && (dependencies.arch ?? process.arch) === "arm64") return "local";
   if (inherited.OPENAI_API_KEY && !inherited.GEMINI_API_KEY && !inherited.GOOGLE_API_KEY) return "openai";
   if (inherited.GEMINI_API_KEY || inherited.GOOGLE_API_KEY) return "gemini";
   if (options.nonInteractive) {
-    throw new Error("No voice provider was selected. Pass --provider local, gemini, openai, or mock.");
+    throw new Error("No voice provider was selected. Pass --provider local, riva, gemini, openai, or mock.");
   }
-  const answer = (await (dependencies.prompt ?? promptText)("Voice provider [gemini/openai/local/mock]: ")).trim();
+  const answer = (await (dependencies.prompt ?? promptText)("Voice provider [gemini/openai/local/riva/mock]: ")).trim();
   if (!answer) throw new Error("Choose a voice provider, or rerun setup with --provider.");
   return parseProvider(answer);
 }
@@ -899,8 +899,8 @@ function isHermesApiCompatibilityError(message: string): boolean {
 }
 
 function parseProvider(value: string): RealtimeProvider {
-  if (value === "local" || value === "gemini" || value === "openai" || value === "mock") return value;
-  throw new Error(`Unsupported provider: ${value}. Choose local, gemini, openai, or mock.`);
+  if (value === "local" || value === "riva" || value === "gemini" || value === "openai" || value === "mock") return value;
+  throw new Error(`Unsupported provider: ${value}. Choose local, riva, gemini, openai, or mock.`);
 }
 
 async function checkProviderSession(

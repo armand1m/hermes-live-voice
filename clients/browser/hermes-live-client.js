@@ -72,7 +72,7 @@ const TASK_STOP_RESPONSE_TYPES = new Set([
   "task.unknown",
 ]);
 const OPEN = 1;
-export const HERMES_LIVE_PROTOCOL_VERSION = 9;
+export const HERMES_LIVE_PROTOCOL_VERSION = 11;
 
 const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "session.ready",
@@ -97,6 +97,9 @@ const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "task.cancelled",
   "task.unknown",
   "task.notification",
+  "session.demoted",
+  "deferred.pending",
+  "deferred.delivered",
   "log",
 ]);
 
@@ -1115,7 +1118,18 @@ export class HermesLiveAudio {
     this.unsubscribeSpeechStopped = client.on?.("input.speech_stopped", (event) => {
       if (event?.provider === "gateway") this.onConfirmedSpeechStopped(event);
     });
-    this.unsubscribeResponseStarted = client.on?.("response.started", () => {
+    this.notificationPlayback = undefined;
+    this.unsubscribeResponseCompleted = client.on?.("response.completed", (event) => {
+      if (event.notificationId && this.notificationPlayback?.id === event.notificationId) {
+        this.notificationPlayback.complete = true;
+        void this.playbackChain.finally(() => this.maybeConfirmNotificationPlayback());
+      }
+    });
+    this.unsubscribeResponseStarted = client.on?.("response.started", (event) => {
+      if (event.notificationId) {
+        this.finishNotificationPlayback("interrupted");
+        this.notificationPlayback = { id: event.notificationId, complete: false, frames: 0 };
+      }
       this.playbackSuppressed = false;
       this.playbackOverflowed = false;
       this.gatewaySpeechConfirmed = false;
@@ -1398,6 +1412,7 @@ export class HermesLiveAudio {
       } finally {
         this.pendingPlaybackMs = Math.max(0, this.pendingPlaybackMs - frame.durationMs);
         this.pendingPlaybackFrames = Math.max(0, this.pendingPlaybackFrames - 1);
+        this.maybeConfirmNotificationPlayback();
       }
     });
     this.playbackChain = operation.catch(() => undefined);
@@ -1490,6 +1505,10 @@ export class HermesLiveAudio {
       stopped: false,
     };
     this.playbackSources.add(record);
+    if (this.notificationPlayback) {
+      this.notificationPlayback.frames += 1;
+      if (this.notificationPlayback.frames === 1) this.sendPlaybackStatus(this.notificationPlayback.id, "playing");
+    }
     this.playbackCursor = record.endAt;
     source.addEventListener("ended", () => this.finishPlaybackRecord(record), { once: true });
     source.start(startAt);
@@ -1499,6 +1518,22 @@ export class HermesLiveAudio {
       queuedMs: this.calculateQueuedPlaybackMs(context.currentTime),
     });
     return true;
+  }
+
+  sendPlaybackStatus(notificationId, status) {
+    if (!this.client.connected || this.client.session?.protocolVersion < 11) return;
+    try { this.client.send({ type: "speech.playback", notificationId, status }); } catch { /* reconnect retains unread state */ }
+  }
+
+  finishNotificationPlayback(status) {
+    const playback = this.notificationPlayback;
+    this.notificationPlayback = undefined;
+    if (playback) this.sendPlaybackStatus(playback.id, status);
+  }
+
+  maybeConfirmNotificationPlayback() {
+    if (!this.notificationPlayback?.complete || this.pendingPlaybackFrames || this.playbackSources.size) return;
+    this.finishNotificationPlayback(this.notificationPlayback.frames > 0 && !this.playbackOverflowed ? "delivered" : "failed");
   }
 
   finishPlaybackRecord(record) {
@@ -1518,6 +1553,7 @@ export class HermesLiveAudio {
       this.playbackConsecutiveLate = 0;
       this.playbackCursor = 0;
     }
+    this.maybeConfirmNotificationPlayback();
     this.emitter.emit("playback", {
       active: this.playbackSources.size > 0,
       queued: this.playbackSources.size,
@@ -1556,6 +1592,7 @@ export class HermesLiveAudio {
   }
 
   clearPlayback() {
+    this.finishNotificationPlayback("interrupted");
     this.playbackEpoch.invalidate();
     this.playbackEpoch = createPlaybackEpoch();
     ++this.playbackGeneration;
@@ -1704,6 +1741,7 @@ export class HermesLiveAudio {
     this.unsubscribeSpeechStarted?.();
     this.unsubscribeSpeechStopped?.();
     this.unsubscribeResponseStarted?.();
+    this.unsubscribeResponseCompleted?.();
     this.unsubscribeResponseCancelled?.();
     this.unsubscribeResponseFailed?.();
     this.emitter.clear();
@@ -1840,13 +1878,30 @@ export function validateServerMessage(value) {
     case "response.started":
     case "response.completed":
     case "response.cancelled":
-      requireOnlyKeys(message, ["type", "responseId"]);
+      requireOnlyKeys(message, ["type", "responseId", "scope", "notificationId"]);
       optionalOpaqueId(message, "responseId");
+      optionalOpaqueId(message, "notificationId");
+      optionalEnum(message, "scope", ["conversation", "task_notification"]);
       break;
     case "response.failed":
-      requireOnlyKeys(message, ["type", "responseId", "error"]);
+      requireOnlyKeys(message, ["type", "responseId", "scope", "error", "notificationId"]);
       optionalOpaqueId(message, "responseId");
+      optionalOpaqueId(message, "notificationId");
+      optionalEnum(message, "scope", ["conversation", "task_notification"]);
       requireBoundedString(message, "error", PUBLIC_TASK_ERROR_MAX_CHARS);
+      break;
+    case "session.demoted":
+      requireOnlyKeys(message, ["type", "reason"]);
+      requireEnum(message, "reason", ["superseded"]);
+      break;
+    case "deferred.pending":
+      requireOnlyKeys(message, ["type", "pendingId", "kind"]);
+      requireOpaqueId(message, "pendingId", 128);
+      requireEnum(message, "kind", ["conversation", "recall"]);
+      break;
+    case "deferred.delivered":
+      requireOnlyKeys(message, ["type", "pendingId"]);
+      requireOpaqueId(message, "pendingId", 128);
       break;
     case "task.snapshot": {
       requireOnlyKeys(message, ["type", "reason", "requestId", "tasks", "truncated"]);
@@ -2316,7 +2371,7 @@ function validateTaskNotification(value) {
 function validateRealtimeCapabilities(value) {
   requireOnlyKeys(value, ["provider", "model", "audio"], "session.ready realtime");
   const realtime = { ...value, type: "session.ready realtime" };
-  requireEnum(realtime, "provider", ["local", "gemini", "openai", "mock"]);
+  requireEnum(realtime, "provider", ["local", "riva", "gemini", "openai", "mock"]);
   requireBoundedString(realtime, "model", PUBLIC_MODEL_MAX_CHARS);
   requireObject(realtime, "audio");
   const audio = value.audio;

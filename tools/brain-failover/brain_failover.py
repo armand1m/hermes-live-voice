@@ -90,6 +90,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "hermes_env_file": str(Path.home() / ".hermes" / ".env"),
     "s2s": {
+        "enabled": True,  # disable after migrating voice away from speech-to-speech
         "unit": "hermes-s2s.service",
         "env_file": "",  # default: <home>/s2s-brain.env
         "ws_host": "127.0.0.1",
@@ -796,19 +797,20 @@ class BrainFailover:
         log.info("fallback probe: %s", fallback_probe)
 
         switch = None
-        try:
-            switch = self.apply_brain("failover", verify_text_probe=True)
-            self._mark("s2s_failover",
-                       at=iso(utcnow()),
-                       verified=switch.get("verified"),
-                       text_probe_ok=(switch.get("text_probe") or {}).get("ok"))
-        except Exception as error:  # noqa: BLE001 — journal and retry next tick
-            log.error("s2s failover switch failed (will retry): %s", error)
+        if self.cfg["s2s"].get("enabled", True):
+            try:
+                switch = self.apply_brain("failover", verify_text_probe=True)
+                self._mark("s2s_failover",
+                           at=iso(utcnow()),
+                           verified=switch.get("verified"),
+                           text_probe_ok=(switch.get("text_probe") or {}).get("ok"))
+            except Exception as error:  # noqa: BLE001 — journal and retry next tick
+                log.error("s2s failover switch failed (will retry): %s", error)
 
-        voice_status = "switched"
-        if switch is None:
+        voice_status = "Riva gateway retains its configured brain" if not self.cfg["s2s"].get("enabled", True) else "switched"
+        if switch is None and self.cfg["s2s"].get("enabled", True):
             voice_status = "switch pending (retrying)"
-        elif not switch.get("verified"):
+        elif switch is not None and not switch.get("verified"):
             voice_status = "switched but NOT verified"
         probe_line = ""
         if switch and switch.get("text_probe"):
@@ -824,11 +826,14 @@ class BrainFailover:
             diag_line = "\n- Diagnosis task: spawn failed, retrying."
 
         fallback_note = "" if fallback_probe["ok"] else f"\n- WARNING: GLM fallback probe failed ({fallback_probe['detail']}) — voice may stay offline."
+        voice_line = ("- Voice brain: " + voice_status + "."
+                      if not self.cfg["s2s"].get("enabled", True)
+                      else f"- Voice brain: {voice_status} to GLM {self.cfg['fallback']['name']}.{probe_line}")
         message = (
             "⚠️ Hermes brain failover\n\n"
             f"The main model {self.cfg['primary']['name']} (sglang :30000) looks DOWN "
             f"(detected {local_ts(now)} after {self.cfg['down_after']} failed probes).\n"
-            f"- Voice brain: {voice_status} to GLM {self.cfg['fallback']['name']}.{probe_line}"
+            f"{voice_line}"
             "\n- Chat gateway: fails over per-run to GLM (hermes native fallback chain)."
             f"{diag_line}{fallback_note}\n\n"
             "You will get another message when the main model is back."
@@ -861,11 +866,12 @@ class BrainFailover:
         self.write_status_file()
 
         switch = None
-        try:
-            switch = self.apply_brain("primary")
-            self._mark("s2s_restore", at=iso(utcnow()), verified=switch.get("verified"))
-        except Exception as error:  # noqa: BLE001
-            log.error("s2s restore switch failed (will retry): %s", error)
+        if self.cfg["s2s"].get("enabled", True):
+            try:
+                switch = self.apply_brain("primary")
+                self._mark("s2s_restore", at=iso(utcnow()), verified=switch.get("verified"))
+            except Exception as error:  # noqa: BLE001
+                log.error("s2s restore switch failed (will retry): %s", error)
 
         outcome = self.collect_diag_outcome()
         log.info("diag outcome for %s: %s", episode, outcome)
@@ -882,21 +888,24 @@ class BrainFailover:
             self._save_state()
             log.info("diag outcome pending; watching pane %s for up to 30 min", outcome["pane"])
 
-        voice_status = "switched back"
-        if switch is None:
+        voice_status = "Riva gateway retains its configured brain" if not self.cfg["s2s"].get("enabled", True) else "switched back"
+        if switch is None and self.cfg["s2s"].get("enabled", True):
             voice_status = "restore pending (retrying)"
-        elif not switch.get("verified"):
+        elif switch is not None and not switch.get("verified"):
             voice_status = "switched back but NOT verified"
         diag_line = ""
         if outcome.get("result") not in ("unknown", ""):
             diag_line = (f"\n- Diagnosis: {outcome['result']}"
                          + (f" — {outcome['summary']}" if outcome.get("summary") else "")
                          + (f"\n- Cause: {outcome['cause']}" if outcome.get("cause") else ""))
+        voice_line = ("- Voice brain: " + voice_status + "."
+                      if not self.cfg["s2s"].get("enabled", True)
+                      else f"- Voice brain: {voice_status} to the primary.")
         message = (
             "✅ Hermes main brain restored\n\n"
             f"{self.cfg['primary']['name']} (sglang :30000) is answering again "
             f"(recovered {local_ts(now)}; was down {duration or 'unknown'}).\n"
-            f"- Voice brain: {voice_status} to the primary.\n"
+            f"{voice_line}\n"
             "- Chat gateway: new runs use the primary again automatically."
             f"{diag_line}"
         )
@@ -1024,15 +1033,16 @@ class BrainFailover:
 
     def reconcile(self) -> None:
         """Adopt whatever the s2s env file says after a controller restart."""
-        env_brain = self._read_s2s_env_brain()
-        state_brain = "failover" if self.state["state"] == "down" else "primary"
-        if env_brain is not None and env_brain != state_brain:
-            log.warning("reconcile: state=%s but s2s env says %s — re-applying %s",
-                        self.state["state"], env_brain, state_brain)
-            try:
-                self.apply_brain(state_brain)
-            except Exception as error:  # noqa: BLE001
-                log.error("reconcile re-apply failed (will keep trying via transitions): %s", error)
+        if self.cfg["s2s"].get("enabled", True):
+            env_brain = self._read_s2s_env_brain()
+            state_brain = "failover" if self.state["state"] == "down" else "primary"
+            if env_brain is not None and env_brain != state_brain:
+                log.warning("reconcile: state=%s but s2s env says %s — re-applying %s",
+                            self.state["state"], env_brain, state_brain)
+                try:
+                    self.apply_brain(state_brain)
+                except Exception as error:  # noqa: BLE001
+                    log.error("reconcile re-apply failed (will keep trying via transitions): %s", error)
         # Warn (once per start) when the gateway-side fallback chain is missing.
         gateway_cfg = Path(self.cfg["gateway_config"])
         marker = self.cfg["gateway_fallback_block"]
@@ -1082,7 +1092,7 @@ class BrainFailover:
                 pending = [name for name, entry in self.state.get("actions", {}).items() if entry.get("status") != "done"]
                 if pending:
                     log.info("retrying pending down-actions: %s", pending)
-                    if "s2s_failover" in pending:
+                    if "s2s_failover" in pending and self.cfg["s2s"].get("enabled", True):
                         try:
                             switch = self.apply_brain("failover", verify_text_probe=True)
                             self._mark("s2s_failover", at=iso(utcnow()), verified=switch.get("verified"))

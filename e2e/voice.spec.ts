@@ -84,6 +84,38 @@ test('history follows streaming text and final corrections without duplicating m
   } finally { await page.close(); await harness.close(); }
 });
 
+test('the wordmark folds captions and diagnostics away while status controls stay', async ({ page }) => {
+  const harness = await voiceHarness();
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  try {
+    await page.goto(harness.url);
+    await expect(page.locator('#state')).toHaveAttribute('data-state', 'armed');
+    await expect(page.locator('.stream')).toBeVisible();
+    await expect(page.locator('.diagnostics')).toBeVisible();
+
+    // The wordmark is a toggle, not a real button: the Mute button stays the
+    // only visible <button> on the page.
+    await page.locator('#chrome-toggle').click();
+    await expect(page.locator('.stream')).toBeHidden();
+    await expect(page.locator('.diagnostics')).toBeHidden();
+    await expect(page.locator('.presence')).toBeVisible();
+    await expect(page.locator('.state-cluster')).toBeVisible();
+    await expect(page.locator('#mute')).toBeVisible();
+    await expect(page.locator('button:visible')).toHaveCount(1);
+
+    // The preference survives a reload, and a second click restores the panels.
+    await page.reload();
+    await expect(page.locator('#state')).toHaveAttribute('data-state', 'armed');
+    await expect(page.locator('.stream')).toBeHidden();
+    await expect(page.locator('.diagnostics')).toBeHidden();
+    await page.locator('#chrome-toggle').click();
+    await expect(page.locator('.stream')).toBeVisible();
+    await expect(page.locator('.diagnostics')).toBeVisible();
+    expect(errors).toEqual([]);
+  } finally { await page.close(); await harness.close(); }
+});
+
 test('a dropped connection visibly reconnects with backoff and re-arms the microphone', async ({ page }) => {
   const harness = await voiceHarness();
   try {

@@ -26,6 +26,25 @@ describe("AgentStateController", () => {
     expect(controller.listeningActive).toBe(false);
   });
 
+  it("keeps re-armed thinking above listening while a deferred answer is pending", () => {
+    const controller = new AgentStateController();
+    controller.connectionState("ready");
+
+    // A turn ended and the page is back to listening; deferred work re-arms
+    // thinking via responseActivity() — thinking must outrank listening.
+    controller.userSpeechStarted();
+    controller.userSpeechEnded();
+    controller.update(1 / 60, frame);
+    expect(controller.mode).toBe("thinking");
+    // Listening resumes underneath, and deferred work re-arms thinking via
+    // responseActivity(): thinking must keep outranking listening.
+    controller.listeningActive = true;
+    controller.responseActivity();
+    controller.update(1 / 60, frame);
+    expect(controller.thinkingActive).toBe(true);
+    expect(controller.mode).toBe("thinking");
+  });
+
   it("releases tool activity and exposes background task waiting mode", () => {
     const controller = new AgentStateController();
     controller.connectionState("ready");

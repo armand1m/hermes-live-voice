@@ -348,6 +348,24 @@ body.no-webgl .fallback {
   opacity: 0.45;
   cursor: default;
 }
+#takeover {
+  margin: 12px 0 0 8px;
+  padding: 8px 14px;
+  border: 1px solid rgba(255, 192, 124, 0.42);
+  color: var(--warm);
+  background: rgba(38, 26, 10, 0.55);
+  font: 500 10px/1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease);
+}
+#takeover:hover,
+#takeover:focus-visible {
+  border-color: var(--warm);
+  background: rgba(58, 38, 12, 0.72);
+  outline: none;
+}
 .periphery {
   position: fixed;
   right: 30px;
@@ -1153,6 +1171,38 @@ body[data-mode="speaking"] .diagnostics {
   body[data-diagnostics="on"] .periphery {
     top: 236px;
   }
+}
+/* Minimal chrome: the wordmark folds the caption box and the diagnostics
+   panel away, leaving presence, channel state and the mute control. Visibility
+   flips after the fade so hiding waits out the transition and restoring shows
+   through immediately (the base rules carry the fade back in). */
+#chrome-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+#chrome-toggle:hover b,
+#chrome-toggle:focus-visible b {
+  color: rgb(var(--accent-live));
+}
+#chrome-toggle:focus-visible {
+  outline: 1px solid rgba(var(--accent-live), 0.75);
+  outline-offset: 4px;
+}
+#chrome-toggle[aria-pressed="true"] i {
+  background: var(--faint);
+  box-shadow: none;
+}
+body[data-chrome="minimal"] .stream,
+body[data-chrome="minimal"] .diagnostics {
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.65s var(--ease),
+    visibility 0s linear 0.65s;
+}
+/* Folding the panel away also frees the corner it reserved for background work. */
+body[data-chrome="minimal"][data-diagnostics="on"] .periphery {
+  top: 82px;
 }
 .dev-panel {
   position: fixed;

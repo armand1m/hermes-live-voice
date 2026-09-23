@@ -72,7 +72,7 @@ const TASK_STOP_RESPONSE_TYPES = new Set([
   "task.unknown",
 ]);
 const OPEN = 1;
-export const HERMES_LIVE_PROTOCOL_VERSION = 9;
+export const HERMES_LIVE_PROTOCOL_VERSION = 10;
 
 const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "session.ready",
@@ -97,6 +97,9 @@ const KNOWN_SERVER_MESSAGE_TYPES = new Set([
   "task.cancelled",
   "task.unknown",
   "task.notification",
+  "session.demoted",
+  "deferred.pending",
+  "deferred.delivered",
   "log",
 ]);
 
@@ -1840,13 +1843,28 @@ export function validateServerMessage(value) {
     case "response.started":
     case "response.completed":
     case "response.cancelled":
-      requireOnlyKeys(message, ["type", "responseId"]);
+      requireOnlyKeys(message, ["type", "responseId", "scope"]);
       optionalOpaqueId(message, "responseId");
+      optionalEnum(message, "scope", ["conversation", "task_notification"]);
       break;
     case "response.failed":
-      requireOnlyKeys(message, ["type", "responseId", "error"]);
+      requireOnlyKeys(message, ["type", "responseId", "scope", "error"]);
       optionalOpaqueId(message, "responseId");
+      optionalEnum(message, "scope", ["conversation", "task_notification"]);
       requireBoundedString(message, "error", PUBLIC_TASK_ERROR_MAX_CHARS);
+      break;
+    case "session.demoted":
+      requireOnlyKeys(message, ["type", "reason"]);
+      requireEnum(message, "reason", ["superseded"]);
+      break;
+    case "deferred.pending":
+      requireOnlyKeys(message, ["type", "pendingId", "kind"]);
+      requireOpaqueId(message, "pendingId", 128);
+      requireEnum(message, "kind", ["conversation", "recall"]);
+      break;
+    case "deferred.delivered":
+      requireOnlyKeys(message, ["type", "pendingId"]);
+      requireOpaqueId(message, "pendingId", 128);
       break;
     case "task.snapshot": {
       requireOnlyKeys(message, ["type", "reason", "requestId", "tasks", "truncated"]);
@@ -2316,7 +2334,7 @@ function validateTaskNotification(value) {
 function validateRealtimeCapabilities(value) {
   requireOnlyKeys(value, ["provider", "model", "audio"], "session.ready realtime");
   const realtime = { ...value, type: "session.ready realtime" };
-  requireEnum(realtime, "provider", ["local", "gemini", "openai", "mock"]);
+  requireEnum(realtime, "provider", ["local", "riva", "gemini", "openai", "mock"]);
   requireBoundedString(realtime, "model", PUBLIC_MODEL_MAX_CHARS);
   requireObject(realtime, "audio");
   const audio = value.audio;

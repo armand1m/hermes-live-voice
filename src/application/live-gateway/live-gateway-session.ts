@@ -1,3 +1,4 @@
+import { PlaybackDelivery } from "./playback-delivery.js";
 import { createHash, randomUUID } from "node:crypto";
 import { errorToMessage } from "../../domain/error-message.js";
 import { isPcmMimeType, requirePcmSampleRate } from "../../domain/audio/pcm.js";
@@ -44,6 +45,7 @@ import { FillerSpeaker, type FillerEmit } from "./filler-speaker.js";
 import { deferredAnswerSpeech } from "./deferred-answer-speech.js";
 import { SpeechMux } from "./speech-mux.js";
 import type { SpeechSink } from "./ports/speech-sink.port.js";
+import type { VoiceArbiter } from "./voice-arbiter.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
 import {
@@ -97,6 +99,12 @@ const DEFERRED_ANSWER_ESCALATION_MS = 20_000;
 /** How often the announcement-deadline watch runs while speech is pending. */
 const ANNOUNCEMENT_DEADLINE_CHECK_MS = 5_000;
 const DEFAULT_ANNOUNCE_MAX_DELAY_MS = 90_000;
+/**
+ * Deferred answers the user is actively waiting on force their way to speech
+ * far sooner than task notifications: a ready answer aging past this lands at
+ * the first response gap even if the user keeps chatting.
+ */
+const DEFAULT_DEFERRED_ANSWER_MAX_DELAY_MS = 15_000;
 
 export interface LiveGatewaySessionDeps {
   config: AppConfig;
@@ -114,6 +122,8 @@ export interface LiveGatewaySessionDeps {
    * byte-for-byte on today's behavior.
    */
   layaShadow?: LayaShadowRecorder;
+  /** Newest-page-wins arbitration across sessions sharing one owner key. */
+  voiceArbiter?: VoiceArbiter;
 }
 
 interface ProviderToolCallRecord {
@@ -149,6 +159,8 @@ type HeldSessionInput =
 
 export class LiveGatewaySession {
   private readonly id = `live_${randomUUID().replaceAll("-", "")}`;
+  private readonly playbackDelivery = new PlaybackDelivery();
+  private activeNotificationId?: string;
   private readonly notificationToken = randomUUID().replaceAll("-", "");
   private readonly abort = new AbortController();
   private liveSession?: LiveModelSession;
@@ -172,6 +184,8 @@ export class LiveGatewaySession {
   private profileId = "default";
   private userLabel = "anonymous";
   private protocolVersion: HermesLiveProtocolVersion = 3;
+  /** Set when a newer session claimed this owner's voice: view-only from then on. */
+  private voiceDemoted = false;
   private conversation: PublicConversation = { mode: "unbound" };
   private conversationOperation: Promise<void> = Promise.resolve();
   private unsubscribeTasks?: () => void;
@@ -206,6 +220,8 @@ export class LiveGatewaySession {
   // Audio-delivery telemetry for the /v1/metrics diagnostics endpoint.
   private lastAudioOutputAt = 0;
   private lastAudioSendAt = 0;
+  /** Estimated instant the browser finishes playing already-emitted downlink audio. */
+  private downlinkUntilMs = 0;
   private readonly audioGapSamples = new Float32Array(128);
   private audioGapLength = 0;
   private audioGapNext = 0;
@@ -281,6 +297,7 @@ export class LiveGatewaySession {
         ? message.userLabel ?? this.deps.config.server.defaultUserLabel
         : this.deps.config.server.defaultUserLabel;
       this.sessionKey = makeSessionKey(this.deps.config.server.sessionPrefix, this.profileId, this.userLabel);
+      this.deps.voiceArbiter?.claim(this.sessionKey, this);
       this.ownerId = this.deps.taskSupervisor.registerOwner(this.sessionKey, this.sessionKey);
       unsubscribe = this.deps.taskSupervisor.subscribe(this.ownerId, (record) => this.receiveTaskRecord(record));
       this.unsubscribeTasks = unsubscribe;
@@ -310,7 +327,7 @@ export class LiveGatewaySession {
           emit: (message) => this.emitFillerSpeech(message),
           gate: () => this.fillerSpeechAllowed(),
           onSpeakingChange: (speaking) => {
-            this.speechGate?.setDownlinkActive(speaking || this.downlinkActiveForGate());
+            this.speechGate?.setDownlinkActive(speaking || this.downlinkActiveForGate(), this.deps.config.vad.turnTailMs);
           },
           onUnavailable: (error) => this.deps.logger.warn("tts sidecar unavailable; falling back to provider speech", {
             sessionId: this.id,
@@ -453,6 +470,18 @@ export class LiveGatewaySession {
               this.filler?.beginSequence();
               this.fail("realtime_provider_error", new Error("Realtime provider reported an error."), true);
             }
+          },
+          onDroppedTurn: (drop) => {
+            this.deps.logger.info("echo-dropped user turn", {
+              sessionId: this.id,
+              kind: drop.kind,
+              text: boundedText(drop.text, 200),
+            });
+            this.send({
+              type: "log",
+              level: "info",
+              message: "Ignored an echo of my own speech picked up by the microphone.",
+            });
           },
           onEvent: (event) => {
             if (this.closing) return;
@@ -700,6 +729,15 @@ export class LiveGatewaySession {
       this.fail("session_not_started", new Error("Send session.start before using the live session."), true, message.id);
       return;
     }
+    if (
+      this.voiceDemoted
+      && (message.type === "audio.input" || message.type === "audio.end" || message.type === "text.input" || message.type === "response.cancel")
+    ) {
+      // View-only session (a newer page owns the voice): turns are dropped
+      // server-side so an old client that ignores session.demoted stays mute.
+      this.deps.logger.debug("demoted session turn input ignored", { sessionId: this.id, type: message.type });
+      return;
+    }
 
     switch (message.type) {
       case "audio.input":
@@ -723,11 +761,22 @@ export class LiveGatewaySession {
           this.heldInputs.push({ kind: "audio_end" });
           return;
         }
+        if (this.deps.config.vad.halfDuplex && !this.userSpeaking && this.downlinkActiveForGate()) {
+          // Half-duplex: the client's own VAD heard the agent's speech, but the
+          // gateway gate never confirmed a user turn — there is nothing to commit.
+          this.userSpeaking = false;
+          this.deps.logger.debug("half-duplex: dropped client-VAD turn during downlink drain", { sessionId: this.id });
+          this.scheduleNotificationFlush();
+          return;
+        }
         this.userSpeaking = false;
         this.lastTurnHadSpeech = true;
         await this.forwardRealtimeClientInput("audio turn", async () => {
           if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
         });
+        // The turn end is the riva path's main idle signal: give a ready
+        // deferred answer its chance to speak now.
+        this.scheduleNotificationFlush();
         return;
       case "text.input":
         validateText(message.text, this.deps.config.server.maxTextChars, "Text input");
@@ -742,6 +791,11 @@ export class LiveGatewaySession {
       case "response.cancel":
         await this.cancelRealtimeResponse(message.reason, message.truncate);
         return;
+      case "speech.playback": {
+        if (this.protocolVersion < 11) throw new Error("Playback confirmation requires protocol v11.");
+        this.playbackDelivery.acknowledge(message.notificationId, message.status);
+        return;
+      }
       case "task.list": {
         const taskWindow = await this.runTaskOperation(
           () => this.deps.taskSupervisor.list(this.ownerId!, message.limit + 1),
@@ -972,8 +1026,9 @@ export class LiveGatewaySession {
     while (this.deferredAnswers.size > MAX_DEFERRED_ANSWERS) {
       const oldest = [...this.deferredAnswers.values()].sort((left, right) => left.startedAt - right.startedAt)[0];
       if (!oldest || oldest.pendingId === pendingId) break;
-      this.deferredAnswers.delete(oldest.pendingId);
+      this.finishDeferredAnswer(oldest.pendingId);
     }
+    if (this.protocolVersion >= 10) this.send({ type: "deferred.pending", pendingId, kind });
     // Fillers cover the wait behind the same delay/interval policy as tools.
     this.filler?.beginSequence();
     void this.serializeConversationOperation(() => this.runDeferredAnswer(record, resolveSessionId, message, instructions))
@@ -1059,13 +1114,13 @@ export class LiveGatewaySession {
       const tail = answer.slice(Math.min(spokenChars, answer.length)).trim();
       if (!tail) {
         current.delivered = true;
-        this.deferredAnswers.delete(current.pendingId);
+        this.finishDeferredAnswer(current.pendingId);
         return;
       }
       if (this.speechMux?.available) {
         void this.speechMux.speak(deferredAnswerSpeech(tail));
         current.delivered = true;
-        this.deferredAnswers.delete(current.pendingId);
+        this.finishDeferredAnswer(current.pendingId);
         return;
       }
       current.speech = deferredAnswerSpeech(tail);
@@ -1120,11 +1175,12 @@ export class LiveGatewaySession {
     const record = ready[0];
     if (!record) return false;
     // The flush's guards can be invalidated while an answer was computed.
+    // A forced delivery (deadline watch) overrides user chatter, but never
+    // talks over the provider mid-response.
     if (
-      this.userSpeaking ||
       this.providerResponseActive ||
-      (!force && this.providerTurnResponseExpected) ||
-      this.notificationResponsePending
+      this.notificationResponsePending ||
+      (!force && (this.userSpeaking || this.providerTurnResponseExpected))
     ) {
       return false;
     }
@@ -1133,7 +1189,7 @@ export class LiveGatewaySession {
     if (mux?.available) {
       const outcome = await mux.speak(record.speech!);
       if (outcome === "spoken") {
-        this.deferredAnswers.delete(record.pendingId);
+        this.finishDeferredAnswer(record.pendingId);
         this.scheduleNotificationFlush();
         return true;
       }
@@ -1160,7 +1216,7 @@ export class LiveGatewaySession {
       }
       return false;
     }
-    this.deferredAnswers.delete(record.pendingId);
+    this.finishDeferredAnswer(record.pendingId);
     this.stopFiller();
     if (this.notificationResponsePending) this.armNotificationResponseWatchdog();
     this.scheduleNotificationFlush();
@@ -1333,7 +1389,7 @@ export class LiveGatewaySession {
           ...(resourceKeys ? { resourceKeys } : {}),
           ...(this.conversation.sessionId ? { originConversationId: this.conversation.sessionId } : {}),
         }), "Background task could not be accepted safely.").then((task) => ({
-          spoken_response: "Nice, I just spun up that task and started a watcher to keep an eye on it. I’ll let you know when it finishes or needs attention, and you can keep talking.",
+          spoken_response: task.status === "queued" ? "Your task is queued. I’ll report when execution starts; you can keep talking." : "Hermes has accepted your task. I’ll keep you updated as it works.",
           ok: true,
           task_id: task.taskId,
           status: task.status,
@@ -1651,8 +1707,10 @@ export class LiveGatewaySession {
         "Realtime provider tool response did not settle before the safety deadline.",
       );
       if (!record.cancelled) record.responseDelivery = "sent";
-      // The receipt speech is starting: filler and stale sidecar speech yield.
-      if (!sidecarSpeaksReceipt) this.stopFiller();
+      // The receipt speech is starting: filler and stale sidecar speech yield —
+      // unless a deferred answer is still outstanding, in which case the
+      // filler sequence must keep covering the wait after the short receipt.
+      if (!sidecarSpeaksReceipt && !this.hasUndeliveredDeferredAnswers()) this.stopFiller();
     } catch (error) {
       if (this.closing) return;
       this.deps.logger.warn("failed to send realtime tool response", {
@@ -1702,7 +1760,7 @@ export class LiveGatewaySession {
    */
   private async handleGatedAudioInput(message: Extract<ClientMessage, { type: "audio.input" }>): Promise<void> {
     const gate = this.speechGate!;
-    gate.setDownlinkActive(this.downlinkActiveForGate());
+    gate.setDownlinkActive(this.downlinkActiveForGate(), this.deps.config.vad.turnTailMs);
     const decision = await gate.ingest({ data: message.data, mimeType: message.mimeType });
     if (this.closing) return;
     if (decision.started) {
@@ -1749,9 +1807,26 @@ export class LiveGatewaySession {
    * armed by a provider error are the exception (the tool state is exactly
    * what cannot be trusted then).
    */
+  /**
+   * A newer session claimed this owner's voice. The session stays connected
+   * and keeps receiving transcripts and task events, but stops speaking and
+   * never starts turns again until the client reconnects (take-over).
+   */
+  demote(reason: "superseded"): void {
+    if (this.voiceDemoted || this.closing) return;
+    this.voiceDemoted = true;
+    this.stopFiller();
+    this.speechMux?.abort();
+    this.heldInputs = [];
+    for (const pendingId of [...this.deferredAnswers.keys()]) this.finishDeferredAnswer(pendingId);
+    this.deps.logger.info("voice session demoted (superseded by a newer session)", { sessionId: this.id, reason });
+    this.send({ type: "session.demoted", reason });
+  }
+
   private fillerSpeechAllowed(): boolean {
     if (
       this.closing ||
+      this.voiceDemoted ||
       this.userSpeaking ||
       this.providerResponseActive ||
       this.providerTurnResponseExpected ||
@@ -1762,6 +1837,14 @@ export class LiveGatewaySession {
     return this.fillerSequenceForProvider
       || this.providerToolResponsePending()
       || this.hasUndeliveredDeferredAnswers();
+  }
+
+  /** Removes a deferred answer and tells v10 clients nothing is outstanding anymore. */
+  private finishDeferredAnswer(pendingId: string): void {
+    this.deferredAnswers.delete(pendingId);
+    if (this.protocolVersion >= 10 && !this.closing) {
+      this.send({ type: "deferred.delivered", pendingId });
+    }
   }
 
   private hasUndeliveredDeferredAnswers(): boolean {
@@ -1784,12 +1867,13 @@ export class LiveGatewaySession {
     this.speechMux?.abort();
   }
 
-  /** Downlink-active covers provider speech, expected responses, fillers, and sidecar speech. */
+  /** Downlink-active covers provider speech, expected responses, fillers, sidecar speech, and audio still draining in the browser. */
   private downlinkActiveForGate(): boolean {
     return this.providerResponseActive
       || this.providerTurnResponseExpected
       || (this.filler?.active ?? false)
-      || (this.speechMux?.speaking ?? false);
+      || (this.speechMux?.speaking ?? false)
+      || Date.now() < this.downlinkUntilMs;
   }
 
   /**
@@ -1823,7 +1907,7 @@ export class LiveGatewaySession {
 
   private async ingestHeldAudio(data: string, mimeType: string): Promise<void> {
     const gate = this.speechGate!;
-    gate.setDownlinkActive(this.downlinkActiveForGate());
+    gate.setDownlinkActive(this.downlinkActiveForGate(), this.deps.config.vad.turnTailMs);
     const decision = await gate.ingest({ data, mimeType });
     if (this.closing) return;
     if (decision.started) {
@@ -2029,23 +2113,25 @@ export class LiveGatewaySession {
       this.stopFiller();
       this.speechTiming.noteResponseStarted(event.scope, Date.now());
       const responseId = publicProviderIdentifier(event.responseId);
-      this.send({ type: "response.started", ...(responseId ? { responseId } : {}) });
+      this.send({ type: "response.started", ...(responseId ? { responseId } : {}), ...this.responseScopeField(event.scope), ...this.notificationCorrelation(event.scope, event.notificationId) });
       return;
     }
 
     this.providerResponseActive = false;
     if (event.scope !== "conversation") this.clearNotificationResponsePending();
     const responseId = publicProviderIdentifier(event.responseId);
+    const scope = { ...this.responseScopeField(event.scope), ...this.notificationCorrelation(event.scope, event.notificationId) };
     if (event.status === "failed") {
       this.send({
         type: "response.failed",
         ...(responseId ? { responseId } : {}),
+        ...scope,
         error: "Realtime provider response failed. Check the gateway logs.",
       });
     } else if (event.status === "completed") {
-      this.send({ type: "response.completed", ...(responseId ? { responseId } : {}) });
+      this.send({ type: "response.completed", ...(responseId ? { responseId } : {}), ...scope });
     } else {
-      this.send({ type: "response.cancelled", ...(responseId ? { responseId } : {}) });
+      this.send({ type: "response.cancelled", ...(responseId ? { responseId } : {}), ...scope });
     }
     // LAYA shadow: once the response settles with no tool output outstanding,
     // the brain's behavior for this turn is known — join it into the pending
@@ -2054,7 +2140,21 @@ export class LiveGatewaySession {
     if (this.pendingProviderToolCalls === 0 && !this.providerTurnResponseExpected && !this.userSpeaking) {
       this.flushLayaShadowOutcome();
     }
+    // After the receipt itself settles, resume covering a still-running
+    // deferred answer wait with filler clips (response.started stopped them).
+    if (this.hasUndeliveredDeferredAnswers()) this.filler?.beginSequence();
     this.scheduleNotificationFlush();
+  }
+
+  /** Protocol v10 field: the response's scope, omitted on older clients. */
+  private notificationCorrelation(scope: string | undefined, id?: string): { notificationId?: string } {
+    const notificationId = id ?? (scope === "task_notification" ? this.activeNotificationId : undefined);
+    return this.protocolVersion >= 11 && notificationId ? { notificationId } : {};
+  }
+
+  private responseScopeField(scope: string | undefined): { scope?: "conversation" | "task_notification" } {
+    if (this.protocolVersion < 10 || (scope !== "conversation" && scope !== "task_notification")) return {};
+    return { scope };
   }
 
   /**
@@ -2147,6 +2247,7 @@ export class LiveGatewaySession {
   private scheduleNotificationFlush(): void {
     if (
       this.closing ||
+      this.voiceDemoted ||
       !this.readySent ||
       this.notificationFlushRunning ||
       this.notificationResponsePending ||
@@ -2166,6 +2267,7 @@ export class LiveGatewaySession {
   private async flushNotifications(force = false): Promise<void> {
     if (
       this.closing ||
+      this.voiceDemoted ||
       this.notificationFlushRunning ||
       this.notificationResponsePending ||
       !this.liveSession?.sendTaskNotification ||
@@ -2244,13 +2346,22 @@ export class LiveGatewaySession {
 
       this.notificationResponsePending = true;
       const announcement = notificationDigest(records);
+      const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
+      this.activeNotificationId = notificationId;
+      const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
+      playback?.catch(() => undefined);
       const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
       await withAbortAndDeadline(
-        this.liveSession.sendTaskNotification({ context, announcement }),
+        this.liveSession.sendTaskNotification({ context, announcement, notificationId }),
         this.abort.signal,
-        MAX_PROVIDER_IO_WAIT_MS,
+        120_000,
         "Realtime provider task notification did not settle before the safety deadline.",
       );
+      if (playback) await playback;
+      // v11 clients confirm playback before the announcement counts as heard.
+      // Older clients cannot attest playback: the provider accepting the
+      // announcement remains the delivery proof, and the durable unread item
+      // still requires an explicit acknowledgement.
       for (const record of records) {
         this.speechTiming.noteAnnouncementDelivered(record.taskId, Date.now());
       }
@@ -2297,6 +2408,8 @@ export class LiveGatewaySession {
         });
       }
     } finally {
+      if (this.activeNotificationId) this.playbackDelivery.cancel(this.activeNotificationId);
+      this.activeNotificationId = undefined;
       this.notificationFlushRunning = false;
     }
   }
@@ -2345,14 +2458,17 @@ export class LiveGatewaySession {
       if (this.closing) return;
       const now = Date.now();
       const maxDelayMs = this.deps.config.hermes.announceMaxDelayMs ?? DEFAULT_ANNOUNCE_MAX_DELAY_MS;
+      const deferredMaxDelayMs = this.deps.config.hermes.deferredAnswerMaxDelayMs ?? DEFAULT_DEFERRED_ANSWER_MAX_DELAY_MS;
       const agedAnswer = [...this.deferredAnswers.values()].some(
-        (record) => !record.delivered && record.speech !== undefined && now - (record.readyAt ?? record.startedAt) > maxDelayMs,
+        (record) => !record.delivered && record.speech !== undefined && now - (record.readyAt ?? record.startedAt) > deferredMaxDelayMs,
       );
       const agedNotification = [...this.pendingNotifications.values()].some(
         (record) => now - record.updatedAt > maxDelayMs,
       );
       if (!agedAnswer && !agedNotification) return;
-      if (this.userSpeaking || this.providerResponseActive || this.notificationResponsePending || this.notificationFlushRunning) return;
+      if (this.providerResponseActive || this.notificationResponsePending || this.notificationFlushRunning) return;
+      // A forced deferred answer overrides user chatter; notifications do not.
+      if (!agedAnswer && this.userSpeaking) return;
       if (this.notificationRetryTimer !== undefined) {
         clearTimeout(this.notificationRetryTimer);
         this.notificationRetryTimer = undefined;
@@ -2430,6 +2546,7 @@ export class LiveGatewaySession {
   }
 
   private async performClose(): Promise<void> {
+    this.playbackDelivery.close();
     this.stopFiller();
     this.flushLayaShadowOutcome();
     if (this.deferredAnswerEscalationTimer !== undefined) {
@@ -2441,6 +2558,7 @@ export class LiveGatewaySession {
       this.announcementDeadlineTimer = undefined;
     }
     this.deferredAnswers.clear();
+    if (this.sessionKey) this.deps.voiceArbiter?.release(this.sessionKey, this);
     this.unsubscribeTasks?.();
     this.unsubscribeTasks = undefined;
     this.pendingTaskRecords.clear();
@@ -2505,11 +2623,11 @@ export class LiveGatewaySession {
 
   private send(message: ServerMessage): void {
     if (this.closing && message.type !== "session.error") return;
-    if (message.type === "audio.output") this.recordAudioOutput();
+    if (message.type === "audio.output") this.recordAudioOutput(message);
     this.client.sendText(serverMessage(message));
   }
 
-  private recordAudioOutput(): void {
+  private recordAudioOutput(message: Extract<ServerMessage, { type: "audio.output" }>): void {
     const now = Date.now();
     if (this.lastAudioSendAt > 0) {
       const gap = now - this.lastAudioSendAt;
@@ -2522,6 +2640,15 @@ export class LiveGatewaySession {
     }
     this.lastAudioSendAt = now;
     this.lastAudioOutputAt = now;
+    // Playback-drain deadline: providers emit each utterance's frames in one
+    // burst long before the browser finishes playing them, so response flags
+    // alone under-cover the downlink window that echo suppression must span.
+    const samples = Buffer.from(message.data, "base64").length / 2;
+    const rate = requirePcmSampleRate(message.mimeType);
+    if (samples > 0 && rate > 0) {
+      const drainMs = samples * 1_000 / rate;
+      this.downlinkUntilMs = Math.max(this.downlinkUntilMs, now + drainMs);
+    }
   }
 
   /**
@@ -2725,18 +2852,14 @@ function mergeTaskRecords(records: TaskRecord[]): TaskRecord[] {
 }
 
 function notificationDigest(records: TaskRecord[]): string {
-  const completed = records.filter((record) => record.status === "completed").length;
-  const attention = records.length - completed;
-  if (records.length === 1 && completed === 1) {
-    return "Your background task is finished. The result is ready in the task inbox.";
-  }
-  if (records.length === 1) {
-    return "A background task needs your attention. Open the task inbox for the exact status.";
-  }
-  if (attention === 0) {
-    return `${records.length} background tasks are finished. Their results are ready in the task inbox.`;
-  }
-  return `${records.length} background tasks have updates: ${completed} finished and ${attention} need attention. Open the task inbox for details.`;
+  return records.slice(0, 3).map((record) => {
+    const title = record.title.slice(0, 100);
+    if (record.status === "completed") {
+      const result = record.output?.trim();
+      return `${title} is complete.${result ? ` ${result.slice(0, 180)}` : " The result is available in the task inbox."}`;
+    }
+    return `${title} needs attention: ${record.status.replaceAll("_", " ")}.`;
+  }).join(" ").slice(0, 500);
 }
 
 function validateAudioFrame(data: string, mimeType: string, maxBytes: number): void {
@@ -2868,16 +2991,17 @@ function boundedProviderToolResponse(response: Record<string, unknown>): Record<
 }
 
 function taskInboxSpokenSummary(records: readonly TaskRecord[]): string {
-  if (records.length === 0) return "Your background task inbox is empty.";
-  const finished = records.filter((record) => ["completed", "failed", "cancelled"].includes(record.status)).length;
-  const uncertain = records.filter((record) => ["unknown", "dispatch_unknown"].includes(record.status)).length;
-  const active = records.length - finished - uncertain;
-  const parts: string[] = [];
-  if (active > 0) parts.push(`${active === 1 ? "one" : active} background ${active === 1 ? "task is" : "tasks are"} active`);
-  if (finished > 0) parts.push(`${finished === 1 ? "one task is" : `${finished} tasks are`} finished in the inbox`);
-  if (uncertain > 0) parts.push(`${uncertain === 1 ? "one task has" : `${uncertain} tasks have`} an uncertain state`);
-  const sentence = parts.join(", and ");
-  return `${sentence[0]!.toUpperCase()}${sentence.slice(1)}.`;
+  if (!records.length) return "Your background task inbox is empty.";
+  const count = (states: string[]) => records.filter((record) => states.includes(record.status)).length;
+  const parts = [
+    [count(["running", "dispatching"]), "running"],
+    [count(["queued"]), "queued"],
+    [count(["delegated"]), "delegated to external agents"],
+    [count(["stopping", "waiting_for_approval"]), "awaiting attention"],
+    [count(["completed", "failed", "cancelled"]), "finished"],
+    [count(["unknown", "dispatch_unknown"]), "with an uncertain outcome"],
+  ].filter(([number]) => Number(number) > 0).map(([number, state]) => `${number} ${state}`);
+  return `Your tasks: ${parts.join(", ")}.`;
 }
 
 function publicHermesCapabilities(

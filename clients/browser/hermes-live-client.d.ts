@@ -7,7 +7,7 @@ export type HermesLiveClientState =
   | "closed"
   | "failed";
 
-export const HERMES_LIVE_PROTOCOL_VERSION: 8;
+export const HERMES_LIVE_PROTOCOL_VERSION: 10;
 
 export type HermesLiveConversationSelection =
   | { mode: "new"; title?: string }
@@ -109,7 +109,7 @@ export interface HermesLiveSessionReady {
   model: string;
   hermes: { model?: string; capabilities?: Record<string, unknown> };
   realtime: {
-    provider: "local" | "gemini" | "openai" | "mock";
+    provider: "local" | "riva" | "gemini" | "openai" | "mock";
     model: string;
     audio: {
       input: { enabled: boolean; mimeType?: string; recommendedFrameMs?: number; speechDetection?: "gateway" | "client" };
@@ -142,10 +142,13 @@ export type HermesLiveKnownServerMessage =
   | { type: "input.speech_stopped"; provider: "openai" | "local" | "gateway"; itemId?: string; audioEndMs?: number }
   | { type: "input.pause_requested"; reason: "voice_command" }
   | { type: "client.audio_settings"; source: "voice_command"; microphone?: "active" | "paused"; effects?: boolean; effectsVolume?: number }
-  | { type: "response.started"; responseId?: string }
-  | { type: "response.completed"; responseId?: string }
-  | { type: "response.cancelled"; responseId?: string }
-  | { type: "response.failed"; responseId?: string; error: string }
+  | { type: "response.started"; responseId?: string; scope?: "conversation" | "task_notification" }
+  | { type: "response.completed"; responseId?: string; scope?: "conversation" | "task_notification" }
+  | { type: "response.cancelled"; responseId?: string; scope?: "conversation" | "task_notification" }
+  | { type: "response.failed"; responseId?: string; scope?: "conversation" | "task_notification"; error: string }
+  | { type: "session.demoted"; reason: "superseded" }
+  | { type: "deferred.pending"; pendingId: string; kind: "conversation" | "recall" }
+  | { type: "deferred.delivered"; pendingId: string }
   | { type: "task.snapshot"; reason: "initial" | "reconnect" | "list" | "get"; requestId?: string; tasks: HermesLiveTask[]; truncated: boolean }
   | (HermesLiveTaskEventBase & {
       type: "task.accepted";
@@ -242,6 +245,9 @@ export interface HermesLiveClientEventMap {
   "task.cancelled": Extract<HermesLiveKnownServerMessage, { type: "task.cancelled" }>;
   "task.unknown": Extract<HermesLiveKnownServerMessage, { type: "task.unknown" }>;
   "task.notification": Extract<HermesLiveKnownServerMessage, { type: "task.notification" }>;
+  "session.demoted": Extract<HermesLiveKnownServerMessage, { type: "session.demoted" }>;
+  "deferred.pending": Extract<HermesLiveKnownServerMessage, { type: "deferred.pending" }>;
+  "deferred.delivered": Extract<HermesLiveKnownServerMessage, { type: "deferred.delivered" }>;
   "task.updated": { task: HermesLiveTask; message: Extract<HermesLiveKnownServerMessage, HermesLiveTaskEventBase> };
   "task.stale": { taskId: string; type: string; sequence: number; currentSequence: number };
   "tasks.changed": { tasks: readonly HermesLiveTask[]; activeTasks: readonly HermesLiveTask[]; recentTasks: readonly HermesLiveTask[] };

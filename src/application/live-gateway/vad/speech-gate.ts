@@ -78,9 +78,9 @@ export class SpeechGate {
   }
 
   /** Arms or disarms the echo guard; agent audio playing down keeps it active. */
-  setDownlinkActive(active: boolean): void {
+  setDownlinkActive(active: boolean, holdMs: number = ECHO_GUARD_HOLD_MS): void {
     this.downlink = active;
-    if (active) this.echoHoldMs = ECHO_GUARD_HOLD_MS;
+    if (active) this.echoHoldMs = Math.max(this.echoHoldMs, holdMs);
   }
 
   async ingest(frame: PcmAudioFrame): Promise<GateDecision> {
@@ -110,6 +110,15 @@ export class SpeechGate {
     for (const probabilityAtChunk of probabilities) {
       if (!this.active) {
         const echoGuarded = this.downlink || this.echoHoldMs > 0;
+        if (echoGuarded && this.config.halfDuplex) {
+          // Half-duplex policy: while assistant audio is still draining (plus
+          // the turn tail), confirmed speech never starts a turn — the mic
+          // hearing the agent's own voice cannot become user speech. Frames
+          // still score and preroll keeps rolling, so speech that continues
+          // past the window starts a clean turn immediately.
+          this.startStreakMs = 0;
+          continue;
+        }
         const threshold = echoGuarded ? this.config.echoStartProbability : this.config.startProbability;
         const sustainMs = echoGuarded ? this.config.echoStartSustainMs : this.config.startSustainMs;
         if (probabilityAtChunk >= threshold) {

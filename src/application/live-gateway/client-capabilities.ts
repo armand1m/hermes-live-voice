@@ -54,6 +54,17 @@ export function realtimeClientCapabilities(
       },
     };
   }
+  if (config.realtime.provider === "riva") {
+    return {
+      provider: "riva",
+      model: config.realtime.model,
+      audio: {
+        input: { enabled: true, mimeType: "audio/pcm;rate=16000", recommendedFrameMs: 80, ...speechDetection },
+        output: { enabled: true, mimeType: "audio/pcm;rate=22050" },
+        turnDetection: "disabled",
+      },
+    };
+  }
   return {
     provider: "openai",
     model: config.realtime.model,

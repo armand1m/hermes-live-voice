@@ -18,6 +18,12 @@ const OpenAIRealtimeBaseUrlSchema = z.string().url().refine(isSafeOpenAIRealtime
 const LocalRealtimeUrlSchema = z.string().url().refine(isSafeRealtimeWebSocketUrl, {
   message: "HERMES_LIVE_LOCAL_URL must be a credential-free WS(S) URL without a fragment.",
 });
+const RivaRealtimeUrlSchema = z.string().url().refine(isSafeRealtimeWebSocketUrl, {
+  message: "Riva endpoints must be credential-free WS(S) URLs without a fragment.",
+});
+const RivaBrainUrlSchema = z.string().url().refine(isSafeHttpLocalUrl, {
+  message: "HERMES_LIVE_RIVA_BRAIN_URL must be a credential-free local HTTP(S) URL.",
+});
 const GoogleCloudProjectSchema = z.preprocess(
   (value) => value === "" ? undefined : value,
   z.string().min(6).max(30).refine(isSafeGoogleCloudProject, {
@@ -109,6 +115,7 @@ const EnvSchema = z.object({
   HERMES_LIVE_ASYNC_TOOLS_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   /** Hard deadline before pending speech is forced into the next inter-turn gap. */
   HERMES_LIVE_ANNOUNCE_MAX_DELAY_MS: z.coerce.number().int().min(5_000).max(600_000).default(90_000),
+  HERMES_LIVE_DEFERRED_ANSWER_MAX_DELAY_MS: z.coerce.number().int().min(1_000).max(90_000).default(15_000),
   HERMES_LIVE_HERMES_STREAM_IDLE_TIMEOUT_MS: z.coerce
     .number()
     .int()
@@ -116,8 +123,24 @@ const EnvSchema = z.object({
     .max(2_147_483_647)
     .default(DEFAULT_HERMES_STREAM_IDLE_TIMEOUT_MS),
 
-  HERMES_LIVE_PROVIDER: z.enum(["local", "gemini", "openai", "mock"]).default("local"),
+  HERMES_LIVE_PROVIDER: z.enum(["local", "riva", "gemini", "openai", "mock"]).default("local"),
   HERMES_LIVE_LOCAL_URL: LocalRealtimeUrlSchema.default("ws://127.0.0.1:8765/v1/realtime"),
+  HERMES_LIVE_RIVA_ASR_URL: RivaRealtimeUrlSchema.default("ws://127.0.0.1:19000/v1/realtime?intent=transcription"),
+  HERMES_LIVE_RIVA_TTS_URL: RivaRealtimeUrlSchema.default("ws://127.0.0.1:19001/v1/realtime?intent=synthesize"),
+  HERMES_LIVE_RIVA_BRAIN_URL: RivaBrainUrlSchema.default("http://127.0.0.1:30000/v1/chat/completions"),
+  HERMES_LIVE_RIVA_BRAIN_MODEL: z.string().trim().min(1).max(128).default("qwen3.8-27b"),
+  HERMES_LIVE_RIVA_BRAIN_API_KEY: z.string().optional(),
+  HERMES_LIVE_RIVA_MINT_API_KEY: z.string().optional(),
+  HERMES_LIVE_RIVA_ASR_WORD_BOOST: z.string().default("Hermes,herdr,exodia,Mac mini"),
+  HERMES_LIVE_EXTERNAL_WORK_ENABLED: z.string().optional(),
+  HERMES_LIVE_PROGRESS_ANNOUNCEMENTS: z.string().optional(),
+  HERMES_LIVE_HERDR_EXECUTABLE: z.string().min(1).default("herdr"),
+  HERMES_LIVE_MSSH_EXECUTABLE: z.string().min(1).default("mssh"),
+  HERMES_LIVE_RIVA_VOICE: z.string().trim().min(1).max(128).default("Magpie-Multilingual.EN-US.Jason"),
+  HERMES_LIVE_RIVA_WS_KEEPALIVE_MS: z.coerce.number().int().min(0).max(120_000).default(25_000),
+  HERMES_LIVE_RIVA_BRAIN_MAX_TOKENS: z.coerce.number().int().min(128).max(8_192).default(2_048),
+  HERMES_LIVE_RIVA_BRAIN_REASONING_EFFORT: z.enum(["off", "minimal", "low", "medium", "high"]).default("low"),
+  HERMES_LIVE_RIVA_ECHO_GUARD: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_TTS_URL: z.string().url().refine(isSafeHttpLocalUrl, {
     message: "HERMES_LIVE_TTS_URL must be a credential-free local HTTP(S) URL (tts sidecar).",
   }).optional(),
@@ -172,6 +195,8 @@ const EnvSchema = z.object({
   HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS: z.coerce.number().int().min(32).max(1_000).default(200),
   HERMES_LIVE_VAD_PREROLL_MS: z.coerce.number().int().min(0).max(1_000).default(250),
   HERMES_LIVE_VAD_TAIL_MS: z.coerce.number().int().min(0).max(2_000).default(400),
+  HERMES_LIVE_HALF_DUPLEX: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_TURN_TAIL_MS: z.coerce.number().int().min(0).max(5_000).default(1_000),
 
   HERMES_LIVE_FILLER_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_FILLER_DELAY_MS: z.coerce.number().int().min(500).max(60_000).default(2_500),
@@ -180,7 +205,7 @@ const EnvSchema = z.object({
   HERMES_LIVE_FILLER_DIR: FillerDirectoryPathSchema.optional(),
 });
 
-export type RealtimeProvider = "local" | "gemini" | "openai" | "mock";
+export type RealtimeProvider = "local" | "riva" | "gemini" | "openai" | "mock";
 
 export interface ContextConfig {
   hermesHome: string;
@@ -201,6 +226,10 @@ export interface VadConfig {
   echoStartSustainMs: number;
   prerollMs: number;
   tailMs: number;
+  /** Half-duplex turn policy: never confirm speech while assistant audio drains. */
+  halfDuplex: boolean;
+  /** Extra margin after the last downlink frame before speech may start a turn. */
+  turnTailMs: number;
 }
 
 export interface FillerConfig {
@@ -242,6 +271,8 @@ export interface AppConfig {
     asyncTools?: boolean;
     /** Pending answer/announcement speech older than this forces delivery. */
     announceMaxDelayMs?: number;
+    /** Force a ready-but-undelivered deferred answer at the first gap past this age. */
+    deferredAnswerMaxDelayMs?: number;
   };
   tasks: {
     stateFile: string;
@@ -262,6 +293,23 @@ export interface AppConfig {
     allowRemote: boolean;
     /** Managed runtime compatibility mode; external upstream endpoints leave this unset. */
     ownsTurnRouting?: boolean;
+  };
+  externalWork?: { enabled: boolean; progressAnnouncements: boolean; herdrExecutable: string; msshExecutable: string };
+  riva: {
+    asrWordBoost?: string[];
+    asrUrl: string;
+    ttsUrl: string;
+    brainUrl: string;
+    brainModel: string;
+    brainApiKey?: string;
+    mintApiKey?: string;
+    voice: string;
+    /** ASR WebSocket ping interval; 0 disables (NIMs idle-close quiet sockets). */
+    wsKeepaliveMs: number;
+    brainMaxTokens: number;
+    brainReasoningEffort: "off" | "minimal" | "low" | "medium" | "high";
+    /** Drop user turns that match recently spoken assistant text (mic echo). */
+    echoGuard: boolean;
   };
   tts: {
     /** Sidecar TTS base URL; unset routes all speech through the provider. */
@@ -343,6 +391,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       asyncTools: parsed.HERMES_LIVE_ASYNC_TOOLS_ENABLED === undefined
         || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_ASYNC_TOOLS_ENABLED),
       announceMaxDelayMs: parsed.HERMES_LIVE_ANNOUNCE_MAX_DELAY_MS,
+      deferredAnswerMaxDelayMs: parsed.HERMES_LIVE_DEFERRED_ANSWER_MAX_DELAY_MS,
     },
     tasks: {
       stateFile: parsed.HERMES_LIVE_TASK_STATE_FILE,
@@ -362,6 +411,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       voice: parsed.HERMES_LIVE_LOCAL_VOICE,
       allowRemote: parseBool(parsed.HERMES_LIVE_LOCAL_ALLOW_REMOTE),
       ownsTurnRouting: parseBool(parsed.HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING),
+    },
+    externalWork: {
+      enabled: parseBool(parsed.HERMES_LIVE_EXTERNAL_WORK_ENABLED),
+      progressAnnouncements: parseBool(parsed.HERMES_LIVE_PROGRESS_ANNOUNCEMENTS),
+      herdrExecutable: parsed.HERMES_LIVE_HERDR_EXECUTABLE,
+      msshExecutable: parsed.HERMES_LIVE_MSSH_EXECUTABLE,
+    },
+    riva: {
+      asrWordBoost: parsed.HERMES_LIVE_RIVA_ASR_WORD_BOOST.split(",").map((word) => word.trim()).filter(Boolean).slice(0, 100),
+      asrUrl: parsed.HERMES_LIVE_RIVA_ASR_URL,
+      ttsUrl: parsed.HERMES_LIVE_RIVA_TTS_URL,
+      brainUrl: parsed.HERMES_LIVE_RIVA_BRAIN_URL,
+      brainModel: parsed.HERMES_LIVE_RIVA_BRAIN_MODEL,
+      ...(parsed.HERMES_LIVE_RIVA_BRAIN_API_KEY ? { brainApiKey: parsed.HERMES_LIVE_RIVA_BRAIN_API_KEY } : {}),
+      ...(parsed.HERMES_LIVE_RIVA_MINT_API_KEY ? { mintApiKey: parsed.HERMES_LIVE_RIVA_MINT_API_KEY } : {}),
+      voice: parsed.HERMES_LIVE_RIVA_VOICE,
+      wsKeepaliveMs: parsed.HERMES_LIVE_RIVA_WS_KEEPALIVE_MS,
+      brainMaxTokens: parsed.HERMES_LIVE_RIVA_BRAIN_MAX_TOKENS,
+      brainReasoningEffort: parsed.HERMES_LIVE_RIVA_BRAIN_REASONING_EFFORT,
+      echoGuard: parsed.HERMES_LIVE_RIVA_ECHO_GUARD === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_RIVA_ECHO_GUARD),
     },
     tts: {
       ...(parsed.HERMES_LIVE_TTS_URL ? { baseUrl: parsed.HERMES_LIVE_TTS_URL } : {}),
@@ -414,6 +484,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       echoStartSustainMs: parsed.HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS,
       prerollMs: parsed.HERMES_LIVE_VAD_PREROLL_MS,
       tailMs: parsed.HERMES_LIVE_VAD_TAIL_MS,
+      halfDuplex: parsed.HERMES_LIVE_HALF_DUPLEX !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_HALF_DUPLEX),
+      turnTailMs: parsed.HERMES_LIVE_TURN_TAIL_MS,
     },
     filler: {
       enabled: parsed.HERMES_LIVE_FILLER_ENABLED === undefined
@@ -457,7 +530,7 @@ export function assertGatewayExposureConfig(config: Pick<AppConfig, "server">): 
   }
 }
 
-export function assertRealtimeProviderConfig(config: Pick<AppConfig, "realtime" | "local" | "gemini" | "openai">): void {
+export function assertRealtimeProviderConfig(config: Pick<AppConfig, "realtime" | "local" | "riva" | "gemini" | "openai">): void {
   if (config.realtime.provider === "local") {
     const endpoint = new URL(config.local.url);
     if (!isLoopbackHostname(endpoint.hostname) && !config.local.allowRemote) {
@@ -471,6 +544,21 @@ export function assertRealtimeProviderConfig(config: Pick<AppConfig, "realtime" 
       && !isPrivateNetworkHostname(endpoint.hostname)
     ) {
       throw new Error("A public remote HERMES_LIVE_LOCAL_URL must use wss://.");
+    }
+    return;
+  }
+  if (config.realtime.provider === "riva") {
+    for (const [endpoint, intent] of [
+      [config.riva.asrUrl, "transcription"],
+      [config.riva.ttsUrl, "synthesize"],
+    ]) {
+      const url = new URL(endpoint);
+      if (url.pathname !== "/v1/realtime" || url.searchParams.get("intent") !== intent || [...url.searchParams.keys()].length !== 1) {
+        throw new Error(`Riva ${intent} URL must use /v1/realtime?intent=${intent}.`);
+      }
+      if (!isLoopbackHostname(url.hostname) && url.protocol !== "wss:") {
+        throw new Error("Remote Riva realtime endpoints must use wss://.");
+      }
     }
     return;
   }
@@ -490,8 +578,11 @@ export function assertRealtimeProviderConfig(config: Pick<AppConfig, "realtime" 
   }
 }
 
-export function realtimeProviderConfigured(config: Pick<AppConfig, "realtime" | "local" | "gemini" | "openai">): boolean {
+export function realtimeProviderConfigured(config: Pick<AppConfig, "realtime" | "local" | "riva" | "gemini" | "openai">): boolean {
   if (config.realtime.provider === "local") {
+    return true;
+  }
+  if (config.realtime.provider === "riva") {
     return true;
   }
   if (config.realtime.provider === "mock") {
@@ -645,6 +736,9 @@ export function publicBaseUrl(value: string): string {
 function selectedRealtimeModel(provider: RealtimeProvider, geminiModel: string, openaiModel: string): string {
   if (provider === "local") {
     return "huggingface/speech-to-speech";
+  }
+  if (provider === "riva") {
+    return "nvidia/speech-nim";
   }
   if (provider === "openai") {
     return openaiModel;

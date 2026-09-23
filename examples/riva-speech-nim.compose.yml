@@ -1,0 +1,54 @@
+# NVIDIA Speech NIM services for the Hermes Riva provider.
+name: hermes-riva
+services:
+  asr-cache-init:
+    image: nvcr.io/nim/nvidia/parakeet-1-1b-ctc-en-us:latest
+    user: root
+    entrypoint: ["chown"]
+    command: ["-R", "1000:1000", "/opt/nim/.cache"]
+    volumes:
+      - riva-asr-cache:/opt/nim/.cache
+
+  asr:
+    image: nvcr.io/nim/nvidia/parakeet-1-1b-ctc-en-us:latest
+    restart: unless-stopped
+    gpus: all
+    shm_size: 8gb
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY:?Set NGC_API_KEY in a private environment file}
+      NIM_TAGS_SELECTOR: name=parakeet-1-1b-ctc-en-us,diarizer=disabled,mode=str,vad=default
+    ports:
+      - "127.0.0.1:19000:9000"
+    volumes:
+      - riva-asr-cache:/opt/nim/.cache
+    depends_on:
+      asr-cache-init:
+        condition: service_completed_successfully
+
+  tts-cache-init:
+    image: nvcr.io/nim/nvidia/magpie-tts-multilingual:latest
+    user: root
+    entrypoint: ["chown"]
+    command: ["-R", "1000:1000", "/opt/nim/.cache"]
+    volumes:
+      - riva-tts-cache:/opt/nim/.cache
+
+  tts:
+    image: nvcr.io/nim/nvidia/magpie-tts-multilingual:latest
+    restart: unless-stopped
+    gpus: all
+    shm_size: 8gb
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY:?Set NGC_API_KEY in a private environment file}
+      NIM_TAGS_SELECTOR: name=magpie-tts-multilingual,batch_size=8
+    ports:
+      - "127.0.0.1:19001:9000"
+    volumes:
+      - riva-tts-cache:/opt/nim/.cache
+    depends_on:
+      tts-cache-init:
+        condition: service_completed_successfully
+
+volumes:
+  riva-asr-cache:
+  riva-tts-cache:

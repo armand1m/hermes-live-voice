@@ -119,7 +119,17 @@ Common settings:
 | `HERMES_BASE_URL` | `http://127.0.0.1:8642` | Hermes API Server |
 | `HERMES_MODEL` | Hermes profile default | Optional literal model override; normally leave unset |
 | `HERMES_LIVE_HERMES_CHAT_TIMEOUT_MS` | greater of `120000` and the ordinary request timeout | Time to wait for a saved-chat answer, including tool execution |
-| `HERMES_LIVE_PROVIDER` | selected by setup | `local`, `gemini`, `openai`, or `mock` |
+| `HERMES_LIVE_PROVIDER` | selected by setup | `local`, `riva`, `gemini`, `openai`, or `mock` |
+| `HERMES_LIVE_RIVA_ASR_URL` | `ws://127.0.0.1:19000/v1/realtime?intent=transcription` | NVIDIA Speech NIM ASR WebSocket |
+| `HERMES_LIVE_RIVA_TTS_URL` | `ws://127.0.0.1:19001/v1/realtime?intent=synthesize` | NVIDIA Speech NIM TTS WebSocket |
+| `HERMES_LIVE_RIVA_BRAIN_URL` | `http://127.0.0.1:30000/v1/chat/completions` | SGLang Chat Completions endpoint |
+| `HERMES_LIVE_RIVA_BRAIN_MODEL` | `qwen3.8-27b` | SGLang served model name |
+| `HERMES_LIVE_RIVA_VOICE` | `Magpie-Multilingual.EN-US.Jason` | NVIDIA TTS voice |
+| `HERMES_LIVE_RIVA_MINT_API_KEY` | unset | Backend-only Riva session mint key, when enabled |
+| `HERMES_LIVE_RIVA_WS_KEEPALIVE_MS` | `25000` | ASR WebSocket ping interval; `0` disables (NIMs idle-close quiet sockets) |
+| `HERMES_LIVE_RIVA_BRAIN_MAX_TOKENS` | `2048` | Chat Completions answer budget |
+| `HERMES_LIVE_RIVA_BRAIN_REASONING_EFFORT` | `low` | Thinking budget for reasoning-capable brains; `off` omits the field |
+| `HERMES_LIVE_RIVA_ECHO_GUARD` | `true` | Drop user turns that match recently spoken assistant text (mic echo) |
 | `HERMES_LIVE_LOCAL_URL` | `ws://127.0.0.1:8765/v1/realtime` | Hugging Face realtime endpoint |
 | `GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Gemini Live model |
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime-2` | OpenAI Realtime model |
@@ -142,6 +152,8 @@ Common settings:
 | `HERMES_LIVE_VAD_STOP_PROBABILITY` / `HERMES_LIVE_VAD_STOP_SUSTAIN_MS` | `0.25` / `500` | Speech-stop confirmation |
 | `HERMES_LIVE_VAD_ECHO_START_PROBABILITY` / `HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS` | `0.7` / `200` | Stricter confirmation required while the agent is speaking (speaker echo guard) |
 | `HERMES_LIVE_VAD_PREROLL_MS` / `HERMES_LIVE_VAD_TAIL_MS` | `250` / `400` | Lead-in kept before confirmed speech and silence tail forwarded after it |
+| `HERMES_LIVE_HALF_DUPLEX` / `HERMES_LIVE_TURN_TAIL_MS` | `false` / `1000` | Half-duplex turns: while assistant audio is still draining (estimated from emitted PCM) plus this tail, confirmed speech never starts a turn — the mic cannot echo the agent into a user turn |
+| `HERMES_LIVE_DEFERRED_ANSWER_MAX_DELAY_MS` | `15000` | Force a ready deferred answer at the first response gap once it ages past this |
 
 Use [.env.example](../.env.example) for containers and `hermes-live print-config` to inspect every resolved value with secrets redacted. `HERMES_LIVE_CONFIG_FILE` selects a different managed file.
 

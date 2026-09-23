@@ -15,11 +15,12 @@ describe("realtime supervisor instruction", () => {
     expect(() => buildSystemInstruction("attacker-controlled")).toThrow(/notification token is invalid/i);
   });
 
-  it("routes bound chat turns through the persisted Hermes conversation", () => {
+  it("keeps bound conversational turns direct and routes only memory to Hermes", () => {
     const instruction = buildSystemInstruction(undefined, false, { bound: true });
 
     expect(instruction).toContain("persisted Hermes conversation is selected");
-    expect(instruction).toContain("call continue_hermes_conversation");
+    expect(instruction).toContain("Conversational replies never need a tool");
+    expect(instruction).toContain("Call continue_hermes_conversation only when the user asks to recall something from memory or past conversations");
     expect(instruction).toContain("Use start_background_task for files, terminal work, research, code");
     expect(instruction).toContain("The user does not have to say background");
   });

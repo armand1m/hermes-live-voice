@@ -1,4 +1,4 @@
-import type { TaskExecutionMode, TaskRecord } from "../../../domain/tasks/index.js";
+import type { TaskDelegation, TaskExecutionMode, TaskRecord } from "../../../domain/tasks/index.js";
 
 export interface SubmitBackgroundTaskInput {
   ownerIdentity: string;
@@ -7,6 +7,7 @@ export interface SubmitBackgroundTaskInput {
   title?: string;
   executionMode?: TaskExecutionMode;
   resourceKeys?: readonly string[];
+  delegation?: TaskDelegation;
   originConversationId?: string;
 }
 

@@ -1,12 +1,12 @@
 # Client Protocol
 
-Hermes Live protocol v9 is strict JSON over WebSocket:
+Hermes Live protocol v10 is strict JSON over WebSocket:
 
 ```txt
 ws://127.0.0.1:8788/v1/live
 ```
 
-Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. Protocol v7 moved speech confirmation into the gateway (Silero VAD) and added `input.speech_started`/`input.speech_stopped` with `provider: "gateway"`. Protocol v8 adds `conversation.mode: "persistent"`: the gateway resolves the durable per-user voice thread (most recent Hermes session with the configured title, else a fresh one) and reports it back as `new` or `resume`; reconnects re-resolve the tip, so every device continues the same conversation. Protocol v9 adds `client.audio_settings`: the agent can ask the client to resume a paused microphone and to change its interface sound settings. The gateway still accepts v3-v8 clients; new clients should send v9.
+Use `wss://` behind TLS for non-local clients. Protocol v4 added persisted conversation binding and durable task follow-ups. Protocol v5 added the local Hugging Face provider and final transcripts. Protocol v6 adds an explicit voice-requested microphone pause. Protocol v7 moved speech confirmation into the gateway (Silero VAD) and added `input.speech_started`/`input.speech_stopped` with `provider: "gateway"`. Protocol v8 adds `conversation.mode: "persistent"`: the gateway resolves the durable per-user voice thread (most recent Hermes session with the configured title, else a fresh one) and reports it back as `new` or `resume`; reconnects re-resolve the tip, so every device continues the same conversation. Protocol v9 adds `client.audio_settings`: the agent can ask the client to resume a paused microphone and to change its interface sound settings. Protocol v10 adds response scopes plus deferred-answer and voice-ownership signals: every `response.*` message may carry `scope: "conversation" | "task_notification"` (receipts/notifications versus conversational turns), `deferred.pending {pendingId, kind}` marks async tool work whose spoken answer arrives later, `deferred.delivered {pendingId}` clears it, and `session.demoted {reason: "superseded"}` tells an older page that a newer page now owns the microphone (view-only until it reconnects). The gateway still accepts v3-v9 clients; new clients should send v10.
 
 The TypeScript schemas in `src/domain/protocol/` and the browser validator in `clients/browser/hermes-live-client.js` are the normative contract.
 

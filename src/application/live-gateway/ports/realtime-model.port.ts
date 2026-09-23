@@ -26,6 +26,7 @@ export interface LiveModelAudio {
 }
 
 export interface LiveTaskNotification {
+  notificationId?: string;
   /** Gateway-built marker with only generic safe copy. Never include a raw task title, output, or error. */
   context: string;
   /** Short, already-sanitized generic sentence that may be spoken to the user. */
@@ -84,6 +85,7 @@ export type LiveModelEvent =
       type: "response";
       status: "started" | "completed" | "cancelled" | "failed";
       responseId?: string;
+      notificationId?: string;
       scope?: "conversation" | "task_notification";
       error?: string;
     }
@@ -97,6 +99,8 @@ export interface LiveModelCallbacks {
   onOpen?(): void;
   onClose?(event?: unknown): void;
   onError?(error: unknown): void;
+  /** A finalized user turn the adapter dropped before it became a response (e.g. mic echo). */
+  onDroppedTurn?(drop: { kind: "echo"; text: string }): void;
 }
 
 export interface LiveModelSession {

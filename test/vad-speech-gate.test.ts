@@ -15,6 +15,8 @@ function vadConfig(overrides: Partial<VadConfig> = {}): VadConfig {
     echoStartSustainMs: 200,
     prerollMs: 250,
     tailMs: 400,
+    halfDuplex: false,
+    turnTailMs: 1_000,
     ...overrides,
   };
 }
@@ -283,5 +285,34 @@ describe("energy probability engine", () => {
     await gate.ingest(frame(0.001));
     const { calls } = await startSpeech(gate, 0.05);
     expect(calls).toBeLessThanOrEqual(8);
+  });
+
+  it("never starts speech during downlink in half-duplex mode, even at full confidence", async () => {
+    const gate = new SpeechGate({
+      engine: new ScriptedEngine([SPEECH]),
+      config: vadConfig({ halfDuplex: true }),
+    });
+    gate.setDownlinkActive(true, 1_000);
+    for (let i = 0; i < 12; i += 1) {
+      const decision = await gate.ingest(frame(0.05));
+      expect(decision.started).toBe(false);
+      expect(decision.forward).toHaveLength(0);
+    }
+  });
+
+  it("holds the half-duplex window for the turn tail after downlink stops, then starts cleanly", async () => {
+    const gate = new SpeechGate({
+      engine: new ScriptedEngine([SPEECH]),
+      config: vadConfig({ halfDuplex: true, turnTailMs: 250 }),
+    });
+    gate.setDownlinkActive(true, 250);
+    gate.setDownlinkActive(false);
+    // 250 ms of hold draining at 50 ms per frame: five frames stay suppressed.
+    for (let i = 0; i < 4; i += 1) {
+      expect((await gate.ingest(frame(0.05))).started).toBe(false);
+    }
+    const { calls, decision } = await startSpeech(gate, 0.05, 12);
+    expect(calls).toBeLessThanOrEqual(4);
+    expect(decision.started).toBe(true);
   });
 });

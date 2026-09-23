@@ -45,7 +45,7 @@ const BoundedJsonObjectSchema = z.record(z.unknown()).superRefine((value, contex
 
 export const RealtimeClientCapabilitiesSchema = z
   .object({
-    provider: z.enum(["local", "gemini", "openai", "mock"]),
+    provider: z.enum(["local", "riva", "gemini", "openai", "mock"]),
     model: z.string().min(1).max(PUBLIC_MODEL_MAX_CHARS),
     audio: z
       .object({
@@ -214,7 +214,7 @@ const TaskEventBase = {
 const SessionReadyMessageSchema = z
   .object({
     type: z.literal("session.ready"),
-    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8), z.literal(9)]),
+    protocolVersion: z.union([z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8), z.literal(9), z.literal(10), z.literal(11)]),
     requestId: RequestIdSchema.optional(),
     sessionId: PublicIdSchema,
     model: z.string().min(1).max(PUBLIC_MODEL_MAX_CHARS),
@@ -304,21 +304,41 @@ const ClientAudioSettingsMessageSchema = z
     }
   });
 
+/** Protocol v10: distinguishes conversational turns from spoken notifications. */
+const ResponseScopeSchema = z.enum(["conversation", "task_notification"]).optional();
 const ResponseStartedMessageSchema = z
-  .object({ type: z.literal("response.started"), responseId: PublicIdSchema.optional() })
+  .object({ type: z.literal("response.started"), responseId: PublicIdSchema.optional(), notificationId: PublicIdSchema.optional(), scope: ResponseScopeSchema })
   .strict();
 const ResponseCompletedMessageSchema = z
-  .object({ type: z.literal("response.completed"), responseId: PublicIdSchema.optional() })
+  .object({ type: z.literal("response.completed"), responseId: PublicIdSchema.optional(), notificationId: PublicIdSchema.optional(), scope: ResponseScopeSchema })
   .strict();
 const ResponseCancelledMessageSchema = z
-  .object({ type: z.literal("response.cancelled"), responseId: PublicIdSchema.optional() })
+  .object({ type: z.literal("response.cancelled"), responseId: PublicIdSchema.optional(), notificationId: PublicIdSchema.optional(), scope: ResponseScopeSchema })
   .strict();
 const ResponseFailedMessageSchema = z
   .object({
     type: z.literal("response.failed"),
     responseId: PublicIdSchema.optional(),
+    notificationId: PublicIdSchema.optional(), scope: ResponseScopeSchema,
     error: z.string().min(1).max(PUBLIC_TASK_ERROR_MAX_CHARS),
   })
+  .strict();
+
+/** Protocol v10: another page claimed this owner's voice; this session is view-only. */
+const SessionDemotedMessageSchema = z
+  .object({ type: z.literal("session.demoted"), reason: z.literal("superseded") })
+  .strict();
+/** Protocol v10: an async tool accepted work whose spoken answer arrives later. */
+const DeferredPendingMessageSchema = z
+  .object({
+    type: z.literal("deferred.pending"),
+    pendingId: PublicIdSchema,
+    kind: z.enum(["conversation", "recall"]),
+  })
+  .strict();
+/** Protocol v10: the pending answer was spoken (or dropped); nothing is outstanding. */
+const DeferredDeliveredMessageSchema = z
+  .object({ type: z.literal("deferred.delivered"), pendingId: PublicIdSchema })
   .strict();
 
 const TaskSnapshotMessageSchema = z
@@ -440,6 +460,9 @@ export const ServerMessageSchema = z.union([
   ResponseCompletedMessageSchema,
   ResponseCancelledMessageSchema,
   ResponseFailedMessageSchema,
+  SessionDemotedMessageSchema,
+  DeferredPendingMessageSchema,
+  DeferredDeliveredMessageSchema,
   TaskSnapshotMessageSchema,
   TaskAcceptedMessageSchema,
   TaskStartedMessageSchema,

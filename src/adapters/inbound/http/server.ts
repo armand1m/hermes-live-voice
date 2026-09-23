@@ -16,6 +16,7 @@ import {
 import type { HermesRunsPort } from "../../../application/live-gateway/ports/hermes-runs.port.js";
 import type { TaskSupervisorPort } from "../../../application/live-gateway/ports/task-supervisor.port.js";
 import { LiveGatewaySession } from "../../../application/live-gateway/live-gateway-session.js";
+import { VoiceArbiter } from "../../../application/live-gateway/voice-arbiter.js";
 import { TaskSupervisor } from "../../../application/task-supervisor/task-supervisor.js";
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
 import { HermesClient } from "../../outbound/hermes/hermes-runs.client.js";
@@ -188,6 +189,7 @@ export async function startServer({
     }
   });
 
+  const voiceArbiter = new VoiceArbiter();
   const wss = new WebSocketServer({ noServer: true, maxPayload: clientWebSocketMaxPayload(config) });
   server.on("upgrade", (req, socket, head) => {
     let url: URL;
@@ -230,6 +232,7 @@ export async function startServer({
         speechDetection,
         ...(speechSink ? { speechSink } : {}),
         ...(layaShadow ? { layaShadow } : {}),
+        voiceArbiter,
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -880,46 +883,54 @@ const PROVIDER_PROBE_CACHE_MS = 2_000;
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
 const providerProbeCache = new Map<string, { at: number; result: RealtimeProviderProbe }>();
 
-/** Provider endpoint whose origin can be probed over plain HTTP; null when none applies. */
-function realtimeProviderProbeTarget(config: AppConfig): string | null {
-  if (config.realtime.provider === "local") return config.local?.url ?? null;
-  if (config.realtime.provider === "openai") return config.openai?.baseUrl ?? null;
-  return null;
+/** Provider endpoints whose origins can be probed over HTTP. */
+function realtimeProviderProbeTargets(config: AppConfig): string[] {
+  if (config.realtime.provider === "local") return [config.local.url];
+  if (config.realtime.provider === "riva") return [config.riva.asrUrl, config.riva.ttsUrl];
+  if (config.realtime.provider === "openai") return [config.openai.baseUrl];
+  return [];
 }
 
 /**
- * One cheap HTTP reachability check of the speech-to-speech origin, cached
+ * Cheap HTTP reachability checks of the speech origins, cached
  * briefly so polling clients cannot turn /status.json into a probe amplifier.
  * Any HTTP answer — even 404/426 — proves the speech service is listening;
  * only a refused/timed-out connection reports unreachable.
  */
 async function probeRealtimeProvider(config: AppConfig): Promise<RealtimeProviderProbe | null> {
-  const target = realtimeProviderProbeTarget(config);
-  if (!target) return null;
-  const cached = providerProbeCache.get(target);
+  const targets = realtimeProviderProbeTargets(config);
+  if (!targets.length) return null;
+  const cacheKey = targets.join("|");
+  const cached = providerProbeCache.get(cacheKey);
   if (cached && Date.now() - cached.at <= PROVIDER_PROBE_CACHE_MS) return cached.result;
-  const origin = new URL(target);
-  origin.protocol = origin.protocol === "wss:" ? "https:" : "http:";
-  origin.pathname = "/";
-  origin.search = "";
   const beganAt = Date.now();
-  let result: RealtimeProviderProbe;
-  try {
-    await fetch(origin, {
-      signal: AbortSignal.timeout(PROVIDER_PROBE_TIMEOUT_MS),
-      headers: { Accept: "application/json" },
-    });
-    result = { reachable: true, latencyMs: Date.now() - beganAt, target: origin.origin, checkedAt: Date.now() };
-  } catch (error) {
-    result = {
-      reachable: false,
-      latencyMs: Date.now() - beganAt,
-      target: origin.origin,
-      checkedAt: Date.now(),
-      error: errorToMessage(error),
-    };
-  }
-  providerProbeCache.set(target, { at: Date.now(), result });
+  const origins = targets.map((target) => {
+    const origin = new URL(target);
+    origin.protocol = origin.protocol === "wss:" ? "https:" : "http:";
+    origin.pathname = "/";
+    origin.search = "";
+    return origin;
+  });
+  const checks = await Promise.all(origins.map(async (origin) => {
+    try {
+      await fetch(origin, {
+        signal: AbortSignal.timeout(PROVIDER_PROBE_TIMEOUT_MS),
+        headers: { Accept: "application/json" },
+      });
+      return { reachable: true as const, target: origin.origin };
+    } catch (error) {
+      return { reachable: false as const, target: origin.origin, error: errorToMessage(error) };
+    }
+  }));
+  const failed = checks.filter((check) => !check.reachable);
+  const result: RealtimeProviderProbe = {
+    reachable: failed.length === 0,
+    latencyMs: Date.now() - beganAt,
+    target: checks.map((check) => check.target).join(", "),
+    checkedAt: Date.now(),
+    ...(failed.length ? { error: failed.map((check) => `${check.target}: ${check.error}`).join("; ") } : {}),
+  };
+  providerProbeCache.set(cacheKey, { at: Date.now(), result });
   return result;
 }
 

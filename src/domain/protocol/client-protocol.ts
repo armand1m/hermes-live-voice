@@ -168,6 +168,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   AudioEndMessageSchema,
   TextInputMessageSchema,
   ResponseCancelMessageSchema,
+  z.object({ type: z.literal("speech.playback"), notificationId: NotificationIdSchema,
+    status: z.enum(["playing", "delivered", "interrupted", "failed"]), id: OptionalRequestIdSchema }).strict(),
   TaskListMessageSchema,
   TaskGetMessageSchema,
   TaskFollowUpMessageSchema,
