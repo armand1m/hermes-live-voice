@@ -2666,6 +2666,26 @@ describe("WebSocket exposure controls", () => {
     await native.messages.waitForClose();
   });
 
+  it("admits a reverse-proxied browser origin only while allowOrigin names it", async () => {
+    // Deployment shape hit live on 2026-09-22: the console is served behind a
+    // path-stripping proxy (tailscale serve), so the browser's Origin is the
+    // public HTTPS host while the gateway itself binds loopback. Without
+    // HERMES_LIVE_ALLOW_ORIGIN every upgrade 403s and the console can never
+    // establish a session; with it, the proxied origin must be admitted.
+    const proxiedOrigin = "https://voice.example.net";
+    const config = testConfig({ server: { allowOrigin: proxiedOrigin } });
+    const server = await startTestServer({ config, hermes: new HermesHarness(), provider: new RecordingLiveAdapter() });
+
+    await expectUpgradeRejected(toWebSocketUrl(server.url), { origin: "https://other.example.org" })
+      .then((status) => expect(status).toBe(403));
+
+    const client = await connectClient(server.url, { origin: proxiedOrigin });
+    send(client.socket, { type: "session.start", protocolVersion: 3 });
+    await expect(client.messages.wait("session.ready")).resolves.toMatchObject({ protocolVersion: 3 });
+    client.socket.terminate();
+    await client.messages.waitForClose();
+  });
+
   it("closes oversized WebSocket payloads before parsing client JSON", async () => {
     const config = testConfig({ server: { maxAudioBytes: 2, maxTextChars: 2 } });
     const server = await startTestServer({ config, hermes: new HermesHarness(), provider: new RecordingLiveAdapter() });

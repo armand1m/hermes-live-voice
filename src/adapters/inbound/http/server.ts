@@ -416,6 +416,22 @@ async function withServerDeadline<T>(promise: Promise<T>, timeoutMs: number, mes
   }
 }
 
+// The console page boots two small inline scripts that resolve voice.js and
+// voice.css against the document's mount path, so the page survives being
+// served behind a path-stripping reverse proxy with no trailing slash. The
+// CSP admits exactly those scripts by sha256 hash; test/console-page.test.ts
+// fails whenever index.html's inline scripts drift from this list.
+export const CONSOLE_INLINE_SCRIPT_HASHES: readonly string[] = [
+  "sha256-mq1hfoo5YHSDtaoJ1p/zwcJD1GUVMaK1syjmsBveOD8=",
+  "sha256-NmKY75Dxp7VN/5hMaS7UmRGFkY+GXqvb4hZbFUBDAZA=",
+];
+
+export function consoleContentSecurityPolicy(): string {
+  const scriptSources = CONSOLE_INLINE_SCRIPT_HASHES.map((hash) => `'${hash}'`).join(" ");
+  return `default-src 'self'; script-src 'self' ${scriptSources}; `
+    + "style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+}
+
 async function handleHttp(
   req: IncomingMessage,
   res: ServerResponse,
@@ -472,7 +488,7 @@ async function handleHttp(
       "Content-Type": asset[1], "Content-Length": content.length,
       "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff",
       "Referrer-Policy": "no-referrer",
-      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+      "Content-Security-Policy": consoleContentSecurityPolicy(),
     });
     res.end(req.method === "HEAD" ? undefined : content);
     return;

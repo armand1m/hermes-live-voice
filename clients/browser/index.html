@@ -1,5 +1,20 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes · Live Voice</title><link rel="stylesheet" href="voice.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes · Live Voice</title>
+<script>
+// The console is served under a path prefix (e.g. https://host/voice via a
+// stripping proxy), and the document URL may or may not carry a trailing
+// slash. Relative asset URLs resolve against "/" in the no-slash case, which
+// escapes the mount — so resolve every asset against the mount path computed
+// the same way voice.js does: pathname minus any trailing slash.
+(function () {
+  var path = location.pathname;
+  var mount = path.endsWith("/") ? path.slice(0, -1) : path;
+  var link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = mount + "/voice.css";
+  document.head.appendChild(link);
+})();
+</script>
 <body data-mode="dormant">
 <canvas id="field" data-state="idle" aria-label="Synthetic entity visualization"></canvas>
 <div class="fallback" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -65,5 +80,17 @@
 <button id="mute" disabled aria-pressed="false">Mute</button>
 
 <footer class="foot"><b>CONTINUOUS LISTENING</b><span>Speech interrupts the reply · Muting keeps your conversation open</span></footer>
-<script type="module" src="voice.js"></script>
+<script type="module">
+// Same mount rule as the stylesheet bootstrap above: a static relative
+// src="voice.js" would resolve outside the mount when the document URL has
+// no trailing slash, and the app would never boot. Dynamic import from the
+// computed mount keeps the entry module mount-agnostic like voice.js itself.
+(function () {
+  var path = location.pathname;
+  var mount = path.endsWith("/") ? path.slice(0, -1) : path;
+  import(mount + "/voice.js").catch(function (error) {
+    console.error("[hermes-live] Failed to load voice.js from " + mount + "/voice.js", error);
+  });
+})();
+</script>
 </body></html>
