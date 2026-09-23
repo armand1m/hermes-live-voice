@@ -3,6 +3,8 @@
 Status: active plan. Source investigation: [`NEXTIMPROVEMENTS.md`](../../NEXTIMPROVEMENTS.md) (September 23–24, 2026).
 Integration baseline: commit `82f6303` (Riva migration + protocol v11 WIP, tests repaired, suite green: 992 passed / 1 skipped, typecheck clean).
 
+**Stage 1 (immediate correctness) is complete** — commits `2cfc3b8` (rolling retention + freshness), `7a6f028` (queue placement + stall review), `2168df5` (narration circuit breaker), `c7ca14d` (universal spoken-content preparation), `9ae639f` (SSE reconnect), `72e53d3` (Riva tool-history integrity + repo-check repairs). Suite: 1020 passed / 1 skipped, 5 e2e, typecheck and all repo checks green. Stage 2 (durable herdr supervision, delegation handoff, notification outbox) and Stage 3 (measured ASR/TTS improvements) are next.
+
 ## Problem
 
 The gateway supervises Hermes runs, but it cannot reliably follow the external work Hermes delegates, and what it tells the voice user often overstates or understates reality. Observed on September 23 (times Europe/Amsterdam):
@@ -52,7 +54,7 @@ Hermes remains the reasoning and execution agent. The gateway owns observation, 
 
 ## Implementation stages
 
-### Stage 1 — immediate correctness
+### Stage 1 — immediate correctness — COMPLETE
 
 1. **Rolling progress retention** (`task-supervisor.ts`, `domain/tasks/task.ts`): replace the lifetime `MAX_PROGRESS_EVENTS_PER_TASK = 64` cutoff with bounded rolling retention. Latest activity keeps updating for the whole task lifetime; lifecycle events are never evicted; sequences stay monotonic. Track `lastObservedAt`, `lastActivityAt`, `lastMeaningfulProgressAt` separately — a successful poll proves connectivity, not progress. Coalesce repeated activity persistence to ≥1/s; lifecycle changes persist immediately. Preserve bounded tool identity and file/operation context across start/completion pairs.
 2. **Truthful queue reporting**: expose queue position and blocking task/reason; task summaries distinguish queued / running / delegated / blocked / uncertain / completed. Ten minutes without meaningful progress flags "needs review" with evidence and duration — no automatic stop or restart.
