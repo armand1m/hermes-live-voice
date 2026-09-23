@@ -1,6 +1,6 @@
 # Architecture
 
-Hermes Live Voice is a continuous voice gateway for Hermes Agent. The speech provider handles conversation and turn-taking. Hermes keeps its memory, tools, skills, MCP servers, and execution environment (the gateway bridges read access via a per-session context digest, a durable titled voice thread, and the search_past_chats/remember tools). The gateway owns authentication, persistent background-task supervision, and the protocol between them.
+Hermes Live Voice is a continuous voice gateway for Hermes Agent. The speech provider handles conversation and turn-taking. Hermes keeps its memory, tools, skills, MCP servers, and execution environment. The gateway bridges read access via a per-session context digest, a durable titled voice thread, and the search_past_chats/remember tools, and owns authentication, persistent background-task supervision, and the protocol between them.
 
 It is an independent community integration, not a replacement for Hermes or an official NousResearch release.
 

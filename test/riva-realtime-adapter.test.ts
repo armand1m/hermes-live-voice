@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LiveModelEvent } from "../src/application/live-gateway/ports/realtime-model.port.js";
-import { mergeTranscriptParts, RivaRealtimeAdapter } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
+import type { BrainMessage } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
+import { boundedHistory, mergeTranscriptParts, RivaRealtimeAdapter } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
 
 const mock = vi.hoisted(() => ({ sockets: [] as Array<{ intent: string; sent: Record<string, unknown>[]; emitEvent: (event: object) => void; close: () => void; pings: { count: number } }> }));
 
@@ -127,6 +128,92 @@ describe("Riva realtime bridge", () => {
     await session.close();
   });
 
+  it("settles malformed tool calls explicitly so the exchange is never orphaned", async () => {
+    const brainRequests: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).endsWith("_sessions")) {
+        return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
+      }
+      brainRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: null, tool_calls: [
+          // One valid call, one call with no function name (malformed).
+          { id: "call_ok", function: { name: "start_background_task", arguments: "{}" } },
+          { id: "call_broken", function: { arguments: "{}" } },
+        ] } }],
+      }), { status: 200 });
+    });
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter({
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0, brainMaxTokens: 2048, brainReasoningEffort: "off", echoGuard: false,
+    }).connect({ sessionId: "test", systemInstruction: "Help the user.", availableTools: [], callbacks: { onEvent: (event) => events.push(event) } });
+
+    await session.sendText("delegate something");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "tool_call")).toBe(true));
+    // Only the well-formed call reaches the gateway.
+    expect(events.filter((event) => event.type === "tool_call")).toHaveLength(1);
+    await session.sendToolResponse({ id: "call_ok", name: "start_background_task", args: {} }, {
+      ok: true,
+      spoken_response: "Queued.",
+    });
+
+    // The next brain request contains a settled tool result for every emitted
+    // call id — including the malformed one — and no orphaned tool message.
+    await session.sendText("anything else");
+    await vi.waitFor(() => expect(brainRequests.length).toBeGreaterThanOrEqual(2));
+    const secondMessages = brainRequests.at(-1)?.messages as Array<{ role: string; tool_call_id?: string }>;
+    expect(secondMessages.at(-1)).toEqual({ role: "user", content: "anything else" });
+    const settled = secondMessages.filter((message) => message.role === "tool").map((message) => message.tool_call_id);
+    expect(settled).toContain("call_ok");
+    expect(settled).toContain("call_broken");
+    expect(secondMessages[0]?.role).not.toBe("tool");
+    await session.close();
+  });
+
+  it("never speaks a queued receipt or notification after barge-in", async () => {
+    let gateRelease: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { gateRelease = resolve; });
+    let brainCalls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("_sessions")) {
+        return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
+      }
+      brainCalls += 1;
+      if (brainCalls === 1) await gate;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "Answer." } }] }), { status: 200 });
+    });
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter({
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0, brainMaxTokens: 2048, brainReasoningEffort: "off", echoGuard: false,
+    }).connect({ sessionId: "test", systemInstruction: "Help the user.", availableTools: [], callbacks: { onEvent: (event) => events.push(event) } });
+
+    // The queue blocks inside the brain turn; the notification speech queues
+    // behind it and has not started when the user barges in.
+    await session.sendText("hold the turn");
+    await vi.waitFor(() => expect(brainCalls).toBe(1));
+    await session.sendTaskNotification?.({ context: "[TEST] stale", announcement: "Stale notification speech." });
+    expect(await session.cancelResponse?.("user barge-in")).toBe(true);
+    gateRelease();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const synthesized = mock.sockets
+      .filter((socket) => socket.intent === "synthesize")
+      .flatMap((socket) => socket.sent.filter((event) => event.type === "input_text.append"));
+    expect(synthesized).toHaveLength(0);
+    expect(events.some((event) => event.type === "text" && event.speaker === "assistant")).toBe(false);
+    await session.close();
+  });
+
   it("collapses near-duplicate ASR re-emissions into one user turn", async () => {
     const brainRequests: Record<string, unknown>[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -229,6 +316,31 @@ describe("Riva realtime bridge", () => {
     next.emitEvent({ type: "conversation.item.input_audio_transcription.completed", transcript: "what is the weather forecast", is_last_result: true });
     await vi.waitFor(() => expect(brainRequests).toHaveLength(2));
     await session.close();
+  });
+});
+
+describe("boundedHistory", () => {
+  it("keeps complete tool-call exchanges and never starts with an orphaned tool result", () => {
+    const messages: BrainMessage[] = [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_1" }] },
+      { role: "tool", tool_call_id: "call_1", content: "r1" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_2" }] },
+      { role: "tool", tool_call_id: "call_2", content: "r2" },
+      { role: "user", content: "second" },
+      { role: "assistant", content: "done" },
+    ];
+    // The window cuts between an assistant tool_calls message and its result:
+    // the orphaned tool result is dropped instead of leading the history with
+    // an unmatched tool message.
+    const kept = boundedHistory(messages, 3);
+    expect(kept[0]?.role).not.toBe("tool");
+    expect(kept.map((message) => message.role)).toEqual(["user", "assistant"]);
+    // A window that lands cleanly keeps every exchange intact.
+    expect(boundedHistory(messages, 4).map((message) => message.role))
+      .toEqual(["assistant", "tool", "user", "assistant"]);
+    // A short history passes through untouched.
+    expect(boundedHistory(messages.slice(0, 2), 4)).toEqual(messages.slice(0, 2));
   });
 });
 

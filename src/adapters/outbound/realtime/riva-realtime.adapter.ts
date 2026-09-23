@@ -26,7 +26,7 @@ const ASR_FINAL_TIMEOUT_MS = 15_000;
 const MAX_HISTORY = 12;
 
 type JsonObject = Record<string, unknown>;
-type BrainMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string; tool_calls?: unknown[] };
+export type BrainMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string; tool_calls?: unknown[] };
 
 /** Bridges NVIDIA Speech NIM's separate ASR/TTS sockets to Hermes' live session. */
 export class RivaRealtimeAdapter implements LiveModelAdapter {
@@ -63,6 +63,9 @@ class RivaRealtimeSession implements LiveModelSession {
   private readonly echoGuard: RivaEchoGuard | undefined;
   private closed = false;
   private generation = 0;
+  /** Bumped on barge-in/close: queued speech from an older epoch is stale. */
+  private speechEpoch = 0;
+  private queuedSpeech = 0;
 
   constructor(
     private readonly config: AppConfig["riva"],
@@ -129,12 +132,17 @@ class RivaRealtimeSession implements LiveModelSession {
   }
 
   async cancelResponse(_reason?: string, _truncate?: RealtimeResponseTruncation): Promise<boolean> {
-    if (!this.activeResponseId) return false;
-    this.generation += 1;
-    this.activeAbort?.abort();
-    this.tts?.close();
-    this.params.callbacks.onEvent({ type: "response", status: "cancelled", responseId: this.activeResponseId });
-    this.activeResponseId = undefined;
+    // Barge-in invalidates queued speech too: a receipt that has not started
+    // speaking yet is stale and must die before it reaches synthesis.
+    this.speechEpoch += 1;
+    if (this.activeResponseId === undefined && this.queuedSpeech === 0) return false;
+    if (this.activeResponseId !== undefined) {
+      this.generation += 1;
+      this.activeAbort?.abort();
+      this.tts?.close();
+      this.params.callbacks.onEvent({ type: "response", status: "cancelled", responseId: this.activeResponseId });
+      this.activeResponseId = undefined;
+    }
     return true;
   }
 
@@ -143,7 +151,7 @@ class RivaRealtimeSession implements LiveModelSession {
     const spoken = typeof response.spoken_response === "string" ? response.spoken_response.trim() : "";
     this.history.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(response) });
     if (spoken) {
-      if (!options?.suppressSpeech) this.enqueue(() => this.speakResponse(spoken));
+      if (!options?.suppressSpeech) this.enqueueSpeech(spoken);
       return;
     }
     if (this.pendingCalls.size === 0) this.enqueue(() => this.completeToolResponse());
@@ -151,13 +159,14 @@ class RivaRealtimeSession implements LiveModelSession {
 
   async sendTaskNotification(notification: LiveTaskNotification): Promise<void> {
     if (this.closed) return;
-    this.enqueue(() => this.speakResponse(notification.speech ?? notification.announcement, "task_notification"));
+    this.enqueueSpeech(notification.speech ?? notification.announcement, "task_notification");
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.generation += 1;
+    this.speechEpoch += 1;
     this.clearTranscriptTimer();
     this.clearAsrKeepalive();
     this.releaseTranscript();
@@ -211,6 +220,17 @@ class RivaRealtimeSession implements LiveModelSession {
   private enqueue(task: () => Promise<void>): void {
     this.queue = this.queue.then(task).catch((error: unknown) => {
       if (!this.closed) this.params.callbacks.onError?.(error);
+    });
+  }
+
+  /** Queue spoken text that a barge-in can still cancel before it starts. */
+  private enqueueSpeech(text: string, scope: "conversation" | "task_notification" = "conversation"): void {
+    const epoch = this.speechEpoch;
+    this.queuedSpeech += 1;
+    this.enqueue(async () => {
+      this.queuedSpeech -= 1;
+      if (this.closed || epoch !== this.speechEpoch) return;
+      await this.speakResponse(text, scope);
     });
   }
 
@@ -310,7 +330,7 @@ class RivaRealtimeSession implements LiveModelSession {
     try {
       const messages: BrainMessage[] = [
         { role: "system", content: this.params.systemInstruction },
-        ...this.history.slice(-MAX_HISTORY),
+        ...boundedHistory(this.history, MAX_HISTORY),
       ];
       const tools = selectCompactOpenAIHermesLiveTools(this.params.availableTools).map((tool) => ({
         type: "function" as const,
@@ -344,7 +364,16 @@ class RivaRealtimeSession implements LiveModelSession {
       if (toolCalls.length) {
         for (const tool of toolCalls) {
           const fn = tool.function as JsonObject | undefined;
-          if (typeof tool.id !== "string" || typeof fn?.name !== "string") continue;
+          if (typeof tool.id !== "string" || typeof fn?.name !== "string") {
+            // Settle malformed calls explicitly: an unanswered tool_call id
+            // would orphan the exchange and poison every later brain request.
+            this.history.push({
+              role: "tool",
+              tool_call_id: typeof tool.id === "string" ? tool.id : `invalid_${randomUUID().slice(0, 8)}`,
+              content: JSON.stringify({ ok: false, error: "Tool call was malformed and was not executed." }),
+            });
+            continue;
+          }
           let args: JsonObject;
           try { args = JSON.parse(String(fn.arguments ?? "{}")) as JsonObject; } catch { args = {}; }
           const call: LiveToolCall = { id: tool.id, name: fn.name, args };
@@ -523,6 +552,18 @@ function providerError(event: JsonObject): string {
 
 function stripThinkingBlocks(content: string): string {
   return content.replace(THINK_BLOCK, "");
+}
+
+/**
+ * Bound the brain history without splitting tool-call exchanges: a leading
+ * tool result whose assistant tool_calls message fell out of the window is
+ * dropped too, because the brain rejects tool messages with no matching call.
+ */
+export function boundedHistory(messages: readonly BrainMessage[], limit: number): BrainMessage[] {
+  if (messages.length <= limit) return [...messages];
+  let kept = messages.slice(-limit);
+  while (kept.length > 0 && kept[0]!.role === "tool") kept = kept.slice(1);
+  return kept;
 }
 
 const TRANSCRIPT_MAX_PARTS = 32;
