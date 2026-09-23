@@ -6,24 +6,20 @@ import type { TaskNarratorPort } from "./ports/task-narrator.port.js";
 // markdown through the configured LLM, and remembers the result by task id
 // and revision (taskId:sequence:updatedAt) so a summary is computed exactly
 // once per revision — reconnects, repeated drawer opens, and any number of
-// clients all hit the cache. The cache is bounded FIFO; narration of evicted
-// or revised tasks simply recomputes. Failed revisions are quarantined for a
-// TTL instead of retried eagerly (a 5xx may mean the model server crashed),
-// and concurrent requests for the same revision join the in-flight call
-// instead of stacking on the LLM.
+// clients all hit the cache. Both caches (successes and failures) are bounded
+// FIFO; narration of evicted or revised tasks simply recomputes. Failed
+// revisions trip a circuit breaker instead of a long quarantine (plan §A): a
+// request that made the LLM answer 5xx is not re-sent on every drawer open,
+// but a transient failure recovers after a minute — not a gateway restart —
+// and concurrent requests for the same revision join the in-flight call.
 
 /** Retained output fed to the model; the raw view keeps the rest. */
 const MAX_OUTPUT_CHARS = 4_000;
 /** Bounded cache: terminal history is capped by the store, this is the backstop. */
 const DEFAULT_MAX_ENTRIES = 256;
-/**
- * Failures are quarantined, not retried immediately: a request that made the
- * LLM answer 5xx (observed live: an sglang speculative-decoding crash that
- * takes the whole model server down) must not be re-sent on every drawer
- * open. After this TTL the task narrates again — a fixed or restarted model
- * recovers without a gateway restart.
- */
-const DEFAULT_FAILURE_TTL_MS = 24 * 60 * 60 * 1_000;
+/** Circuit breaker: first retry after one minute, doubling, capped at five. */
+const DEFAULT_BREAKER_RETRY_MS = 60_000;
+const DEFAULT_BREAKER_MAX_MS = 5 * 60_000;
 
 export const NARRATOR_SYSTEM_PROMPT = [
   "You tidy voice-assistant task records into markdown for a compact on-screen log.",
@@ -67,14 +63,20 @@ export interface TaskNarrationResult {
 export interface TaskNarrationServiceOptions {
   client: TaskNarratorPort;
   maxEntries?: number;
-  /** How long a failed revision stays quarantined before it retries. */
-  failureTtlMs?: number;
+  /** Circuit breaker: delay before the first retry of a failed revision. */
+  breakerRetryMs?: number;
+  /** Circuit breaker ceiling: backoff stops growing at this delay. */
+  breakerMaxMs?: number;
 }
 
-interface QuarantinedEntry {
+interface FailedEntry {
   failed: true;
+  taskId: string;
+  sequence: number;
+  updatedAt: number;
   error: string;
   at: number;
+  attempts: number;
 }
 
 export interface TaskNarrationService {
@@ -87,20 +89,26 @@ export interface TaskNarrationService {
 export function createTaskNarrationService(options: TaskNarrationServiceOptions): TaskNarrationService {
   const client = options.client;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  const failureTtlMs = options.failureTtlMs ?? DEFAULT_FAILURE_TTL_MS;
-  const cache = new Map<string, TaskNarrationResult | QuarantinedEntry>();
+  const breakerRetryMs = options.breakerRetryMs ?? DEFAULT_BREAKER_RETRY_MS;
+  const breakerMaxMs = Math.max(options.breakerMaxMs ?? DEFAULT_BREAKER_MAX_MS, breakerRetryMs);
+  const cache = new Map<string, TaskNarrationResult | FailedEntry>();
   const inflight = new Map<string, Promise<TaskNarrationResult>>();
 
   const keyOf = (taskId: string, sequence: number, updatedAt: number) =>
     `${taskId}:${sequence}:${updatedAt}`;
 
-  function remember(result: TaskNarrationResult) {
-    const key = keyOf(result.taskId, result.sequence, result.updatedAt);
-    cache.set(key, result);
+  function remember(entry: TaskNarrationResult | FailedEntry) {
+    const key = keyOf(entry.taskId, entry.sequence, entry.updatedAt);
+    cache.set(key, entry);
     while (cache.size > maxEntries) {
-      // Map preserves insertion order: drop the oldest remembered summary.
+      // Map preserves insertion order: drop the oldest remembered entry —
+      // failures included, so a burst of dead revisions cannot grow the map.
       cache.delete(cache.keys().next().value as string);
     }
+  }
+
+  function breakerDelayMs(entry: FailedEntry): number {
+    return Math.min(breakerRetryMs * 2 ** Math.min(entry.attempts - 1, 16), breakerMaxMs);
   }
 
   return {
@@ -114,8 +122,13 @@ export function createTaskNarrationService(options: TaskNarrationServiceOptions)
       const entry = cache.get(key);
       if (entry && !("failed" in entry)) return { ...entry, cached: true };
       if (entry && "failed" in entry) {
-        if (Date.now() - entry.at <= failureTtlMs) {
-          throw new Error(`task narration is quarantined after a recent failure: ${entry.error}`);
+        const elapsed = Date.now() - entry.at;
+        const delay = breakerDelayMs(entry);
+        if (elapsed < delay) {
+          const retryInSeconds = Math.ceil((delay - elapsed) / 1_000);
+          throw new Error(
+            `task narration is recovering after a recent failure (retrying in ~${retryInSeconds}s): ${entry.error}`,
+          );
         }
         cache.delete(key);
       }
@@ -135,10 +148,18 @@ export function createTaskNarrationService(options: TaskNarrationServiceOptions)
           remember(result);
           return result;
         } catch (error) {
-          // Quarantine the revision: never re-send a request that just made
-          // the model fail (it may have crashed the model server outright).
-          const message = errorToMessage(error);
-          cache.set(key, { failed: true, error: message, at: Date.now() });
+          // Trip the breaker with backoff: never hammer a model that just
+          // failed (it may have crashed outright), but never strand a task
+          // log behind a 24-hour quarantine either.
+          remember({
+            failed: true,
+            taskId: task.taskId,
+            sequence: task.sequence,
+            updatedAt: task.updatedAt,
+            error: errorToMessage(error),
+            at: Date.now(),
+            attempts: (entry && "failed" in entry ? entry.attempts : 0) + 1,
+          });
           throw error;
         } finally {
           inflight.delete(key);

@@ -661,7 +661,9 @@ async function handleHttp(
       json(req, res, 200, result);
     } catch (error) {
       // A failure can mean the LLM is down (or was crashed by this very
-      // request); the service quarantines the revision — say so in the log.
+      // request); the service opens its circuit breaker and retries shortly.
+      // The raw structured facts stay visible regardless — narration is
+      // presentation, never the source of truth.
       options.logger.error("task narration failed", {
         taskId,
         error: errorToMessage(error),

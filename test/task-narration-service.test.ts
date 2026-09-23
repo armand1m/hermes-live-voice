@@ -102,25 +102,70 @@ describe("createTaskNarrationService", () => {
     expect(summarize).toHaveBeenCalledTimes(1);
   });
 
-  it("quarantines failed revisions for the TTL, then retries them", async () => {
+  it("recovers a failed revision through the circuit breaker instead of a day-long quarantine", async () => {
     vi.useFakeTimers();
     try {
       const boom = fakeClient();
       (boom as unknown as { summarize: Mock }).summarize
         .mockRejectedValueOnce(new Error("LLM responded 500"))
         .mockResolvedValueOnce("**Recovered**");
-      const service = createTaskNarrationService({ client: boom, failureTtlMs: 1_000 });
+      const service = createTaskNarrationService({ client: boom, breakerRetryMs: 1_000, breakerMaxMs: 4_000 });
 
       // The failure propagates…
       await expect(service.narrate(SNAPSHOT)).rejects.toThrow("LLM responded 500");
-      // …and the revision is quarantined: the next caller fails fast without
-      // touching the LLM again (a 5xx may have crashed the model server).
-      await expect(service.narrate(SNAPSHOT)).rejects.toThrow("quarantined");
+      // …and the breaker is open: the next caller fails fast without touching
+      // the LLM again (a 5xx may have crashed the model server).
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow("recovering after a recent failure");
       expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(1);
 
+      // The 2026-09-23 journal had narration unavailable for a day. The breaker
+      // retries after the short window, not the old 24-hour quarantine.
       await vi.advanceTimersByTimeAsync(1_100);
       await expect(service.narrate(SNAPSHOT)).resolves.toMatchObject({ markdown: "**Recovered**" });
       expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("backs the breaker off exponentially up to its ceiling on repeated failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const boom = fakeClient();
+      (boom as unknown as { summarize: Mock }).summarize.mockRejectedValue(new Error("still down"));
+      const service = createTaskNarrationService({ client: boom, breakerRetryMs: 1_000, breakerMaxMs: 4_000 });
+
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow("still down");
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow(/retrying in ~1s/);
+      await vi.advanceTimersByTimeAsync(1_100);
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow("still down"); // attempt 2
+      // Second backoff doubles…
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow(/retrying in ~2s/);
+      await vi.advanceTimersByTimeAsync(2_100);
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow("still down"); // attempt 3
+      // …and stops growing at the ceiling.
+      await expect(service.narrate(SNAPSHOT)).rejects.toThrow(/retrying in ~4s/);
+      expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds failed revisions together with successful ones in the cache", async () => {
+    vi.useFakeTimers();
+    try {
+      const boom = fakeClient();
+      (boom as unknown as { summarize: Mock }).summarize.mockRejectedValue(new Error("LLM down"));
+      const service = createTaskNarrationService({ client: boom, maxEntries: 2, breakerRetryMs: 1_000 });
+      const ids = ["task_1111111111111111", "task_2222222222222222", "task_3333333333333333"];
+      for (const id of ids) {
+        await expect(service.narrate({ ...SNAPSHOT, taskId: id })).rejects.toThrow("LLM down");
+      }
+      // The first failed revision was evicted by the FIFO bound; re-narrating
+      // it re-attempts immediately instead of failing fast on a stale entry.
+      (boom as unknown as { summarize: Mock }).summarize.mockResolvedValue("**Back**");
+      await expect(service.narrate({ ...SNAPSHOT, taskId: ids[0] })).resolves.toMatchObject({ markdown: "**Back**" });
+      expect((boom as unknown as { summarize: Mock }).summarize).toHaveBeenCalledTimes(4);
     } finally {
       vi.useRealTimers();
     }

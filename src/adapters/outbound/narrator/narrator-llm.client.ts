@@ -18,6 +18,8 @@ const THINK_BLOCK = /<think>[\s\S]*?<\/think>/g;
 const MAX_COMPLETION_TOKENS = 2_048;
 /** Summarizing a record needs no deep reasoning; low effort answers directly. */
 const REASONING_EFFORT = "low";
+/** The answer is a bounded markdown summary; anything larger is a wedged or hostile body. */
+const MAX_RESPONSE_BODY_BYTES = 1_048_576;
 
 export interface NarratorLlmClientOptions {
   baseUrl: string;
@@ -38,15 +40,17 @@ export class NarratorLlmClient {
 
   /**
    * Summarize one task fact sheet into markdown. The user-role message is
-   * mandatory: the sglang chat endpoint rejects requests without one.
+   * mandatory: the sglang chat endpoint rejects requests without one. The
+   * wall-time budget covers headers *and* body decoding: the abort signal
+   * stays armed until the payload is fully read, so a wedged model cannot
+   * hang the route on a slow-dripping body after fast headers.
    */
   async summarize(systemPrompt: string, factSheet: string): Promise<string> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.options.requestTimeoutMs);
     timer.unref?.();
-    let response: Response;
     try {
-      response = await fetch(`${this.options.baseUrl}/chat/completions`, {
+      const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
         method: "POST",
         redirect: "error",
         headers: { "content-type": "application/json", accept: "application/json" },
@@ -63,28 +67,50 @@ export class NarratorLlmClient {
         }),
         signal: controller.signal,
       });
+      if (!response.ok) {
+        throw new Error(`task narrator LLM responded ${response.status}`);
+      }
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BODY_BYTES) {
+        throw new Error("task narrator LLM response body exceeded the safe size limit.");
+      }
+      let body: string;
+      try {
+        body = await response.text();
+      } catch (error) {
+        throw new Error(
+          isAbortError(error)
+            ? "task narrator LLM body read timed out"
+            : `task narrator LLM body read failed: ${errorToMessage(error)}`,
+        );
+      }
+      if (body.length > MAX_RESPONSE_BODY_BYTES) {
+        throw new Error("task narrator LLM response body exceeded the safe size limit.");
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(body);
+      } catch (error) {
+        throw new Error(`task narrator LLM returned invalid JSON: ${errorToMessage(error)}`);
+      }
+      const content = extractContent(payload);
+      const markdown = content.replace(THINK_BLOCK, "").trim();
+      if (!markdown) {
+        const finish = extractFinishReason(payload);
+        throw new Error(`task narrator LLM returned no content (finish_reason: ${finish ?? "unknown"})`);
+      }
+      return markdown;
     } catch (error) {
-      throw new Error(`task narrator LLM request failed: ${errorToMessage(error)}`);
+      if (isAbortError(error)) throw new Error("task narrator LLM request timed out");
+      throw error instanceof Error ? error : new Error(`task narrator LLM request failed: ${errorToMessage(error)}`);
     } finally {
       clearTimeout(timer);
     }
-    if (!response.ok) {
-      throw new Error(`task narrator LLM responded ${response.status}`);
-    }
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      throw new Error(`task narrator LLM returned invalid JSON: ${errorToMessage(error)}`);
-    }
-    const content = extractContent(payload);
-    const markdown = content.replace(THINK_BLOCK, "").trim();
-    if (!markdown) {
-      const finish = extractFinishReason(payload);
-      throw new Error(`task narrator LLM returned no content (finish_reason: ${finish ?? "unknown"})`);
-    }
-    return markdown;
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function extractContent(payload: unknown): string {
