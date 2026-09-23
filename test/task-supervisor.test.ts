@@ -885,6 +885,63 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("re-subscribes a dropped run-event stream with bounded backoff while polling continues", async () => {
+    const scheduler = new ManualScheduler();
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    let subscriptions = 0;
+    hermes.streamBehavior = async function* (runId: string, options?: AbortSignal | HermesRequestOptions) {
+      subscriptions += 1;
+      if (subscriptions === 1) {
+        yield { event: "tool.started", run_id: runId, tool: "search" } as HermesRunEvent;
+        // The transport drops mid-run: not a 404, so the supervisor must
+        // re-subscribe rather than fall back to polling alone.
+        throw Object.assign(new Error("connection dropped"), { status: 502 });
+      }
+      yield { event: "tool.completed", run_id: runId, tool: "search" } as HermesRunEvent;
+      // Stay open like a real stream, but end on abort so close() settles.
+      const signal = options instanceof AbortSignal ? options : options?.signal;
+      await new Promise<void>((resolve) => {
+        if (!signal) return;
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    };
+    const supervisor = new TaskSupervisor({
+      store,
+      hermes,
+      scheduler,
+      now: () => scheduler.now,
+      pollIntervalMs: 100,
+      retryBaseMs: 10,
+      retryMaxMs: 50,
+      activityCoalesceMs: 1,
+    });
+    await supervisor.initialize();
+    const task = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Watch a flaky stream",
+    });
+    await waitFor(async () => (await store.load(task.taskId))?.status === "running");
+    const runId = (await store.load(task.taskId))!.runId!;
+
+    // The first subscription delivered its event before dropping.
+    await waitFor(async () => (await store.load(task.taskId))?.lastActivityAt !== undefined);
+    expect(subscriptions).toBe(1);
+    // The task stays running: polling never depended on the stream.
+    scheduler.advanceBy(100);
+    await waitFor(() => hermes.getCalls.includes(runId));
+
+    // Backoff elapses and exactly one fresh subscription takes over.
+    scheduler.advanceBy(10);
+    await waitFor(() => subscriptions === 2);
+    await waitFor(async () => (await store.load(task.taskId))?.lastMeaningfulProgressAt !== undefined);
+    const recovered = (await store.load(task.taskId))!;
+    expect(recovered.status).toBe("running");
+    expect(recovered.events.some((event) => event.type === "progress")).toBe(true);
+    await supervisor.close();
+  });
+
   it("polls while SSE stays open, persists terminal output before publication, and confirms stop asynchronously", async () => {
     const scheduler = new ManualScheduler();
     const store = new MemoryTaskStore();

@@ -150,6 +150,8 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private readonly stopRequests = new Map<string, Promise<void>>();
   private readonly containingApprovals = new Set<string>();
   private readonly backgroundOperations = new Set<Promise<void>>();
+  /** Pending backoff sleeps, resolved immediately on close. */
+  private readonly backoffWaiters = new Set<() => void>();
   private readonly abortController = new AbortController();
   private operationTail: Promise<void> = Promise.resolve();
   private initializePromise?: Promise<void>;
@@ -193,6 +195,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private async closeOnce(): Promise<void> {
     this.closed = true;
     this.abortController.abort();
+    for (const done of this.backoffWaiters) done();
     for (const handle of this.timers.values()) this.scheduler.clearTimeout(handle);
     this.timers.clear();
     this.watching.clear();
@@ -839,23 +842,62 @@ export class TaskSupervisor implements TaskSupervisorPort {
   }
 
   private async consumeRunEvents(record: TaskRecord): Promise<void> {
+    let attempt = 0;
     try {
-      const events = this.hermes.streamRunEvents(record.runId!, {
-        signal: this.abortController.signal,
-        sessionKey: this.ownerSessionKeys.get(record.ownerId),
-      });
-      for await (const event of events) {
-        if (this.closed) return;
-        await this.handleRunEvent(record.taskId, record.runId!, event);
+      // One gateway subscription per run, re-established with bounded backoff
+      // when the stream drops (plan §A). Status polling continues
+      // independently the whole time and remains authoritative for state.
+      while (!this.closed) {
         const current = await this.store.load(record.taskId);
-        if (!current || isTaskOperationallyClosed(current)) return;
+        if (!current || isTaskOperationallyClosed(current) || current.runId !== record.runId) return;
+        try {
+          const events = this.hermes.streamRunEvents(record.runId!, {
+            signal: this.abortController.signal,
+            sessionKey: this.ownerSessionKeys.get(record.ownerId),
+          });
+          for await (const event of events) {
+            if (this.closed) return;
+            await this.handleRunEvent(record.taskId, record.runId!, event);
+            const after = await this.store.load(record.taskId);
+            if (!after || isTaskOperationallyClosed(after)) return;
+            // A delivered event proves the subscription is healthy: the next
+            // interruption starts its backoff from the base again.
+            attempt = 0;
+          }
+        } catch (error) {
+          if (this.closed && isAbortError(error)) return;
+          if (httpStatus(error) === 404) {
+            // Hermes can remove a terminal run's consumptive SSE stream. The
+            // already-scheduled status poll projects completed or
+            // confirmed-missing state; re-subscribing would only 404 again.
+            return;
+          }
+          if (!isAbortError(error)) this.reportError(error);
+        }
+        if (this.closed) return;
+        attempt += 1;
+        const delay = Math.min(this.retryBaseMs * 2 ** Math.min(attempt - 1, 16), this.retryMaxMs);
+        await this.waitUnlessClosed(delay);
       }
     } finally {
-      // Once SSE ends, hand recovery back to the bounded polling loop. Doing
-      // reconciliation inline here could let one transient state-store failure
-      // escape before a replacement poll was scheduled.
+      // Once SSE gives up, hand recovery back to the bounded polling loop.
+      // Doing reconciliation inline here could let one transient state-store
+      // failure escape before a replacement poll was scheduled.
       if (!this.closed) this.schedulePoll(record.taskId, 0);
     }
+  }
+
+  /** Backoff sleep that close() can end immediately (never blocks shutdown). */
+  private waitUnlessClosed(delayMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        this.backoffWaiters.delete(done);
+        resolve();
+      };
+      this.backoffWaiters.add(done);
+      const handle = this.scheduler.setTimeout(done, Math.max(0, delayMs));
+      (handle as { unref?: () => void }).unref?.();
+    });
   }
 
   private async handleRunEvent(taskId: string, runId: string, event: HermesRunEvent): Promise<void> {
