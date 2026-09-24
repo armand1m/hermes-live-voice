@@ -149,6 +149,7 @@ const EnvSchema = z.object({
   HERMES_LIVE_RIVA_BRAIN_PREWARM: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_KNOWLEDGE_INDEX: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_KNOWLEDGE_REFLECTION: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_TTS_URL: z.string().url().refine(isSafeHttpLocalUrl, {
     message: "HERMES_LIVE_TTS_URL must be a credential-free local HTTP(S) URL (tts sidecar).",
   }).optional(),
@@ -230,6 +231,8 @@ export interface KnowledgeConfig {
   turnContext: boolean;
   /** Index file; a derived cache that is safe to delete. */
   path: string;
+  /** After substantial voice sessions, let Hermes update memory/skills from the transcript (default off). */
+  reflection?: boolean;
 }
 
 export interface VadConfig {
@@ -542,6 +545,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       turnContext: parsed.HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT !== undefined
         && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT),
       path: join(dirname(parsed.HERMES_LIVE_TASK_STATE_FILE), "knowledge-v1.sqlite"),
+      reflection: parsed.HERMES_LIVE_KNOWLEDGE_REFLECTION !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_KNOWLEDGE_REFLECTION),
     },
   };
 }

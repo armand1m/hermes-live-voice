@@ -642,6 +642,39 @@ describe("live gateway WebSocket", () => {
     });
   });
 
+  it("hands a substantial voice session to one quiet Hermes reflection run on close", async () => {
+    const config = { ...testConfig(), knowledge: { enabled: false, turnContext: false, path: "", reflection: true } };
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider });
+    const client = await readyClient(server.url);
+    for (let turn = 0; turn < 4; turn += 1) {
+      provider.emit({ type: "text", speaker: "user", text: `I prefer dark roast coffee, turn ${turn}.`, final: true });
+      provider.emit({ type: "text", speaker: "assistant", text: `Noted, turn ${turn}.`, final: true });
+    }
+    await delay(50);
+    client.socket.close();
+    await waitUntil(() => hermes.startCalls.length === 1);
+    expect(hermes.startCalls[0]).toMatchObject({
+      sessionId: expect.stringMatching(/^hermes-live:reflection:\d{4}-\d{2}-\d{2}$/),
+      instructions: expect.stringContaining("memory tool"),
+      input: expect.stringContaining("User: I prefer dark roast coffee, turn 3."),
+    });
+  });
+
+  it("does not reflect on short voice sessions", async () => {
+    const config = { ...testConfig(), knowledge: { enabled: false, turnContext: false, path: "", reflection: true } };
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider });
+    const client = await readyClient(server.url);
+    provider.emit({ type: "text", speaker: "user", text: "Hello there.", final: true });
+    await delay(50);
+    client.socket.close();
+    await delay(300);
+    expect(hermes.startCalls).toHaveLength(0);
+  });
+
   it("never speaks another owner's external watch", async () => {
     const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
     const provider = new RecordingLiveAdapter();

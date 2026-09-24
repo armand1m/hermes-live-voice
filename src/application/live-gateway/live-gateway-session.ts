@@ -59,6 +59,12 @@ import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import { localRecallResult, turnContextBlock } from "../knowledge/recall.js";
 import { suggestWork, workSuggestionsSpokenSummary } from "../knowledge/work-suggester.js";
 import {
+  REFLECTION_INSTRUCTIONS,
+  ReflectionTranscript,
+  buildReflectionInput,
+  reflectionSessionId,
+} from "../knowledge/session-reflection.js";
+import {
   nextTaskProgressAnnouncement,
   startTaskProgressTracking,
   type TaskProgressAnnouncement,
@@ -245,6 +251,7 @@ export class LiveGatewaySession {
   /** Spoken progress for running Hermes tasks (progress announcements flag). */
   private readonly taskProgress = new Map<string, { record: TaskRecord; tracking: TaskProgressTracking }>();
   private pendingProgressAnnouncements: TaskProgressAnnouncement[] = [];
+  private readonly reflectionTranscript = new ReflectionTranscript();
   private taskProgressTimer?: ReturnType<typeof setInterval>;
   private lastExternalAnnouncementAt?: number;
   private sessionStartedAt = Date.now();
@@ -731,8 +738,32 @@ export class LiveGatewaySession {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    this.startSessionReflection();
     this.closePromise = this.performClose();
     return this.closePromise;
+  }
+
+  /**
+   * Post-session learning (opt-in): hand a substantial voice transcript to
+   * one quiet Hermes run that updates memory and skills with Hermes' own
+   * tools. Not a supervised task — it never enters the inbox or speaks — and
+   * fire-and-forget, so closing never waits on it.
+   */
+  private startSessionReflection(): void {
+    if (this.deps.config.knowledge?.reflection !== true || !this.sessionKey) return;
+    const endedAt = Date.now();
+    const input = buildReflectionInput(this.reflectionTranscript.snapshot(), endedAt);
+    if (!input) return;
+    void this.deps.hermes.startRun({
+      input,
+      instructions: REFLECTION_INSTRUCTIONS,
+      sessionId: reflectionSessionId(endedAt),
+      sessionKey: this.sessionKey,
+    }).then((run) => {
+      this.deps.logger.info("session reflection started", { sessionId: this.id, runId: run.runId });
+    }).catch((error: unknown) => {
+      this.deps.logger.warn("session reflection could not start", { sessionId: this.id, error: errorToMessage(error) });
+    });
   }
 
   private enqueueClientFrame(frame: ClientInboundFrame): void {
@@ -2412,11 +2443,13 @@ export class LiveGatewaySession {
       // marks the brain → TTS boundary of the turn timeline.
       if ((event.speaker ?? "assistant") === "assistant") this.speechTiming.noteAssistantText(Date.now());
       if ((event.speaker ?? "assistant") === "user" && event.final) {
+        this.reflectionTranscript.add("user", event.text);
         this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
         this.noteLayaShadowTurn(event.text);
       } else if (event.final && event.speaker !== "system") {
+        this.reflectionTranscript.add("assistant", event.text);
         this.recordShadowTurn(event.speaker ?? "assistant", event.text);
       }
       this.send({

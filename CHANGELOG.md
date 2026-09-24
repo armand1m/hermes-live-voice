@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opt-in post-session learning (`HERMES_LIVE_KNOWLEDGE_REFLECTION`, default off). After a voice session with at least four user turns, one quiet Hermes run (not a supervised task: no inbox entry, no announcement) reviews the bounded transcript and updates memory and skills with Hermes' own tools, treating the transcript as data. Voice turns bypass Hermes, so its learning loop otherwise never sees them.
+
 - Add a local knowledge index for fast recall (`HERMES_LIVE_KNOWLEDGE_INDEX`, default on). It is an SQLite FTS5 file (node:sqlite, Node ≥ 22.5; off automatically elsewhere), created owner-only next to the task state, covering finished tasks, Hermes session titles and previews, the skills catalog, and memory entries. `search_past_chats` answers from strong local matches in about a millisecond and falls back to the full Hermes recall turn on a miss or with `deep: true`. `HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT` (default off) adds strong matches as bounded reference context to each Riva brain turn.
 - Add `suggest_work`, deterministic suggestions from the owner's own history: delegated work an agent reports done, stalled runs, recent failures nobody followed up, unread results, and requests repeated on several days. Suggestions are offers only.
 - Hold a delegated task's explicitly declared resources against conflicting admission; the implicit shared `workspace:default` key never blocks.
