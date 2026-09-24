@@ -5,7 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { createServer } from "node:http";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AppConfig } from "../src/config.js";
+import { makeSessionKey, type AppConfig } from "../src/config.js";
 import type { Logger } from "../src/logger.js";
 import type { ApprovalChoice } from "../src/domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../src/domain/protocol/server-protocol.js";
@@ -548,6 +548,46 @@ describe("live gateway WebSocket", () => {
     await waitUntil(() => provider.latest.notifications.items.some((notice) => notice.announcement?.includes("Now watching")), 5_000);
     expect(attempts).toBeGreaterThanOrEqual(2);
     await waitUntil(async () => (await watchStore.load(watchId))?.lastAnnouncedKey === `${watchId}:registered`, 2_000);
+    await monitor.close();
+  }, 10_000);
+
+  it("catches a reconnecting session up on an unspoken external state, once", async () => {
+    const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
+    const watchStore = new FileAgentWatchStore({ directory: dirname(config.tasks.stateFile) });
+    let status: "working" | "done" = "working";
+    const agents: ExternalAgentPort = {
+      async listAgents() {
+        return [{
+          host: "exodia", harness: "herdr", agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+          paneId: "w4:p1", status, revision: 23, stateChangeSeq: status === "done" ? 361 : 360, cwd: "/repositories/diamond",
+        }];
+      },
+      async readRecentOutput() { return "All checks passed."; },
+    };
+    const monitor = new ExternalAgentMonitor({ store: watchStore, agents, pollIntervalMs: 40 });
+    await monitor.initialize();
+    const owner = makeSessionKey(config.server.sessionPrefix, config.server.defaultProfileId, config.server.defaultUserLabel);
+    const watch = await monitor.registerWatch({
+      ownerIdentity: owner, host: "exodia", harness: "herdr",
+      agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2", paneId: "w4:p1",
+      objective: "Fix the diamond indicator.", acceptanceCriteria: ["Plot renders"],
+    });
+    // The agent finishes while no voice session is connected.
+    status = "done";
+    await waitUntil(async () => (await watchStore.load(watch.watchId))?.lastObserved?.state === "done", 3_000);
+
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes: new HermesHarness(), provider, externalMonitor: monitor });
+    await readyClient(server.url);
+    await waitUntil(() => provider.latest.notifications.items.some((notice) => notice.announcement?.includes("reports done")), 3_000);
+
+    // Recorded as heard: a later session does not repeat it.
+    await waitUntil(async () => (await watchStore.load(watch.watchId))?.recentAnnouncedKeys?.some((key) => key.includes(":state:done:")) === true);
+    const firstSession = provider.latest;
+    await readyClient(server.url);
+    await waitUntil(() => provider.latest !== firstSession);
+    await delay(300);
+    expect(provider.latest.notificationCalls.some((notice) => notice.announcement?.includes("reports done"))).toBe(false);
     await monitor.close();
   }, 10_000);
 

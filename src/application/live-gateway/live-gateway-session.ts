@@ -54,7 +54,7 @@ import {
   externalCheckInMessage,
   type ExternalAnnouncement,
 } from "../external-work/external-announcement-policy.js";
-import { hashWatchOwnerId } from "../../domain/external-work/index.js";
+import { hasWatchAnnounced, hashWatchOwnerId } from "../../domain/external-work/index.js";
 import {
   nextTaskProgressAnnouncement,
   startTaskProgressTracking,
@@ -659,6 +659,7 @@ export class LiveGatewaySession {
         this.sessionStartedAt = Date.now();
         this.externalSubscription = this.deps.externalMonitor.subscribe((event) => this.handleExternalMonitorEvent(event));
         this.armExternalCheckIn();
+        void this.catchUpExternalAnnouncements();
       }
       const initialTaskSequences = new Map(initialTasks.map((record) => [record.taskId, record.sequence]));
       for (const record of unreadTasks) {
@@ -2946,6 +2947,30 @@ export class LiveGatewaySession {
       this.pendingExternalAnnouncements.splice(0, this.pendingExternalAnnouncements.length - 10);
     }
     this.scheduleNotificationFlush();
+  }
+
+  /**
+   * Reconnect catch-up: announcements are transient events, so a state change
+   * that happened while no voice session was connected was never spoken.
+   * Offer each watched agent's current state once if that exact update is
+   * unspoken — a digest of where things stand, not a replay of history.
+   */
+  private async catchUpExternalAnnouncements(): Promise<void> {
+    const monitor = this.deps.externalMonitor;
+    if (!monitor || !this.sessionKey) return;
+    try {
+      const watches = await monitor.listWatches(this.sessionKey);
+      for (const watch of watches) {
+        if (watch.status !== "watching" || !watch.lastObserved) continue;
+        const announcement = externalAnnouncementFor({ kind: "state-change", watch, previousState: undefined });
+        if (!announcement || hasWatchAnnounced(watch, announcement.key)) continue;
+        if (this.pendingExternalAnnouncements.some((pending) => sameExternalCategory(pending, announcement))) continue;
+        this.pendingExternalAnnouncements.push(announcement);
+      }
+      if (this.pendingExternalAnnouncements.length > 0) this.scheduleNotificationFlush();
+    } catch (error) {
+      this.deps.logger.debug("external announcement catch-up skipped", { sessionId: this.id, error: errorToMessage(error) });
+    }
   }
 
   /** Two-minute quiet-period check-in while tracked work stays active. */
