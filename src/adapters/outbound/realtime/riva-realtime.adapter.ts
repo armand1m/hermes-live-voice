@@ -337,11 +337,15 @@ class RivaRealtimeSession implements LiveModelSession {
       { role: "system", content: this.params.systemInstruction },
       ...history,
     ];
-    // Reference context for this turn only, placed just before the user's
-    // utterance so the cached prefix (system prompt + earlier history) stays
-    // intact and history never accumulates retrieved text.
-    if (turnContext && messages.at(-1)?.role === "user") {
-      messages.splice(messages.length - 1, 0, { role: "system", content: turnContext });
+    // Reference context for this turn only, prefixed to the user's utterance
+    // in this request: the cached prefix (system prompt + earlier history)
+    // stays intact and history never accumulates retrieved text. It cannot be
+    // a second system message — Qwen-style chat templates reject any system
+    // message after the first (HTTP 400 "System message must be at the
+    // beginning").
+    const last = messages.at(-1);
+    if (turnContext && last?.role === "user") {
+      messages[messages.length - 1] = { ...last, content: `${turnContext}\n\n${last.content}` };
     }
     const tools = selectCompactOpenAIHermesLiveTools(this.params.availableTools).map((tool) => ({
       type: "function" as const,

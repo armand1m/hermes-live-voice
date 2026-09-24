@@ -695,7 +695,7 @@ describe("Riva streamed brain", () => {
 });
 
 describe("Riva per-turn knowledge context", () => {
-  it("adds retrieved context just before the user's turn without persisting it", async () => {
+  it("prefixes retrieved context to the user's turn without persisting it", async () => {
     const requests: Array<{ messages: Array<{ role: string; content: string }> }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (String(input).endsWith("_sessions")) return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
@@ -717,8 +717,9 @@ describe("Riva per-turn knowledge context", () => {
     });
     await session.sendText("what fixed the deploy test");
     await vi.waitFor(() => expect(requests).toHaveLength(1));
-    expect(requests[0]!.messages.map((message) => message.role)).toEqual(["system", "system", "user"]);
-    expect(requests[0]!.messages[1]!.content).toContain("KNOWLEDGE");
+    // Never a second system message: Qwen templates reject it with HTTP 400.
+    expect(requests[0]!.messages.map((message) => message.role)).toEqual(["system", "user"]);
+    expect(requests[0]!.messages[1]!.content).toMatch(/^\[HERMES_LIVE_KNOWLEDGE_V1\][\s\S]*\n\nwhat fixed the deploy test$/);
     await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
 
     await session.sendText("thanks");
