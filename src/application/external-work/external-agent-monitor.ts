@@ -2,6 +2,7 @@ import {
   createAgentWatchRecord,
   hashWatchOwnerId,
   markWatchMismatched,
+  noteWatchAnnounced,
   recordWatchHostFailure,
   recordWatchObservation,
   stopWatch,
@@ -204,6 +205,19 @@ export class ExternalAgentMonitor {
     } finally {
       state.inFlight = false;
     }
+  }
+
+  /**
+   * Single-speak claim for announcements derived from a watch: the first
+   * caller for a given key wins durably, so two open voice sessions cannot
+   * both say the same update (plan §D).
+   */
+  async claimAnnouncement(watchId: string, key: string): Promise<boolean> {
+    const current = await this.store.load(watchId);
+    if (!current || current.status === "stopped") return false;
+    if (current.lastAnnouncedKey === key) return false;
+    await this.updateWatch(current, (watch) => noteWatchAnnounced(watch, key, this.now()));
+    return true;
   }
 
   private hostState(host: DelegationHost): HostState {

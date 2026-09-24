@@ -352,7 +352,7 @@ describe("live gateway WebSocket", () => {
   });
 
   it("watches an external agent through the voice tools and delegates the linked task", async () => {
-    const config = testConfig();
+    const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
     const hermes = new HermesHarness();
     const provider = new RecordingLiveAdapter();
     // A real monitor over a real watch store, but a fake agent transport:
@@ -382,6 +382,7 @@ describe("live gateway WebSocket", () => {
       type: "tool_call",
       call: { id: "discover_agents", name: "list_external_agents", args: { host: "exodia" } },
     });
+    provider.emit({ type: "response", status: "started", responseId: "turn_discover" });
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "discover_agents")).resolves
       .toMatchObject({
         response: {
@@ -396,7 +397,9 @@ describe("live gateway WebSocket", () => {
       type: "tool_call",
       call: backgroundTaskCall("delegate_diamond", "Fix the diamond indicator"),
     });
+    provider.emit({ type: "response", status: "started", responseId: "turn_delegate" });
     const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === "delegate_diamond");
+    provider.emit({ type: "response", status: "completed", responseId: "turn_delegate" });
     const taskId = String(receipt.response.task_id);
     await waitForStoredTask(config.tasks.stateFile, taskId, "running");
 
@@ -415,6 +418,7 @@ describe("live gateway WebSocket", () => {
         },
       },
     });
+    provider.emit({ type: "response", status: "started", responseId: "turn_watch" });
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "watch_diamond")).resolves
       .toMatchObject({
         response: {
@@ -425,6 +429,7 @@ describe("live gateway WebSocket", () => {
           spoken_response: expect.stringContaining("watching it and the task is delegated"),
         },
       });
+    provider.emit({ type: "response", status: "completed", responseId: "turn_watch" });
     await waitForStoredTask(config.tasks.stateFile, taskId, "delegated");
 
     // The spoken inbox distinguishes delegated work from running work.
@@ -432,8 +437,10 @@ describe("live gateway WebSocket", () => {
       type: "tool_call",
       call: { id: "inbox_delegated", name: "list_background_tasks", args: { summary_only: true } },
     });
+    provider.emit({ type: "response", status: "started", responseId: "turn_inbox" });
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "inbox_delegated")).resolves
       .toMatchObject({ response: { spoken_response: "Your tasks: 1 delegated to external agents." } });
+    provider.emit({ type: "response", status: "completed", responseId: "turn_inbox" });
 
     // Watch summaries report states honestly; a refusal is honest too.
     provider.emit({
@@ -451,6 +458,8 @@ describe("live gateway WebSocket", () => {
     });
     await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "watch_wrong_session")).resolves
       .toMatchObject({ response: { ok: false, error: expect.stringContaining("Refusing to attach to different work") } });
+    provider.emit({ type: "response", status: "started", responseId: "turn_refused" });
+    provider.emit({ type: "response", status: "completed", responseId: "turn_refused" });
 
     // Monitor observations land on the linked task's retained progress log.
     fakeAgents.snapshots = [{
@@ -462,6 +471,27 @@ describe("live gateway WebSocket", () => {
     ) === true);
     const stored = storedTask(config.tasks.stateFile, taskId);
     expect(stored?.lastMeaningfulProgressAt).toBeDefined();
+
+    // Progress policy (plan §D): launch and state changes are spoken through
+    // the exact task-notification channel, each exactly once, honestly.
+    // A real provider emits a scoped response around spoken notifications;
+    // the recording adapter does not, so pump them to release the latch.
+    const spoken = provider.latest.notifications.items;
+    let noticeIndex = 0;
+    for (let round = 0; round < 40; round += 1) {
+      if (spoken.some((notice) => notice.announcement?.includes("went idle"))) break;
+      await delay(30);
+      while (noticeIndex < spoken.length) {
+        const responseId = `ext_notice_${noticeIndex}`;
+        provider.emit({ type: "response", status: "started", responseId, scope: "task_notification" });
+        provider.emit({ type: "response", status: "completed", responseId, scope: "task_notification" });
+        noticeIndex += 1;
+      }
+    }
+    expect(spoken.some((notice) => notice.announcement?.includes("Now watching"))).toBe(true);
+    expect(spoken.some((notice) => notice.announcement?.includes("is working"))).toBe(true);
+    expect(spoken.filter((notice) => notice.announcement?.includes("went idle"))).toHaveLength(1);
+    expect(spoken.some((notice) => notice.announcement?.includes("percent"))).toBe(false);
     await monitor.close();
   }, 15_000);
 
@@ -3158,6 +3188,7 @@ function testConfig(overrides: {
   tts?: Partial<AppConfig["tts"]>;
   narrator?: Partial<AppConfig["narrator"]>;
   context?: Partial<AppConfig["context"]>;
+  externalWork?: Partial<NonNullable<AppConfig["externalWork"]>>;
 } = {}): AppConfig {
   const stateFile = createTaskStateFile();
   return {
@@ -3246,6 +3277,13 @@ function testConfig(overrides: {
       recallSessionTitle: "Hermes Live Voice Recall",
       recallTimeoutMs: 30_000,
       ...overrides.context,
+    },
+    externalWork: {
+      enabled: false,
+      progressAnnouncements: false,
+      herdrExecutable: "herdr",
+      msshExecutable: "mssh",
+      ...overrides.externalWork,
     },
   } as AppConfig;
 }

@@ -47,7 +47,13 @@ import { prepareSpokenContent } from "../../domain/speech/spoken-content.js";
 import { SpeechMux } from "./speech-mux.js";
 import type { SpeechSink } from "./ports/speech-sink.port.js";
 import type { VoiceArbiter } from "./voice-arbiter.js";
-import type { ExternalAgentMonitor } from "../external-work/external-agent-monitor.js";
+import type { ExternalAgentMonitor, ExternalMonitorEvent } from "../external-work/external-agent-monitor.js";
+import {
+  EXTERNAL_CHECK_IN_MS,
+  externalAnnouncementFor,
+  externalCheckInMessage,
+  type ExternalAnnouncement,
+} from "../external-work/external-announcement-policy.js";
 import type { AgentWatchRecord } from "../../domain/external-work/index.js";
 import type { DelegationHost } from "../../domain/tasks/delegation.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
@@ -206,6 +212,12 @@ export class LiveGatewaySession {
   private unsubscribeTasks?: () => void;
   private readonly pendingTaskRecords = new Map<string, TaskRecord>();
   private readonly pendingNotifications = new Map<string, TaskRecord>();
+  /** External-work announcements (plan §D) riding the same speech flush. */
+  private pendingExternalAnnouncements: ExternalAnnouncement[] = [];
+  private externalSubscription?: () => void;
+  private externalCheckInTimer?: ReturnType<typeof setTimeout>;
+  private lastExternalAnnouncementAt?: number;
+  private sessionStartedAt = Date.now();
   private readonly claimedNotifications = new Map<string, TaskRecord>();
   private readonly notificationDeliveryAttempts = new Map<string, number>();
   private notificationFlushRunning = false;
@@ -615,6 +627,14 @@ export class LiveGatewaySession {
       }
       this.readySent = true;
       this.armAnnouncementDeadlineWatch();
+      // External-work progress policy (plan §D): announcements are template
+      // speech through the exact task-notification channel, claimed durably
+      // per watch so only one voice session says each update.
+      if (this.deps.externalMonitor && this.deps.config.externalWork?.progressAnnouncements === true) {
+        this.sessionStartedAt = Date.now();
+        this.externalSubscription = this.deps.externalMonitor.subscribe((event) => this.handleExternalMonitorEvent(event));
+        this.armExternalCheckIn();
+      }
       const initialTaskSequences = new Map(initialTasks.map((record) => [record.taskId, record.sequence]));
       for (const record of unreadTasks) {
         const notification = projectTaskNotification(record);
@@ -2434,7 +2454,7 @@ export class LiveGatewaySession {
       this.providerTurnResponseExpected ||
       this.userSpeaking ||
       this.notificationRetryTimer !== undefined ||
-      (this.pendingNotifications.size === 0 && !this.hasReadyDeferredAnswers())
+      (this.pendingNotifications.size === 0 && !this.hasReadyDeferredAnswers() && this.pendingExternalAnnouncements.length === 0)
     ) {
       return;
     }
@@ -2456,13 +2476,24 @@ export class LiveGatewaySession {
       return;
     }
     const candidates = [...this.pendingNotifications.values()];
-    if (candidates.length === 0 && !this.hasReadyDeferredAnswers()) return;
+    if (candidates.length === 0 && !this.hasReadyDeferredAnswers() && this.pendingExternalAnnouncements.length === 0) return;
     this.notificationFlushRunning = true;
     // Deferred answers outrank task notifications: the user asked for them
     // and is waiting. One speech response per flush; the loser re-schedules.
     if (this.hasReadyDeferredAnswers()) {
       try {
         if (await this.deliverNextDeferredAnswer(force)) return;
+      } finally {
+        this.notificationFlushRunning = false;
+      }
+    }
+    // External-work announcements come next: they are timely state changes,
+    // while task terminal notices are durable and never lose eligibility.
+    // Same speech channel, same playback confirmation, same single-flight
+    // latch — never a second speaker (plan §D).
+    if (this.pendingExternalAnnouncements.length > 0) {
+      try {
+        if (await this.deliverExternalAnnouncements()) return;
       } finally {
         this.notificationFlushRunning = false;
       }
@@ -2593,6 +2624,123 @@ export class LiveGatewaySession {
       if (this.activeNotificationId) this.playbackDelivery.cancel(this.activeNotificationId);
       this.activeNotificationId = undefined;
       this.notificationFlushRunning = false;
+    }
+  }
+
+  /**
+   * Speak coalesced external-work announcements through the exact task
+   * notification channel: provider handoff, v11 playback confirmation, and
+   * durable single-speak claims on the watch (plan §D).
+   */
+  private async deliverExternalAnnouncements(): Promise<boolean> {
+    const monitor = this.deps.externalMonitor;
+    if (!monitor || !this.liveSession?.sendTaskNotification || this.pendingExternalAnnouncements.length === 0) {
+      return false;
+    }
+    const batch = this.pendingExternalAnnouncements.splice(0, 5);
+    const claimed: ExternalAnnouncement[] = [];
+    for (const item of batch) {
+      try {
+        if (await monitor.claimAnnouncement(item.watchId, item.key)) claimed.push(item);
+      } catch (error) {
+        // Unclaimable right now (store hiccup, watch stopped): requeue once.
+        this.pendingExternalAnnouncements.push(item);
+        this.deps.logger.warn("failed to claim external announcement", {
+          sessionId: this.id,
+          watchId: item.watchId,
+          error: errorToMessage(error),
+        });
+      }
+    }
+    if (claimed.length === 0) return false;
+    const message = claimed.map((item) => item.message).join(" ").slice(0, 500);
+    try {
+      this.notificationResponsePending = true;
+      const announcement = prepareSpokenContent(message);
+      const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
+      this.activeNotificationId = notificationId;
+      const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
+      playback?.catch(() => undefined);
+      const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
+      await withAbortAndDeadline(
+        this.liveSession.sendTaskNotification({ context, announcement, notificationId }),
+        this.abort.signal,
+        120_000,
+        "Realtime provider task notification did not settle before the safety deadline.",
+      );
+      if (playback) await playback;
+      this.lastExternalAnnouncementAt = Date.now();
+    } catch (error) {
+      this.notificationResponsePending = false;
+      if (!this.closing) {
+        this.deps.logger.warn("external announcement speech delivery failed", {
+          sessionId: this.id,
+          error: errorToMessage(error),
+        });
+      }
+    } finally {
+      if (this.activeNotificationId) this.playbackDelivery.cancel(this.activeNotificationId);
+      this.activeNotificationId = undefined;
+      this.armExternalCheckIn();
+      if (this.notificationResponsePending) this.armNotificationResponseWatchdog();
+      this.notificationFlushRunning = false;
+    }
+    return true;
+  }
+
+  /** Queue one external monitor event as (at most) one announcement. */
+  private handleExternalMonitorEvent(event: ExternalMonitorEvent): void {
+    if (this.closing || this.voiceDemoted) return;
+    const announcement = externalAnnouncementFor(event);
+    if (!announcement) {
+      this.armExternalCheckIn();
+      return;
+    }
+    // Superseded messages never pile up: a newer key for the same watch and
+    // category replaces an unspoken older one.
+    this.pendingExternalAnnouncements = this.pendingExternalAnnouncements.filter((pending) => {
+      const sameCategory = pending.watchId === announcement.watchId
+        && pending.key.split(":")[1] === announcement.key.split(":")[1];
+      return !sameCategory;
+    });
+    this.pendingExternalAnnouncements.push(announcement);
+    if (this.pendingExternalAnnouncements.length > 10) {
+      this.pendingExternalAnnouncements.splice(0, this.pendingExternalAnnouncements.length - 10);
+    }
+    this.scheduleNotificationFlush();
+  }
+
+  /** Two-minute quiet-period check-in while tracked work stays active. */
+  private armExternalCheckIn(): void {
+    if (this.externalCheckInTimer) clearTimeout(this.externalCheckInTimer);
+    this.externalCheckInTimer = undefined;
+    const monitor = this.deps.externalMonitor;
+    if (!monitor || this.closing || this.deps.config.externalWork?.progressAnnouncements !== true) return;
+    this.externalCheckInTimer = setTimeout(() => {
+      this.externalCheckInTimer = undefined;
+      void this.evaluateExternalCheckIn();
+    }, EXTERNAL_CHECK_IN_MS);
+    this.externalCheckInTimer.unref?.();
+  }
+
+  private async evaluateExternalCheckIn(): Promise<void> {
+    if (this.closing || this.voiceDemoted) return;
+    const monitor = this.deps.externalMonitor;
+    if (!monitor) return;
+    const quietMs = Date.now() - (this.lastExternalAnnouncementAt ?? this.sessionStartedAt ?? Date.now());
+    if (quietMs < EXTERNAL_CHECK_IN_MS) {
+      this.armExternalCheckIn();
+      return;
+    }
+    try {
+      const watches = await monitor.listWatches(this.sessionKey!);
+      const checkIn = externalCheckInMessage(watches, quietMs);
+      if (checkIn) {
+        this.pendingExternalAnnouncements.push(checkIn);
+        this.scheduleNotificationFlush();
+      }
+    } catch {
+      this.armExternalCheckIn();
     }
   }
 
@@ -2729,6 +2877,13 @@ export class LiveGatewaySession {
 
   private async performClose(): Promise<void> {
     this.playbackDelivery.close();
+    this.externalSubscription?.();
+    this.externalSubscription = undefined;
+    if (this.externalCheckInTimer) {
+      clearTimeout(this.externalCheckInTimer);
+      this.externalCheckInTimer = undefined;
+    }
+    this.pendingExternalAnnouncements = [];
     this.stopFiller();
     this.flushLayaShadowOutcome();
     if (this.deferredAnswerEscalationTimer !== undefined) {
