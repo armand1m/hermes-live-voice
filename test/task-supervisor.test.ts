@@ -278,6 +278,51 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("holds a delegated task's explicit resources but never the shared default key", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    // Declared resource keys are honored only when the operator trusts them.
+    const supervisor = new TaskSupervisor({ store, hermes, maxConcurrent: 1, trustDeclaredReadOnly: true });
+    await supervisor.initialize();
+    const ownerId = supervisor.registerOwner("alice", "session-a");
+    const submit = (input: string, resourceKeys?: string[]) => supervisor.submit({
+      ownerIdentity: "alice", sessionKey: "session-a", input, ...(resourceKeys ? { resourceKeys } : {}),
+    });
+
+    const scoped = await submit("Delegate the diamond fix", ["repo:diamond"]);
+    await waitFor(async () => (await store.load(scoped.taskId))?.status === "running");
+    const scopedRun = (await store.load(scoped.taskId))!.runId!;
+    await supervisor.markDelegated(ownerId, scoped.taskId, "herdr agent launched.");
+    hermes.pushEvent(scopedRun, { event: "run.completed", run_id: scopedRun, output: "launched" });
+    hermes.setSnapshot(scopedRun, { object: "hermes.run", run_id: scopedRun, status: "completed", output: "launched", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+
+    // Regression: with no other Hermes run active, a task on the same repo
+    // used to be admitted while the external agent still worked on it.
+    const sameRepo = await submit("Mutate the same repo", ["repo:diamond"]);
+    await delay(80);
+    expect((await store.load(sameRepo.taskId))?.status).toBe("queued");
+    await supervisor.stop(ownerId, sameRepo.taskId);
+
+    // Unscoped work shares only the implicit default key and still runs.
+    const unscoped = await submit("Summarize the release notes");
+    await waitFor(async () => (await store.load(unscoped.taskId))?.status === "running");
+    const unscopedRun = (await store.load(unscoped.taskId))!.runId!;
+    hermes.pushEvent(unscopedRun, { event: "run.completed", run_id: unscopedRun, output: "ok" });
+    hermes.setSnapshot(unscopedRun, { object: "hermes.run", run_id: unscopedRun, status: "completed", output: "ok", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    await waitFor(async () => (await store.load(unscoped.taskId))?.status === "completed");
+
+    // A delegated task on the default key blocks nothing either.
+    const unscopedDelegated = await submit("Delegate unscoped work");
+    await waitFor(async () => (await store.load(unscopedDelegated.taskId))?.status === "running");
+    const delegatedRun = (await store.load(unscopedDelegated.taskId))!.runId!;
+    await supervisor.markDelegated(ownerId, unscopedDelegated.taskId, "herdr agent launched.");
+    hermes.pushEvent(delegatedRun, { event: "run.completed", run_id: delegatedRun, output: "launched" });
+    hermes.setSnapshot(delegatedRun, { object: "hermes.run", run_id: delegatedRun, status: "completed", output: "launched", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    const later = await submit("Another unscoped task");
+    await waitFor(async () => (await store.load(later.taskId))?.status === "running");
+    await supervisor.close();
+  });
+
   it("resolves a delegated task only on explicit owner confirmation", async () => {
     const store = new MemoryTaskStore();
     const hermes = new HermesHarness();

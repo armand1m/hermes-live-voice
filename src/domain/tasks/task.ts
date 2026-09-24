@@ -309,6 +309,9 @@ export interface CreateTaskRecordInput {
   originConversationId?: string;
 }
 
+/** Implicit key for tasks that name no resources: shared by every such task. */
+export const DEFAULT_TASK_RESOURCE_KEY = "workspace:default";
+
 export function createTaskId(): string {
   return `task_${randomUUID().replaceAll("-", "")}`;
 }
@@ -332,7 +335,7 @@ export function createTaskRecord(input: CreateTaskRecordInput): TaskRecord {
   const now = parseTaskTimestamp(input.now ?? Date.now(), "Task creation timestamp");
   const taskInput = TaskInputSchema.parse(input.input);
   const title = sanitizeTaskTitle(input.title ?? deriveTaskTitle(taskInput));
-  const resourceKeys = normalizeResourceKeys(input.resourceKeys ?? ["workspace:default"]);
+  const resourceKeys = normalizeResourceKeys(input.resourceKeys ?? [DEFAULT_TASK_RESOURCE_KEY]);
   const event: TaskEvent = {
     sequence: 1,
     type: "queued",

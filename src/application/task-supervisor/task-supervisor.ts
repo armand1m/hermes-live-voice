@@ -12,6 +12,7 @@ import type {
 } from "../live-gateway/ports/hermes-runs.port.js";
 import type { TaskStorePort } from "./ports/task-store.port.js";
 import {
+  DEFAULT_TASK_RESOURCE_KEY,
   MAX_TASK_OUTPUT_CHARS,
   MAX_TASK_INPUT_CHARS,
   TaskIdSchema,
@@ -1590,6 +1591,15 @@ function canAdmit(
   if (resourceHolders.length === 0) return true;
   const candidateRoot = candidate.rootTaskId ?? candidate.taskId;
   if (resourceHolders.some((record) => (record.rootTaskId ?? record.taskId) === candidateRoot)) return false;
+  // A delegated task no longer occupies a Hermes slot, but the external agent
+  // is still changing what it was given: its explicitly named resources
+  // (repo:x, host:y) stay reserved. The implicit shared default key never
+  // blocks — every unscoped task carries it, so honoring it would stall all
+  // work behind one open delegation.
+  if (resourceHolders.some((record) =>
+    record.status === "delegated" && sharesExplicitResource(candidate.resourceKeys, record.resourceKeys))) {
+    return false;
+  }
   if (activeCount === 0) return true;
   // The policy flag also governs records created by an older release or a
   // previous configuration. Otherwise upgrading with the safer default could
@@ -1776,6 +1786,11 @@ function structuredHermesErrorCode(error: unknown): string | undefined {
     if (typeof value === "string" && /^[a-z][a-z0-9_.-]{0,127}$/u.test(value)) return value;
   }
   return undefined;
+}
+
+function sharesExplicitResource(left: readonly string[], right: readonly string[]): boolean {
+  const rightKeys = new Set(right.filter((key) => key !== DEFAULT_TASK_RESOURCE_KEY));
+  return left.some((key) => rightKeys.has(key));
 }
 
 function resourcesAreDisjoint(left: readonly string[], right: readonly string[]): boolean {
