@@ -3,7 +3,9 @@
 Status: active plan. Source investigation: [`NEXTIMPROVEMENTS.md`](../../NEXTIMPROVEMENTS.md) (September 23–24, 2026).
 Integration baseline: commit `82f6303` (Riva migration + protocol v11 WIP, tests repaired, suite green: 992 passed / 1 skipped, typecheck clean).
 
-**Stage 1 (immediate correctness) is complete** — commits `2cfc3b8` (rolling retention + freshness), `7a6f028` (queue placement + stall review), `2168df5` (narration circuit breaker), `c7ca14d` (universal spoken-content preparation), `9ae639f` (SSE reconnect), `72e53d3` (Riva tool-history integrity + repo-check repairs). Suite: 1020 passed / 1 skipped, 5 e2e, typecheck and all repo checks green. Stage 2 (durable herdr supervision, delegation handoff, notification outbox) and Stage 3 (measured ASR/TTS improvements) are next.
+**Stage 1 (immediate correctness) is complete** — commits `2cfc3b8` (rolling retention + freshness), `7a6f028` (queue placement + stall review), `2168df5` (narration circuit breaker), `c7ca14d` (universal spoken-content preparation), `9ae639f` (SSE reconnect), `72e53d3` (Riva tool-history integrity + repo-check repairs). Suite: 1020 passed / 1 skipped, 5 e2e, typecheck and all repo checks green.
+
+**Stage 2 (durable supervision) is complete** — commits `c90d6f9` (contracts: watch registry, delegated phase, agent ports), `7c7c7f6` (herdr adapter over local + mssh), `3b5f135` (durable external-agent monitor), `8502c47` (gateway wiring: voice tools, task linkage), `e83b63d` (progress policy announcements + check-ins), `b2e4f66` (idempotent delegation launch bridge + `hermes_delegate_work` plugin tool). Suite: 1051 passed / 1 skipped, typecheck, build, and all repo checks green. Everything is behind `HERMES_LIVE_EXTERNAL_WORK_ENABLED` (+ `HERMES_LIVE_PROGRESS_ANNOUNCEMENTS` for speech) and **not yet deployed or exercised against the live hosts** — a local canary with a real herdr agent is the next step before enabling it on exodia. Stage 3 (measured ASR/TTS improvements: word boosting, endpointing experiments, optional sentence buffering) remains.
 
 ## Problem
 

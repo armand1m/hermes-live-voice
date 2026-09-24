@@ -8,6 +8,7 @@ The plugin provides:
 - An authenticated same-origin WebSocket relay.
 - A saved-conversation picker.
 - The `hermes_live_status` tool.
+- The `hermes_delegate_work` tool: launches (or reconciles) a herdr agent on exodia or mac-mini through the gateway's delegation bridge. Idempotent by `idempotency_key`; the gateway verifies the launch, registers monitoring, and returns the receipt.
 - The `/hermes-live` and `/hermes-live ready` commands.
 
 The plugin does not run provider WebSockets, audio pipelines, or background-task supervision inside Hermes.
