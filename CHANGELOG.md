@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Speak progress on running Hermes tasks (with `HERMES_LIVE_PROGRESS_ANNOUNCEMENTS` on). A task the session saw queued is announced when it starts; a long run reports its latest recorded step at most every four minutes; a run with no new activity is called out once. Template-only, lowest priority behind answers, external updates, and terminal notices.
+- Add `resolve_delegated_task`, so the owner can close a delegated task as completed or failed by voice after checking the external agent's work. Monitoring still never closes delegated work on its own. The confirmed outcome counts as already heard, so it is not re-announced. A linked agent's "reports done" announcement now says how to close the task.
+- Catch a reconnecting voice session up on watched-agent states that changed while no session was connected, once per unspoken update.
+- Break down the console's task status line by state ("2 running · 1 queued · 1 delegated · 1 needs review") instead of "Running · N".
+
 - Speak streamed Riva answers sentence by sentence. With `HERMES_LIVE_RIVA_BRAIN_STREAMING` on, the brain call streams over SSE and each finished sentence is synthesized while generation continues. Every sentence is still emitted only after complete synthesis, so there are no mid-word underruns. Reasoning blocks are stripped across chunk boundaries, and streamed tool calls are assembled into the usual shape. Measured first audio on a four-sentence answer dropped from 6.9 s to 2.9 s. `HERMES_LIVE_RIVA_BRAIN_PREWARM` (default on) prefills each session's prompt into the SGLang prefix cache; `HERMES_LIVE_RIVA_BRAIN_THINKING=false` disables the reasoning phase.
 - Measure per-stage turn latency. Each voice or typed turn logs a `turn latency` line: endpoint, ASR, brain, TTS, response, and total, where applicable. `GET /v1/metrics` reports p50/p95 per stage under `turnLatency`.
 - Send the configured ASR word boost to Riva. `HERMES_LIVE_RIVA_ASR_WORD_BOOST` was parsed but never reached the NIM. The new `HERMES_LIVE_RIVA_ASR_WORD_BOOST_SCORE` (default 30) sets the weight, and both keys are allow-listed in managed config.
