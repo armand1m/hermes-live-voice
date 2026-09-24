@@ -26,7 +26,7 @@ function agentFixture(overrides: Record<string, unknown> = {}) {
 
 function adapterWith(runner: CommandRunner) {
   return new HerdrExternalAgentAdapter({
-    herdrExecutable: "herdr",
+    herdrExecutable: "/home/armand1m/.local/bin/herdr",
     msshExecutable: "mssh",
     localHost: "exodia",
     remoteHost: "mac-mini",
@@ -53,7 +53,8 @@ describe("HerdrExternalAgentAdapter", () => {
       },
     });
     const agents = await adapter.listAgents("exodia");
-    expect(commands).toEqual([["herdr", "agent", "list"]]);
+    // The local host keeps the absolute executable path.
+    expect(commands).toEqual([["/home/armand1m/.local/bin/herdr", "agent", "list"]]);
     // Uppercase hex pane ids are valid herdr identities; only pattern
     // violations and missing session identities drop out.
     expect(agents).toHaveLength(3);
@@ -91,6 +92,26 @@ describe("HerdrExternalAgentAdapter", () => {
     await expect(adapter.listAgents("laptop" as never)).rejects.toThrow(/No transport/);
   });
 
+  it("ships only the bare herdr name to the remote host, never the local absolute path", async () => {
+    const commands: string[][] = [];
+    const adapter = adapterWith({
+      async run(command) {
+        commands.push([...command]);
+        return { stdout: JSON.stringify({ id: "cli:agent:list", result: { agents: [agentFixture()] } }), stderr: "" };
+      },
+    });
+    await adapter.listAgents("exodia");
+    await adapter.listAgents("mac-mini");
+    // Regression (2026-09-24): the exodia absolute path embedded in the
+    // mssh command string does not exist on the mac-mini — remote zsh died
+    // with "no such file or directory". The remote transport must send the
+    // bare executable name and let the mssh PATH bootstrap resolve it.
+    expect(commands[0]).toEqual(["/home/armand1m/.local/bin/herdr", "agent", "list"]);
+    expect(commands[1]).toEqual(["mssh", "herdr agent list"]);
+    // The local absolute path must never leak into the remote command string.
+    expect((commands[1] ?? []).join(" ")).not.toContain("/home/armand1m");
+  });
+
   it("clamps line budgets and surfaces stderr and timeouts as bounded errors", async () => {
     const commands: string[][] = [];
     const adapter = adapterWith({
@@ -104,8 +125,9 @@ describe("HerdrExternalAgentAdapter", () => {
       },
     });
     await adapter.readRecentOutput("exodia", "w4:p1", 5_000);
-    // The 5,000-line request is clamped to the 80-line observation budget.
-    expect(commands[0]).toEqual(["herdr", "agent", "read", "w4:p1", "--lines", "80", "--format", "text"]);
+    // The 5,000-line request is clamped to the 80-line observation budget;
+    // the local host still uses the absolute executable path.
+    expect(commands[0]).toEqual(["/home/armand1m/.local/bin/herdr", "agent", "read", "w4:p1", "--lines", "80", "--format", "text"]);
     await expect(adapter.listAgents("mac-mini")).rejects.toThrow(/ssh: connect to host timed out/);
 
     const timing: CommandRunner = {

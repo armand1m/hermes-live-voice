@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
 import {
   ExternalAgentRuntimeStatusSchema,
   PaneIdSchema,
@@ -165,7 +166,12 @@ export class HerdrExternalAgentAdapter implements ExternalAgentPort {
       // mssh takes one remote command string. Every interpolated value is
       // either a constant flag or pattern-validated (pane id, integer line
       // count), so nothing user-controlled can reach a shell metacharacter.
-      return [this.options.msshExecutable, [this.options.herdrExecutable, ...herdrArgs].join(" ")];
+      // The remote resolves herdr from the mssh PATH bootstrap: the local
+      // absolute executable path does not exist on the remote host, so only
+      // the bare name may be shipped (2026-09-24: "no such file or
+      // directory" on mac-mini when the exodia path was embedded verbatim).
+      const remoteHerdr = basename(this.options.herdrExecutable);
+      return [this.options.msshExecutable, [remoteHerdr, ...herdrArgs].join(" ")];
     }
     throw new HerdrExternalAgentError(`No transport configured for host ${host}.`);
   }
