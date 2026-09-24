@@ -612,6 +612,51 @@ describe("live gateway WebSocket", () => {
       .toMatchObject({ taskId: receipt.response.task_id });
   });
 
+  it("speaks when a queued task starts running (progress announcements)", async () => {
+    const start = deferred<StartRunResult>();
+    const hermes = new HermesHarness();
+    hermes.startBehavior = async () => start.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({
+      config: testConfig({ externalWork: { enabled: false, progressAnnouncements: true } }),
+      hermes,
+      provider,
+    });
+    const client = await readyClient(server.url);
+
+    const taskCall = backgroundTaskCall("progress_1", "Audit the release", { title: "Release audit" });
+    provider.emit({ type: "tool_call", call: taskCall });
+    provider.emit({ type: "response", status: "started", responseId: "turn_progress" });
+    const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === taskCall.id);
+    provider.emit({ type: "response", status: "completed", responseId: "turn_progress" });
+    expect(receipt.response).toMatchObject({ status: "queued" });
+
+    start.resolve({ runId: "run_progress", status: "queued" });
+    await client.messages.wait("task.started", (message) => message.taskId === receipt.response.task_id);
+    await waitUntil(() => provider.latest.notifications.items.some(
+      (notice) => notice.announcement === "Release audit has started.",
+    ), 3_000);
+    // Spoken exactly once.
+    await delay(200);
+    expect(provider.latest.notifications.items.filter((notice) => notice.announcement?.includes("has started"))).toHaveLength(1);
+  });
+
+  it("stays silent about task starts when progress announcements are off", async () => {
+    const start = deferred<StartRunResult>();
+    const hermes = new HermesHarness();
+    hermes.startBehavior = async () => start.promise;
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes, provider });
+    const client = await readyClient(server.url);
+    const taskCall = backgroundTaskCall("progress_off", "Audit the release", { title: "Release audit" });
+    provider.emit({ type: "tool_call", call: taskCall });
+    const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === taskCall.id);
+    start.resolve({ runId: "run_progress_off", status: "queued" });
+    await client.messages.wait("task.started", (message) => message.taskId === receipt.response.task_id);
+    await delay(300);
+    expect(provider.latest.notificationCalls.some((notice) => notice.announcement?.includes("has started"))).toBe(false);
+  });
+
   it("speaks receipts and answers through the tts sidecar without provider speech", async () => {
     // Stub sidecar: streams one PCM frame per request.
     const payload = Buffer.alloc(4_800, 7);

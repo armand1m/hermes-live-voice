@@ -56,6 +56,12 @@ import {
 } from "../external-work/external-announcement-policy.js";
 import { hashWatchOwnerId } from "../../domain/external-work/index.js";
 import {
+  nextTaskProgressAnnouncement,
+  startTaskProgressTracking,
+  type TaskProgressAnnouncement,
+  type TaskProgressTracking,
+} from "./task-progress-policy.js";
+import {
   archiveSweepSpokenSummary,
   externalWatchesSpokenSummary,
   notificationDigest,
@@ -93,6 +99,8 @@ const MAX_PROVIDER_CANCEL_WAIT_MS = 1_000;
 const MAX_PROVIDER_NOTIFICATION_RESPONSE_WAIT_MS = 30_000;
 const MAX_NOTIFICATION_DELIVERY_ATTEMPTS = 3;
 const NOTIFICATION_RETRY_BASE_MS = 250;
+/** Clock for task-progress milestones and quiet-period checks. */
+const TASK_PROGRESS_CHECK_MS = 30_000;
 const MAX_PENDING_CLIENT_MESSAGES = 256;
 const MAX_PENDING_CLIENT_BYTES = 8 * 1024 * 1024;
 const MAX_CLIENT_MESSAGE_ERRORS = 16;
@@ -229,6 +237,10 @@ export class LiveGatewaySession {
   private readonly externalDeliveryAttempts = new Map<string, number>();
   private externalSubscription?: () => void;
   private externalCheckInTimer?: ReturnType<typeof setTimeout>;
+  /** Spoken progress for running Hermes tasks (progress announcements flag). */
+  private readonly taskProgress = new Map<string, { record: TaskRecord; tracking: TaskProgressTracking }>();
+  private pendingProgressAnnouncements: TaskProgressAnnouncement[] = [];
+  private taskProgressTimer?: ReturnType<typeof setInterval>;
   private lastExternalAnnouncementAt?: number;
   private sessionStartedAt = Date.now();
   private readonly claimedNotifications = new Map<string, TaskRecord>();
@@ -2515,7 +2527,85 @@ export class LiveGatewaySession {
       this.pendingNotifications.delete(record.taskId);
       this.notificationDeliveryAttempts.delete(record.taskId);
     }
+    this.trackTaskProgress(record);
     this.scheduleNotificationFlush();
+  }
+
+  private progressAnnouncementsEnabled(): boolean {
+    return this.deps.config.externalWork?.progressAnnouncements === true;
+  }
+
+  /** Follow one task record for spoken progress; terminal tasks drop out. */
+  private trackTaskProgress(record: TaskRecord): void {
+    if (!this.progressAnnouncementsEnabled() || this.closing) return;
+    const active = record.status === "queued" || record.status === "dispatching" || record.status === "running";
+    if (!active) {
+      this.taskProgress.delete(record.taskId);
+      this.pendingProgressAnnouncements = this.pendingProgressAnnouncements
+        .filter((pending) => pending.taskId !== record.taskId);
+      return;
+    }
+    const now = Date.now();
+    const entry = this.taskProgress.get(record.taskId);
+    if (entry) entry.record = structuredClone(record);
+    else this.taskProgress.set(record.taskId, { record: structuredClone(record), tracking: startTaskProgressTracking(record, now) });
+    this.evaluateTaskProgress(record.taskId, now);
+    this.armTaskProgressTimer();
+  }
+
+  private evaluateTaskProgress(taskId: string, now: number): void {
+    const entry = this.taskProgress.get(taskId);
+    if (!entry) return;
+    const announcement = nextTaskProgressAnnouncement(entry.record, entry.tracking, now);
+    if (!announcement) return;
+    // One pending line per task: a newer update supersedes an unspoken one.
+    this.pendingProgressAnnouncements = this.pendingProgressAnnouncements
+      .filter((pending) => pending.taskId !== taskId)
+      .concat(announcement)
+      .slice(-5);
+    this.scheduleNotificationFlush();
+  }
+
+  /** Milestones and quiet periods need a clock, not only record pushes. */
+  private armTaskProgressTimer(): void {
+    if (this.taskProgressTimer !== undefined) return;
+    this.taskProgressTimer = setInterval(() => {
+      if (this.closing) return;
+      if (this.taskProgress.size === 0) {
+        clearInterval(this.taskProgressTimer);
+        this.taskProgressTimer = undefined;
+        return;
+      }
+      const now = Date.now();
+      for (const taskId of this.taskProgress.keys()) this.evaluateTaskProgress(taskId, now);
+    }, TASK_PROGRESS_CHECK_MS);
+    this.taskProgressTimer.unref?.();
+  }
+
+  /**
+   * Speak pending progress lines (lowest priority: after answers, external
+   * updates, and terminal notices). Progress is ephemeral and per session: a
+   * line whose task is no longer running is dropped, never replayed.
+   */
+  private async deliverProgressAnnouncements(): Promise<void> {
+    const batch = this.pendingProgressAnnouncements.splice(0, 3).filter((item) =>
+      this.taskProgress.get(item.taskId)?.record.status === "running");
+    if (batch.length === 0) return;
+    try {
+      await this.speakNotification(batch.map((item) => item.message).join(" "));
+    } catch (error) {
+      this.notificationResponsePending = false;
+      if (!this.closing) {
+        this.deps.logger.warn("task progress speech delivery failed", {
+          sessionId: this.id,
+          error: errorToMessage(error),
+        });
+      }
+    } finally {
+      if (this.activeNotificationId) this.playbackDelivery.cancel(this.activeNotificationId);
+      this.activeNotificationId = undefined;
+      if (this.notificationResponsePending) this.armNotificationResponseWatchdog();
+    }
   }
 
   private scheduleNotificationFlush(): void {
@@ -2529,7 +2619,8 @@ export class LiveGatewaySession {
       this.providerTurnResponseExpected ||
       this.userSpeaking ||
       this.notificationRetryTimer !== undefined ||
-      (this.pendingNotifications.size === 0 && !this.hasReadyDeferredAnswers() && this.pendingExternalAnnouncements.length === 0)
+      (this.pendingNotifications.size === 0 && !this.hasReadyDeferredAnswers()
+        && this.pendingExternalAnnouncements.length === 0 && this.pendingProgressAnnouncements.length === 0)
     ) {
       return;
     }
@@ -2551,7 +2642,10 @@ export class LiveGatewaySession {
       return;
     }
     const candidates = [...this.pendingNotifications.values()];
-    if (candidates.length === 0 && !this.hasReadyDeferredAnswers() && this.pendingExternalAnnouncements.length === 0) return;
+    if (
+      candidates.length === 0 && !this.hasReadyDeferredAnswers()
+      && this.pendingExternalAnnouncements.length === 0 && this.pendingProgressAnnouncements.length === 0
+    ) return;
     this.notificationFlushRunning = true;
     // Deferred answers outrank task notifications: the user asked for them
     // and is waiting. One speech response per flush; the loser re-schedules.
@@ -2573,7 +2667,18 @@ export class LiveGatewaySession {
         this.notificationFlushRunning = false;
       }
     }
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) {
+      // Terminal notices outrank progress; progress speaks only when none wait.
+      if (this.pendingProgressAnnouncements.length > 0) {
+        this.notificationFlushRunning = true;
+        try {
+          await this.deliverProgressAnnouncements();
+        } finally {
+          this.notificationFlushRunning = false;
+        }
+      }
+      return;
+    }
     this.notificationFlushRunning = true;
     const records: TaskRecord[] = [];
     try {
@@ -2989,6 +3094,10 @@ export class LiveGatewaySession {
     this.externalSubscription?.();
     this.externalSubscription = undefined;
     this.deps.externalMonitor?.releaseAnnouncementsFor(this.id);
+    if (this.taskProgressTimer) {
+      clearInterval(this.taskProgressTimer);
+      this.taskProgressTimer = undefined;
+    }
     if (this.externalCheckInTimer) {
       clearTimeout(this.externalCheckInTimer);
       this.externalCheckInTimer = undefined;
