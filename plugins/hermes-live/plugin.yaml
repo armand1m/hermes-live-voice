@@ -33,6 +33,7 @@ optional_env:
     secret: false
 provides_tools:
   - hermes_live_status
+  - hermes_delegate_work
 provides_commands:
   - hermes-live
 entrypoint: __init__.py

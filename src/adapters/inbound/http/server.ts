@@ -34,6 +34,8 @@ import { FileTaskStore } from "../../outbound/task-store/file-task-store.js";
 import { FileAgentWatchStore } from "../../outbound/external-work/file-agent-watch-store.js";
 import { HerdrExternalAgentAdapter } from "../../outbound/external-work/herdr-external-agent.adapter.js";
 import { ExternalAgentMonitor, type ExternalMonitorEvent } from "../../../application/external-work/external-agent-monitor.js";
+import { DelegationService } from "../../../application/external-work/delegation.service.js";
+import { HerdrExternalLaunchAdapter } from "../../outbound/external-work/herdr-external-launch.adapter.js";
 import type { Logger } from "../../../logger.js";
 import { buildReadinessReport } from "../../../readiness.js";
 import { WebSocketClientConnection } from "./websocket-client-connection.js";
@@ -63,6 +65,8 @@ export interface StartServerOptions {
   narration?: TaskNarrationService;
   /** Overrides the config-built monitor (tests inject a fake agent port). */
   externalMonitor?: ExternalAgentMonitor;
+  /** Overrides the config-built delegation bridge (tests inject fakes). */
+  delegations?: Pick<DelegationService, "delegate">;
   signal?: AbortSignal;
 }
 
@@ -81,6 +85,7 @@ export async function startServer({
   speechDetection: providedSpeechDetection,
   narration: providedNarration,
   externalMonitor: providedExternalMonitor,
+  delegations: providedDelegations,
   signal,
 }: StartServerOptions): Promise<{
   close(): Promise<void>;
@@ -141,6 +146,20 @@ export async function startServer({
           remoteHost: "mac-mini",
         }),
         onError: (error) => logger.error("external work monitor error", { error: errorToMessage(error) }),
+      })
+    : undefined);
+  const delegations = providedDelegations ?? (externalWork?.enabled && externalMonitor
+    ? new DelegationService({
+        launches: new HerdrExternalLaunchAdapter({
+          agentAdapter: new HerdrExternalAgentAdapter({
+            herdrExecutable: externalWork.herdrExecutable,
+            msshExecutable: externalWork.msshExecutable,
+            localHost: "exodia",
+            remoteHost: "mac-mini",
+          }),
+        }),
+        monitor: externalMonitor,
+        onError: (error) => logger.error("delegation error", { error: errorToMessage(error) }),
       })
     : undefined);
   const defaultSessionKey = makeSessionKey(
@@ -218,7 +237,9 @@ export async function startServer({
         hermes,
         taskSupervisor,
         taskOwnerId: defaultOwnerId,
+        taskOwnerIdentity: defaultSessionKey,
         narration,
+        ...(delegations ? { delegations } : {}),
         logger,
         sessions,
         metrics,
@@ -407,6 +428,65 @@ export async function startServer({
   };
 }
 
+const DELEGATION_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/u;
+const DELEGATION_REPOSITORY_PATTERN = /^\/[^ -]{0,500}$/u;
+
+function parseDelegationRequest(body: Record<string, unknown>):
+  | { ok: true; value: {
+      idempotencyKey: string;
+      host: "exodia" | "mac-mini";
+      harness: "herdr";
+      agentKind: string;
+      repository: string;
+      objective: string;
+      acceptanceCriteria: string[];
+      linkedTaskId?: string;
+    } }
+  | { ok: false; error: string } {
+  const idempotencyKey = typeof body.idempotency_key === "string" ? body.idempotency_key : "";
+  if (!DELEGATION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    return { ok: false, error: "idempotency_key must be 8-128 chars of letters, digits, :, -, ., or _." };
+  }
+  const host = body.host;
+  if (host !== "exodia" && host !== "mac-mini") {
+    return { ok: false, error: "host must be exodia or mac-mini." };
+  }
+  const repository = typeof body.repository === "string" ? body.repository : "";
+  if (!DELEGATION_REPOSITORY_PATTERN.test(repository)) {
+    return { ok: false, error: "repository must be an absolute path on that host." };
+  }
+  const objective = typeof body.objective === "string" ? body.objective.trim() : "";
+  if (!objective || objective.length > 4_000) {
+    return { ok: false, error: "objective must be 1-4000 characters." };
+  }
+  const agentKind = typeof body.agent_kind === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(body.agent_kind)
+    ? body.agent_kind
+    : "claude";
+  const acceptanceCriteria = Array.isArray(body.acceptance_criteria)
+    ? body.acceptance_criteria
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .map((item) => item.trim().slice(0, 500))
+        .slice(0, 8)
+    : [];
+  const linkedTaskId = typeof body.task_id === "string" ? body.task_id : undefined;
+  if (linkedTaskId !== undefined && !TASK_ID_PATTERN.test(linkedTaskId)) {
+    return { ok: false, error: "task_id must be a task id." };
+  }
+  return {
+    ok: true,
+    value: {
+      idempotencyKey,
+      host,
+      harness: "herdr",
+      agentKind,
+      repository,
+      objective,
+      acceptanceCriteria: acceptanceCriteria.length > 0 ? acceptanceCriteria : ["Outcome inspected by the owner."],
+      ...(linkedTaskId !== undefined ? { linkedTaskId } : {}),
+    },
+  };
+}
+
 /** Honest one-line phrase for a linked task's progress log; never claims completion. */
 function observationSummaryPhrase(event: ExternalMonitorEvent): string {
   const state = event.watch.lastObserved?.state;
@@ -508,8 +588,12 @@ async function handleHttp(
     taskSupervisor: TaskSupervisorRuntime;
     /** Owner whose task inbox the narration route resolves records from. */
     taskOwnerId: string;
+    /** The owner identity (session key) watch registrations hash. */
+    taskOwnerIdentity: string;
     /** Present only when a narrator LLM is configured. */
     narration?: TaskNarrationService;
+    /** Present only when external work is enabled. */
+    delegations?: Pick<DelegationService, "delegate">;
     logger: Logger;
     sessions: Set<LiveGatewaySession>;
     metrics: GatewayMetricsCollector;
@@ -736,6 +820,70 @@ async function handleHttp(
     }
     return;
   }
+  if (url.pathname === "/v1/delegations") {
+    if (req.method !== "POST") {
+      methodNotAllowed(req, res, "POST");
+      return;
+    }
+    if (!options.delegations) {
+      json(req, res, 503, { status: "external_work_disabled" });
+      return;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonObjectBody(req);
+    } catch (error) {
+      json(req, res, 400, { status: "invalid_request", error: errorToMessage(error) });
+      return;
+    }
+    const parse = parseDelegationRequest(body);
+    if (!parse.ok) {
+      json(req, res, 400, { status: "invalid_request", error: parse.error });
+      return;
+    }
+    try {
+      // The verified receipt: launch (or reconcile), register the watch, and
+      // move the linked task into the delegated phase — one idempotent call.
+      const result = await options.delegations.delegate({
+        ...parse.value,
+        ownerIdentity: options.taskOwnerIdentity,
+        ...(parse.value.linkedTaskId !== undefined ? { linkedTaskId: parse.value.linkedTaskId } : {}),
+      });
+      if (parse.value.linkedTaskId !== undefined) {
+        try {
+          await options.taskSupervisor.markDelegated(
+            options.taskOwnerId,
+            parse.value.linkedTaskId,
+            `Verified handoff: ${parse.value.harness} agent ${result.watch.agentSessionValue.slice(0, 8)} on ${result.watch.host} (${result.watch.paneId}) took over this work; the gateway is monitoring.`,
+          );
+        } catch (error) {
+          options.logger.warn("delegation linked task could not enter delegated phase", {
+            taskId: parse.value.linkedTaskId,
+            error: errorToMessage(error),
+          });
+        }
+      }
+      json(req, res, 200, {
+        status: "delegated",
+        reconciled: result.reconciled,
+        watch_id: result.watch.watchId,
+        host: result.watch.host,
+        harness: result.watch.harness,
+        pane_id: result.watch.paneId,
+        agent_session_value: result.watch.agentSessionValue,
+        ...(parse.value.linkedTaskId !== undefined ? { task_id: parse.value.linkedTaskId, task_status: "delegated" } : {}),
+        message: result.reconciled
+          ? "An agent for this delegation already existed; it is being monitored."
+          : "Agent launched and verified; the gateway is monitoring it.",
+      });
+    } catch (error) {
+      // An ambiguous launch is never retried blindly: the next call with the
+      // same idempotency key reconciles against the host first.
+      options.logger.error("delegation failed", { error: errorToMessage(error) });
+      json(req, res, 502, { status: "delegation_failed", error: errorToMessage(error) });
+    }
+    return;
+  }
   if (url.pathname === "/v1/capabilities") {
     if (!isGetOrHead(req)) {
       methodNotAllowed(req, res, "GET, HEAD");
@@ -868,7 +1016,7 @@ function isAuthorized(req: IncomingMessage, config: AppConfig, url: URL, options
 }
 
 function requiresHttpAuth(pathname: string): boolean {
-  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations" || pathname === "/v1/metrics" || pathname === "/v1/task-narration";
+  return pathname === "/ready" || pathname === "/v1/capabilities" || pathname === "/v1/conversations" || pathname === "/v1/metrics" || pathname === "/v1/task-narration" || pathname === "/v1/delegations";
 }
 
 function isWebSocketOriginAllowed(req: IncomingMessage, config: AppConfig): boolean {

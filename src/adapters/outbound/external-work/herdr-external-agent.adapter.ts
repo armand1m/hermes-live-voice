@@ -113,6 +113,19 @@ export class HerdrExternalAgentAdapter implements ExternalAgentPort {
     return unwrapTextOutput(stdout).slice(-READ_OUTPUT_BUDGET);
   }
 
+  /**
+   * Raw herdr command surface for the launch bridge (plan §C): same
+   * transports, same deadline, same output bounds. Monitoring code never
+   * needs this — it stays on the observe-only methods above.
+   */
+  async runCommand(
+    host: DelegationHost,
+    args: readonly string[],
+    options: { signal?: AbortSignal; maxOutputBytes?: number } = {},
+  ): Promise<string> {
+    return this.runHerdr(host, args, options.maxOutputBytes ?? 512 * 1024, options.signal);
+  }
+
   private async runHerdr(
     host: DelegationHost,
     herdrArgs: readonly string[],

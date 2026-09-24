@@ -11,6 +11,8 @@ import type { Logger } from "../src/logger.js";
 import { MockLiveAdapter } from "../src/adapters/outbound/realtime/mock-live.adapter.js";
 import { FileTaskStore } from "../src/adapters/outbound/task-store/file-task-store.js";
 import { createTaskRecord, transitionTask } from "../src/domain/tasks/index.js";
+import type { DelegateWorkInput, DelegateWorkResult } from "../src/application/external-work/delegation.service.js";
+import { createAgentWatchRecord, hashWatchOwnerId, type AgentWatchRecord } from "../src/domain/external-work/index.js";
 import {
   startServer,
   type TaskSupervisorRuntime,
@@ -202,6 +204,111 @@ describe("HTTP server", () => {
       if (shutdownTimeout) clearTimeout(shutdownTimeout);
       socket.destroy();
     }
+  });
+
+
+  it("serves the delegation bridge: auth, validation, verified receipts, honest failures", async () => {
+    const calls: DelegateWorkInput[] = [];
+    let failNext: Error | null = null;
+    const delegations = {
+      async delegate(input: DelegateWorkInput): Promise<DelegateWorkResult> {
+        calls.push(input);
+        if (failNext) {
+          const error = failNext;
+          failNext = null;
+          throw error;
+        }
+        const watch: AgentWatchRecord = createAgentWatchRecord({
+          ownerId: hashWatchOwnerId(input.ownerIdentity),
+          host: input.host,
+          harness: input.harness,
+          agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+          paneId: "w4:p1",
+          objective: input.objective,
+          acceptanceCriteria: input.acceptanceCriteria,
+          ...(input.linkedTaskId !== undefined ? { linkedTaskId: input.linkedTaskId } : {}),
+        });
+        return { watch, reconciled: calls.length > 1 };
+      },
+    };
+    const server = await startServer({
+      config: testConfig({ server: { authToken: "gateway-secret" } }),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      logger: fakeLogger(),
+      delegations,
+    });
+    openServers.push(server);
+
+    const unauthorized = await fetch(`${server.url}/v1/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "diamond-fix-1", host: "exodia", repository: "/r", objective: "o" }),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const invalid = await fetch(`${server.url}/v1/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer gateway-secret" },
+      body: JSON.stringify({ idempotency_key: "short", host: "laptop", repository: "relative", objective: "" }),
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json() as { error: string }).error).toContain("idempotency_key");
+
+    const ok = await fetch(`${server.url}/v1/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer gateway-secret" },
+      body: JSON.stringify({
+        idempotency_key: "diamond-fix-2026-09-24",
+        host: "exodia",
+        repository: "/repositories/diamond",
+        objective: "Fix the diamond indicator.",
+        acceptance_criteria: ["Plot renders"],
+      }),
+    });
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toMatchObject({
+      status: "delegated",
+      reconciled: false,
+      host: "exodia",
+      pane_id: "w4:p1",
+      watch_id: expect.stringMatching(/^watch_[0-9a-f]{32}$/),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ host: "exodia", repository: "/repositories/diamond" });
+
+    // An ambiguous launch is reported honestly, never turned into a receipt.
+    failNext = new Error("herdr transport died after the agent started");
+    const failed = await fetch(`${server.url}/v1/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer gateway-secret" },
+      body: JSON.stringify({
+        idempotency_key: "ambiguous-launch",
+        host: "mac-mini",
+        repository: "/Volumes/T7/amp",
+        objective: "Archive recordings.",
+      }),
+    });
+    expect(failed.status).toBe(502);
+    await expect(failed.json()).resolves.toMatchObject({ status: "delegation_failed" });
+    await server.close();
+  });
+
+  it("says external work is disabled when no delegation bridge is configured", async () => {
+    const server = await startServer({
+      config: testConfig(),
+      hermes: fakeHermes(),
+      liveModel: new MockLiveAdapter(),
+      logger: fakeLogger(),
+    });
+    openServers.push(server);
+    const response = await fetch(`${server.url}/v1/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "diamond-fix-1", host: "exodia", repository: "/r", objective: "o" }),
+    });
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ status: "external_work_disabled" });
   });
 
   it("serves health and capabilities", async () => {

@@ -579,3 +579,85 @@ def _dump_result(value: dict[str, Any]) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def hermes_delegate_work(args: dict[str, Any], **_kwargs: Any) -> str:
+    """Launch (or reconcile) a herdr agent through the gateway's delegation bridge.
+
+    The gateway owns the full sequence: idempotent intent, labeled workspace,
+    agent start, objective submission, watch registration, and the verified
+    receipt. This tool only carries the request over the authenticated
+    gateway boundary.
+    """
+    try:
+        gateway_url = configured_gateway_url()
+    except ValueError as error:
+        return _dump_result({"success": False, "error": {"code": "invalid_gateway_url", "message": str(error)}})
+    token = configured_gateway_token()
+
+    idempotency_key = args.get("idempotency_key")
+    host = args.get("host")
+    repository = args.get("repository")
+    objective = args.get("objective")
+    if not isinstance(idempotency_key, str) or not isinstance(host, str):
+        return _dump_result({"success": False, "error": {"code": "invalid_request", "message": "idempotency_key and host are required strings."}})
+    if not isinstance(repository, str) or not isinstance(objective, str) or not objective.strip():
+        return _dump_result({"success": False, "error": {"code": "invalid_request", "message": "repository and objective are required strings."}})
+    acceptance = args.get("acceptance_criteria")
+    if acceptance is not None and (not isinstance(acceptance, list) or not all(isinstance(item, str) for item in acceptance)):
+        return _dump_result({"success": False, "error": {"code": "invalid_request", "message": "acceptance_criteria must be a list of strings."}})
+    task_id = args.get("task_id")
+    if task_id is not None and not isinstance(task_id, str):
+        return _dump_result({"success": False, "error": {"code": "invalid_request", "message": "task_id must be a string."}})
+    agent_kind = args.get("agent_kind") if isinstance(args.get("agent_kind"), str) else "claude"
+
+    result = _post_json(
+        gateway_url,
+        "/v1/delegations",
+        token,
+        {
+            "idempotency_key": idempotency_key[:128],
+            "host": host,
+            "repository": repository[:512],
+            "objective": objective[:4000],
+            "agent_kind": agent_kind,
+            **({"acceptance_criteria": [item[:500] for item in acceptance[:8]]} if acceptance else {}),
+            **({"task_id": task_id} if task_id else {}),
+        },
+        timeout=_timeout_seconds(args.get("timeout_seconds")) or 150.0,
+    )
+    return _dump_result(result)
+
+
+def _post_json(
+    base_url: str,
+    path: str,
+    token: str | None,
+    payload: dict[str, Any],
+    timeout: float,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    redacted_values = tuple(value for value in (*sensitive_values, token) if value)
+    headers = {"accept": "application/json", "content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    request = Request(
+        base_url + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            return _response_result(response, path, int(response.status), redacted_values)
+    except HTTPError as error:
+        try:
+            if 300 <= error.code < 400:
+                return {"success": False, "error": "redirect_not_allowed"}
+            return _response_result(error, path, error.code, redacted_values)
+        finally:
+            error.close()
+    except TimeoutError:
+        return {"success": False, "error": "timeout"}
+    except (URLError, OSError, ValueError, UnicodeError):
+        return {"success": False, "error": "request_failed"}
