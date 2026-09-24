@@ -47,6 +47,9 @@ import { prepareSpokenContent } from "../../domain/speech/spoken-content.js";
 import { SpeechMux } from "./speech-mux.js";
 import type { SpeechSink } from "./ports/speech-sink.port.js";
 import type { VoiceArbiter } from "./voice-arbiter.js";
+import type { ExternalAgentMonitor } from "../external-work/external-agent-monitor.js";
+import type { AgentWatchRecord } from "../../domain/external-work/index.js";
+import type { DelegationHost } from "../../domain/tasks/delegation.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
 import {
@@ -130,6 +133,12 @@ export interface LiveGatewaySessionDeps {
   layaShadow?: LayaShadowRecorder;
   /** Newest-page-wins arbitration across sessions sharing one owner key. */
   voiceArbiter?: VoiceArbiter;
+  /**
+   * External-work monitor (plan §B): durable observation of harness agents on
+   * the fixed hosts. Omitted (or HERMES_LIVE_EXTERNAL_WORK_ENABLED unset)
+   * keeps the external-agent tools unlisted and the gateway inert.
+   */
+  externalMonitor?: ExternalAgentMonitor;
 }
 
 interface ProviderToolCallRecord {
@@ -411,6 +420,7 @@ export class LiveGatewaySession {
               searchPastChats: availableTools.includes("search_past_chats"),
               remember: availableTools.includes("remember"),
               deferredAnswers: this.deps.config.hermes.asyncTools !== false,
+              externalWorkMonitoring: availableTools.includes("watch_external_agent"),
             },
           ),
           ...(this.deps.config.hermes.instructions
@@ -1267,6 +1277,9 @@ export class LiveGatewaySession {
     }
     if (this.protocolVersion >= 6) tools.push("pause_voice_input");
     if (this.protocolVersion >= 9) tools.push("set_client_audio");
+    if (this.deps.externalMonitor) {
+      tools.push("watch_external_agent", "list_external_agents", "list_external_watches", "stop_watching_agent");
+    }
     return tools;
   }
 
@@ -1566,9 +1579,144 @@ export class LiveGatewaySession {
           message: `Client audio settings requested: ${applied}. The client applies them and stays authoritative.`,
         });
       }
+      case "watch_external_agent": {
+        const monitor = this.requireExternalMonitor();
+        const host = stringArg(call, "host") as DelegationHost | undefined;
+        const paneId = stringArg(call, "pane_id");
+        const objective = stringArg(call, "objective");
+        if (!host || !paneId || !objective) {
+          throw new Error("watch_external_agent requires host, pane_id, and objective.");
+        }
+        if (host !== "exodia" && host !== "mac-mini") {
+          throw new Error("watch_external_agent host must be exodia or mac-mini.");
+        }
+        const linkedTaskId = optionalStringArg(call, "task_id");
+        const requestedSession = optionalStringArg(call, "agent_session_value");
+        return this.runTaskOperation(async () => {
+          // Resolve the agent's identity from a live host snapshot: the pane
+          // must exist, and a supplied session value must match it exactly.
+          const discovery = await monitor.discover(host);
+          const agent = discovery.find((candidate) => candidate.paneId === paneId);
+          if (!agent) {
+            return {
+              ok: false,
+              error: `No harness agent is running at pane ${paneId} on ${host}. Use list_external_agents to find the current panes.`,
+            };
+          }
+          if (requestedSession && requestedSession !== agent.agentSessionValue) {
+            return {
+              ok: false,
+              error: `Pane ${paneId} on ${host} runs session ${agent.agentSessionValue}, not ${requestedSession}. Refusing to attach to different work.`,
+            };
+          }
+          const watch = await monitor.registerWatch({
+            ownerIdentity: this.sessionKey!,
+            host,
+            harness: "herdr",
+            agentSessionValue: agent.agentSessionValue,
+            paneId,
+            objective,
+            acceptanceCriteria: arrayArg(call, "acceptance_criteria") ?? ["Outcome inspected by the owner."],
+            ...(agent.workspaceId !== undefined ? { workspaceId: agent.workspaceId } : {}),
+            ...(linkedTaskId ? { linkedTaskId } : {}),
+            ...(this.conversation.sessionId ? { originConversationId: this.conversation.sessionId } : {}),
+          });
+          // A verified registration against a linked task is the handoff
+          // receipt: the task enters the delegated phase (plan §C).
+          if (linkedTaskId) {
+            await this.deps.taskSupervisor.markDelegated(
+              this.ownerId!,
+              linkedTaskId,
+              `Verified handoff: herdr agent on ${host} (${paneId}) took over this work; the gateway is monitoring.`,
+            );
+          }
+          return {
+            spoken_response: linkedTaskId
+              ? `Agent launched and verified on ${host}: I’m watching it and the task is delegated. I’ll report changes and won’t touch the agent.`
+              : `I’m watching the agent on ${host} (${paneId}). I’ll report state changes and won’t touch it.`,
+            ok: true,
+            watch_id: watch.watchId,
+            host,
+            pane_id: paneId,
+            status: agent.status,
+            ...(linkedTaskId ? { task_id: linkedTaskId, task_status: "delegated" } : {}),
+            message: "Watch registered after verifying the pane's session identity.",
+          };
+        }, "Unable to watch that external agent.");
+      }
+      case "list_external_agents": {
+        const monitor = this.requireExternalMonitor();
+        const host = stringArg(call, "host") as DelegationHost | undefined;
+        if (!host || (host !== "exodia" && host !== "mac-mini")) {
+          throw new Error("list_external_agents requires host exodia or mac-mini.");
+        }
+        return this.runTaskOperation(async () => {
+          const agents = await monitor.discover(host);
+          return {
+            ...(agents.length === 0
+              ? { spoken_response: `No harness agents are running on ${host} right now.` }
+              : { spoken_response: `${agents.length} agent${agents.length === 1 ? " is" : "s are"} running on ${host}.` }),
+            ok: true,
+            host,
+            agents: agents.slice(0, 20).map((agent) => ({
+              pane_id: agent.paneId,
+              agent_session_value: agent.agentSessionValue,
+              status: agent.status,
+              ...(agent.name ? { name: agent.name } : {}),
+              ...(agent.title ? { title: agent.title } : {}),
+              ...(agent.workspaceId ? { workspace_id: agent.workspaceId } : {}),
+              cwd: agent.cwd,
+            })),
+          };
+        }, "Unable to list external agents.");
+      }
+      case "list_external_watches": {
+        const monitor = this.requireExternalMonitor();
+        return this.runTaskOperation(async () => {
+          const watches = await monitor.listWatches(this.sessionKey!);
+          const active = watches.filter((watch) => watch.status !== "stopped");
+          return {
+            ...(active.length === 0
+              ? { spoken_response: "You are not watching any external agents." }
+              : { spoken_response: externalWatchesSpokenSummary(active) }),
+            ok: true,
+            watches: active.map((watch) => ({
+              watch_id: watch.watchId,
+              host: watch.host,
+              pane_id: watch.paneId,
+              status: watch.status,
+              state: watch.lastObserved?.state ?? "not-yet-observed",
+              observed_at: watch.lastObserved?.at,
+              ...(watch.lastObserved?.excerpt ? { last_output: watch.lastObserved.excerpt } : {}),
+              ...(watch.linkedTaskId ? { task_id: watch.linkedTaskId } : {}),
+              objective: watch.objective,
+            })),
+          };
+        }, "Unable to list external watches.");
+      }
+      case "stop_watching_agent": {
+        const monitor = this.requireExternalMonitor();
+        const watchId = stringArg(call, "watch_id");
+        if (!watchId) throw new Error("stop_watching_agent requires watch_id.");
+        return this.runTaskOperation(
+          () => monitor.stopWatch(this.sessionKey!, watchId, "Stopped by the user through the voice session."),
+          "Unable to stop that watch.",
+        ).then((watch) => ({
+          spoken_response: "Stopped watching that agent. The agent itself keeps running untouched.",
+          ok: true,
+          watch_id: watch.watchId,
+          status: watch.status,
+        }));
+      }
       default:
         return Promise.resolve({ ok: false, error: `Unknown hermes-live tool: ${call.name}` });
     }
+  }
+
+  private requireExternalMonitor(): ExternalAgentMonitor {
+    const monitor = this.deps.externalMonitor;
+    if (!monitor) throw new Error("External work monitoring is disabled on this gateway.");
+    return monitor;
   }
 
   private enqueueProviderToolCall(call: LiveToolCall): void {
@@ -2981,6 +3129,28 @@ function stringArg(call: LiveToolCall, name: string): string {
 function optionalStringArg(call: LiveToolCall, name: string): string | undefined {
   const value = stringArg(call, name);
   return value || undefined;
+}
+
+function arrayArg(call: LiveToolCall, name: string): string[] | undefined {
+  const value = call.args[name];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`Tool argument ${name} must be an array.`);
+  return value.map((item) => {
+    if (typeof item !== "string" || !item.trim()) throw new Error(`Tool argument ${name} must contain non-empty strings.`);
+    return item.trim();
+  });
+}
+
+/** Honest spoken summary of watched external work; never claims completion. */
+function externalWatchesSpokenSummary(watches: readonly AgentWatchRecord[]): string {
+  const byState = new Map<string, number>();
+  for (const watch of watches) {
+    const state = watch.lastObserved?.state ?? "not-yet-observed";
+    byState.set(state, (byState.get(state) ?? 0) + 1);
+  }
+  const hosts = [...new Set(watches.map((watch) => watch.host))].join(" and ");
+  const parts = [...byState.entries()].map(([state, count]) => `${count} ${state.replace("-", " ")}`);
+  return `You are watching ${watches.length} agent${watches.length === 1 ? "" : "s"} on ${hosts}: ${parts.join(", ")}. Idle means the outcome needs inspection, not completion.`;
 }
 
 function booleanArg(call: LiveToolCall, name: string, fallback: boolean): boolean {

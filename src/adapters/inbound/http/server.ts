@@ -31,6 +31,9 @@ import { narratorClientFromConfig } from "../../outbound/narrator/narrator-llm.c
 import { createTaskNarrationService, type TaskNarrationService } from "../../../application/live-gateway/task-narration.service.js";
 import { projectTaskSnapshot } from "../../../application/live-gateway/task-public-projection.js";
 import { FileTaskStore } from "../../outbound/task-store/file-task-store.js";
+import { FileAgentWatchStore } from "../../outbound/external-work/file-agent-watch-store.js";
+import { HerdrExternalAgentAdapter } from "../../outbound/external-work/herdr-external-agent.adapter.js";
+import { ExternalAgentMonitor, type ExternalMonitorEvent } from "../../../application/external-work/external-agent-monitor.js";
 import type { Logger } from "../../../logger.js";
 import { buildReadinessReport } from "../../../readiness.js";
 import { WebSocketClientConnection } from "./websocket-client-connection.js";
@@ -58,6 +61,8 @@ export interface StartServerOptions {
   taskSupervisor?: TaskSupervisorRuntime;
   speechDetection?: SpeechDetectionService;
   narration?: TaskNarrationService;
+  /** Overrides the config-built monitor (tests inject a fake agent port). */
+  externalMonitor?: ExternalAgentMonitor;
   signal?: AbortSignal;
 }
 
@@ -75,6 +80,7 @@ export async function startServer({
   taskSupervisor: providedTaskSupervisor,
   speechDetection: providedSpeechDetection,
   narration: providedNarration,
+  externalMonitor: providedExternalMonitor,
   signal,
 }: StartServerOptions): Promise<{
   close(): Promise<void>;
@@ -118,6 +124,25 @@ export async function startServer({
     ...(config.hermes.instructions ? { runInstructions: config.hermes.instructions } : {}),
     onError: (error) => logger.error("background task supervisor error", { error: errorToMessage(error) }),
   });
+  // External-work monitor (plan §B): inert unless HERMES_LIVE_EXTERNAL_WORK_ENABLED.
+  // It owns durable observation of harness agents on the fixed hosts and runs
+  // independently of the Hermes implementation queue — a status poll on the
+  // Mac mini never waits behind code-changing work.
+  // An injected monitor is trusted (tests); only the config-built path
+  // requires the explicit HERMES_LIVE_EXTERNAL_WORK_ENABLED flag.
+  const externalWork = config.externalWork;
+  const externalMonitor = providedExternalMonitor ?? (externalWork?.enabled
+    ? new ExternalAgentMonitor({
+        store: new FileAgentWatchStore({ directory: dirname(config.tasks.stateFile) }),
+        agents: new HerdrExternalAgentAdapter({
+          herdrExecutable: externalWork.herdrExecutable,
+          msshExecutable: externalWork.msshExecutable,
+          localHost: "exodia",
+          remoteHost: "mac-mini",
+        }),
+        onError: (error) => logger.error("external work monitor error", { error: errorToMessage(error) }),
+      })
+    : undefined);
   const defaultSessionKey = makeSessionKey(
     config.server.sessionPrefix,
     config.server.defaultProfileId,
@@ -163,6 +188,24 @@ export async function startServer({
     }
     if (signal?.aborted) throw startupAbortError(signal);
     throw error;
+  }
+  if (externalMonitor) {
+    // One gateway-level subscription: verified external observations flow into
+    // the linked task's retained progress log regardless of which (or whether
+    // any) voice session is connected.
+    externalMonitor.subscribe((event) => {
+      const taskId = event.watch.linkedTaskId;
+      if (!taskId) return;
+      if (event.kind === "registered" || event.kind === "stopped") return;
+      const observation = event.watch.lastObserved;
+      const evidence = observation?.excerpt ? ` Last output: ${observation.excerpt.slice(0, 180)}` : "";
+      void taskSupervisor.noteExternalObservation(
+        event.watch.ownerId,
+        taskId,
+        `External agent on ${event.watch.host} (${event.watch.paneId}): ${observationSummaryPhrase(event)}${evidence}`,
+      ).catch(() => undefined);
+    });
+    await externalMonitor.initialize();
   }
   const sessions = new Set<LiveGatewaySession>();
   // Process/host signals for the browser diagnostics overlay (GET /v1/metrics).
@@ -233,6 +276,7 @@ export async function startServer({
         ...(speechSink ? { speechSink } : {}),
         ...(layaShadow ? { layaShadow } : {}),
         voiceArbiter,
+        ...(externalMonitor ? { externalMonitor } : {}),
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -340,6 +384,11 @@ export async function startServer({
         } catch (error) {
           shutdownFailures.push(error);
         }
+        try {
+          await externalMonitor?.close();
+        } catch (error) {
+          shutdownFailures.push(error);
+        }
         if (shutdownFailures.length === 1) throw shutdownFailures[0];
         if (shutdownFailures.length > 1) {
           throw new AggregateError(
@@ -356,6 +405,21 @@ export async function startServer({
     url,
     close,
   };
+}
+
+/** Honest one-line phrase for a linked task's progress log; never claims completion. */
+function observationSummaryPhrase(event: ExternalMonitorEvent): string {
+  const state = event.watch.lastObserved?.state;
+  switch (event.kind) {
+    case "offline":
+      return "host unreachable; observations are stale.";
+    case "recovered":
+      return `host reachable again; the agent is ${state ?? "observed"}.`;
+    case "mismatched":
+      return "the pane now runs a different session; the watch needs attention.";
+    default:
+      return `is ${state ?? "observed"}${event.kind === "output-evidence" ? " with new output" : ""}.`;
+  }
 }
 
 function startupAbortError(signal: AbortSignal): Error {

@@ -184,6 +184,87 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    name: "watch_external_agent",
+    description:
+      "Start durable observation of one external harness agent (herdr) on a fixed host when the user asks to watch, follow, or monitor an agent. Observation only: the gateway reports state changes and never prompts, cancels, or restarts the agent. Optionally link the task that delegated the work; the verified registration moves that task into the delegated phase.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        host: {
+          type: "string",
+          enum: ["exodia", "mac-mini"],
+          description: "The fixed host the agent runs on.",
+        },
+        pane_id: {
+          type: "string",
+          pattern: "^w[0-9a-zA-Z]{1,8}:p[0-9]{1,4}$",
+          description: "The agent's pane id, for example w4:p1 (from list_external_agents).",
+        },
+        agent_session_value: {
+          type: "string",
+          description: "The agent's session identity. Optional: resolved from the pane when omitted, and verified when provided.",
+        },
+        objective: {
+          type: "string",
+          description: "What the watched agent is working on, in one or two sentences.",
+        },
+        acceptance_criteria: {
+          type: "array",
+          maxItems: 8,
+          items: { type: "string" },
+          description: "How the user will judge the outcome. Optional.",
+        },
+        task_id: TASK_ID_SCHEMA,
+      },
+      required: ["host", "pane_id", "objective"],
+    },
+  },
+  {
+    name: "list_external_agents",
+    description:
+      "Discover the harness agents currently running on one host (herdr on exodia or mac-mini), with pane ids, status, and what each pane appears to be doing. Use before watch_external_agent to find the exact pane.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        host: {
+          type: "string",
+          enum: ["exodia", "mac-mini"],
+          description: "The host to inspect.",
+        },
+      },
+      required: ["host"],
+    },
+  },
+  {
+    name: "list_external_watches",
+    description:
+      "Summarize the external agents this user is currently watching: agent state per host, how long since the last verified observation, and which linked tasks are delegated. Idle means the outcome needs inspection, not that the work finished.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "stop_watching_agent",
+    description:
+      "Stop observing one external agent by its watch id. This only ends the watch; the agent itself is never touched.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        watch_id: {
+          type: "string",
+          pattern: "^watch_[a-f0-9]{32}$",
+          description: "The watch id returned by watch_external_agent or list_external_watches.",
+        },
+      },
+      required: ["watch_id"],
+    },
+  },
 ] as const satisfies ReadonlyArray<{
   name: LiveToolName;
   description: string;
@@ -214,6 +295,10 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   stop_background_task: "Request cancellation of one exact task.",
   pause_voice_input: "Pause microphone input without stopping tasks or disconnecting.",
   set_client_audio: "Resume or pause the mic, or change interface sound effects, on explicit request.",
+  watch_external_agent: "Watch one external herdr agent by host and pane; observation only.",
+  list_external_agents: "Discover herdr agents on one host with pane ids and status.",
+  list_external_watches: "Summarize watched external agents and their linked delegated tasks.",
+  stop_watching_agent: "Stop observing one external agent by watch id.",
 };
 
 export function selectHermesLiveToolDeclarations(names?: readonly LiveToolName[]) {

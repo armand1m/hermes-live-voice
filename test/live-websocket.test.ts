@@ -9,6 +9,12 @@ import type { AppConfig } from "../src/config.js";
 import type { Logger } from "../src/logger.js";
 import type { ApprovalChoice } from "../src/domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../src/domain/protocol/server-protocol.js";
+import { ExternalAgentMonitor } from "../src/application/external-work/external-agent-monitor.js";
+import type {
+  ExternalAgentPort,
+  ExternalAgentSnapshot,
+} from "../src/application/external-work/ports/external-agent.port.js";
+import { FileAgentWatchStore } from "../src/adapters/outbound/external-work/file-agent-watch-store.js";
 import type {
   ApprovalResult,
   HermesCapabilities,
@@ -344,6 +350,120 @@ describe("live gateway WebSocket", () => {
       expect(task).not.toHaveProperty("attention");
     }
   });
+
+  it("watches an external agent through the voice tools and delegates the linked task", async () => {
+    const config = testConfig();
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    // A real monitor over a real watch store, but a fake agent transport:
+    // herdr is not spawned from tests.
+    const watchStore = new FileAgentWatchStore({ directory: dirname(config.tasks.stateFile) });
+    const fakeAgents = {
+      snapshots: [{
+        host: "exodia" as const,
+        harness: "herdr" as const,
+        agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+        paneId: "w4:p1",
+        status: "working" as const,
+        revision: 23,
+        stateChangeSeq: 360,
+        cwd: "/repositories/diamond",
+      }] as ExternalAgentSnapshot[],
+      async listAgents() { return structuredClone(this.snapshots); },
+      async readRecentOutput() { return "building…\n❯ tests passed"; },
+    };
+    const agents: ExternalAgentPort = fakeAgents;
+    const monitor = new ExternalAgentMonitor({ store: watchStore, agents, pollIntervalMs: 50 });
+    const server = await startTestServer({ config, hermes, provider, externalMonitor: monitor });
+    await readyClient(server.url);
+
+    // Discovery first: the brain finds the pane before attaching a watch.
+    provider.emit({
+      type: "tool_call",
+      call: { id: "discover_agents", name: "list_external_agents", args: { host: "exodia" } },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "discover_agents")).resolves
+      .toMatchObject({
+        response: {
+          ok: true,
+          spoken_response: "1 agent is running on exodia.",
+          agents: [expect.objectContaining({ pane_id: "w4:p1", status: "working" })],
+        },
+      });
+
+    // Submit the task that will delegate its work to the external agent.
+    provider.emit({
+      type: "tool_call",
+      call: backgroundTaskCall("delegate_diamond", "Fix the diamond indicator"),
+    });
+    const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === "delegate_diamond");
+    const taskId = String(receipt.response.task_id);
+    await waitForStoredTask(config.tasks.stateFile, taskId, "running");
+
+    // The verified watch moves the linked task into the delegated phase and
+    // says so honestly.
+    provider.emit({
+      type: "tool_call",
+      call: {
+        id: "watch_diamond",
+        name: "watch_external_agent",
+        args: {
+          host: "exodia",
+          pane_id: "w4:p1",
+          objective: "Fix the diamond indicator and verify on the plot.",
+          task_id: taskId,
+        },
+      },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "watch_diamond")).resolves
+      .toMatchObject({
+        response: {
+          ok: true,
+          status: "working",
+          task_id: taskId,
+          task_status: "delegated",
+          spoken_response: expect.stringContaining("watching it and the task is delegated"),
+        },
+      });
+    await waitForStoredTask(config.tasks.stateFile, taskId, "delegated");
+
+    // The spoken inbox distinguishes delegated work from running work.
+    provider.emit({
+      type: "tool_call",
+      call: { id: "inbox_delegated", name: "list_background_tasks", args: { summary_only: true } },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "inbox_delegated")).resolves
+      .toMatchObject({ response: { spoken_response: "Your tasks: 1 delegated to external agents." } });
+
+    // Watch summaries report states honestly; a refusal is honest too.
+    provider.emit({
+      type: "tool_call",
+      call: {
+        id: "watch_wrong_session",
+        name: "watch_external_agent",
+        args: {
+          host: "exodia",
+          pane_id: "w4:p1",
+          agent_session_value: "not-the-session-on-that-pane",
+          objective: "Attach to different work.",
+        },
+      },
+    });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "watch_wrong_session")).resolves
+      .toMatchObject({ response: { ok: false, error: expect.stringContaining("Refusing to attach to different work") } });
+
+    // Monitor observations land on the linked task's retained progress log.
+    fakeAgents.snapshots = [{
+      host: "exodia", harness: "herdr", agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+      paneId: "w4:p1", status: "idle", revision: 24, stateChangeSeq: 361, cwd: "/repositories/diamond",
+    }];
+    await waitUntil(() => storedTask(config.tasks.stateFile, taskId)?.events.some(
+      (event: { summary?: string }) => event.summary?.includes("idle"),
+    ) === true);
+    const stored = storedTask(config.tasks.stateFile, taskId);
+    expect(stored?.lastMeaningfulProgressAt).toBeDefined();
+    await monitor.close();
+  }, 15_000);
 
   it("returns a durable receipt immediately and keeps realtime conversation responsive during dispatch", async () => {
     const start = deferred<StartRunResult>();
@@ -2956,6 +3076,7 @@ async function startTestServer(options: {
   provider: LiveModelAdapter;
   logger?: Logger;
   speechDetection?: SpeechDetectionService;
+  externalMonitor?: ExternalAgentMonitor;
 }): Promise<TestServer> {
   const server = await startServer({
     config: options.config,
@@ -2963,6 +3084,7 @@ async function startTestServer(options: {
     liveModel: options.provider,
     logger: options.logger ?? fakeLogger(),
     ...(options.speechDetection ? { speechDetection: options.speechDetection } : {}),
+    ...(options.externalMonitor ? { externalMonitor: options.externalMonitor } : {}),
   });
   openServers.push(server);
   return server;

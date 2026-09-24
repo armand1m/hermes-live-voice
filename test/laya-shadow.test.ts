@@ -443,6 +443,8 @@ function fakeSupervisor(): TaskSupervisorPort {
     },
     get: async () => undefined,
     stop: unused,
+    markDelegated: unused,
+    noteExternalObservation: unused,
     acknowledgeNotification: unused,
     markNotificationAnnounced: unused,
     claimNotificationAnnouncement: unused,

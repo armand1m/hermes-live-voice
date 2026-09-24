@@ -356,6 +356,10 @@ describe("protocol v11", () => {
       "stop_background_task",
       "pause_voice_input",
       "set_client_audio",
+      "watch_external_agent",
+      "list_external_agents",
+      "list_external_watches",
+      "stop_watching_agent",
     ]);
     expect(OPENAI_HERMES_LIVE_TOOLS.every((tool) => tool.type === "function")).toBe(true);
     expect(OPENAI_HERMES_LIVE_TOOLS[0]).toHaveProperty("parameters");
@@ -374,6 +378,10 @@ describe("protocol v11", () => {
       "stop_background_task",
       "pause_voice_input",
       "set_client_audio",
+      "watch_external_agent",
+      "list_external_agents",
+      "list_external_watches",
+      "stop_watching_agent",
     ]);
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).toHaveProperty("parametersJsonSchema");
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).not.toHaveProperty("parameters");

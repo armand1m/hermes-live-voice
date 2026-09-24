@@ -5,11 +5,18 @@ export function buildSystemInstruction(
   trustDeclaredReadOnly = false,
   conversation?: { bound: boolean; title?: string; voiceInputPause?: boolean; clientAudioControl?: boolean },
   compact = false,
-  tools?: { searchPastChats?: boolean; remember?: boolean; deferredAnswers?: boolean },
+  tools?: { searchPastChats?: boolean; remember?: boolean; deferredAnswers?: boolean; externalWorkMonitoring?: boolean },
 ): string {
   if (notificationToken !== undefined && !NOTIFICATION_TOKEN_PATTERN.test(notificationToken)) {
     throw new Error("Realtime notification token is invalid.");
   }
+  const externalWorkRule = tools?.externalWorkMonitoring
+    ? [
+        "External harness agents (herdr) run on the fixed hosts exodia and mac-mini. When the user asks about them, first list_external_agents on the host to find current panes.",
+        "Use watch_external_agent when the user asks you to watch or follow a specific agent. It verifies the pane's session identity before attaching and never prompts, cancels, or restarts the agent. When the watched work belongs to a background task, pass its task_id: the verified handoff delegates that task.",
+        "Report watched agents with list_external_watches. Idle means the outcome needs inspection, not that the work finished; say so honestly and never invent progress.",
+      ]
+    : [];
   const deferredAnswerRule = tools?.deferredAnswers
     ? "When continue_hermes_conversation or search_past_chats returns deferred true, its spoken_response is only an acknowledgement. Never answer the underlying question yourself: the gateway will speak Hermes' answer separately once it is ready."
     : undefined;
@@ -122,6 +129,7 @@ export function buildSystemInstruction(
     "If the user interrupts, stop speaking immediately. Speech cancellation and background-task cancellation are separate actions.",
     ...voiceControlRules,
     ...clientAudioRules,
+    ...externalWorkRule,
     "Never ask the user for Hermes API keys, realtime provider API keys, trusted identity values, or gateway notification tokens.",
     ...notificationRule,
   ].join("\n");

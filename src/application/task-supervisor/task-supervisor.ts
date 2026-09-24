@@ -432,6 +432,24 @@ export class TaskSupervisor implements TaskSupervisorPort {
     });
   }
 
+  /**
+   * Append an external-work observation to a task's retained progress log
+   * (plan §B/D): the monitor's verified findings about a delegated agent.
+   */
+  noteExternalObservation(ownerId: string, taskId: string, summary: string): Promise<TaskRecord> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    const parsedTaskId = TaskIdSchema.parse(taskId);
+    const now = this.now();
+    return this.mutatePersist(parsedTaskId, (record) => {
+      if (record.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
+      if (isTaskOperationallyClosed(record)) return record;
+      // A verified external finding is meaningful progress for the linked
+      // task: it resets the stall-review clock.
+      return appendTaskActivity(record, { summary: sanitizeTaskEventSummary(summary), now, meaningfulAt: now });
+    });
+  }
+
   acknowledgeNotification(ownerId: string, taskId: string): Promise<TaskRecord> {
     return this.updateOwnedNotification(ownerId, taskId, (record) =>
       acknowledgeTaskNotification(record, this.now()));

@@ -42,6 +42,10 @@ export interface TaskSupervisorPort {
   listUnreadNotifications(ownerId: string): Promise<TaskRecord[]>;
   get(ownerId: string, taskId: string): Promise<TaskRecord | undefined>;
   stop(ownerId: string, taskId: string, reason?: string): Promise<TaskRecord>;
+  /** Enter the delegated phase after a verified external handoff (plan §C). */
+  markDelegated(ownerId: string, taskId: string, summary?: string): Promise<TaskRecord>;
+  /** Append a verified external-work observation to a task's progress log. */
+  noteExternalObservation(ownerId: string, taskId: string, summary: string): Promise<TaskRecord>;
   acknowledgeNotification(ownerId: string, taskId: string): Promise<TaskRecord>;
   markNotificationAnnounced(ownerId: string, taskId: string): Promise<TaskRecord>;
   claimNotificationAnnouncement(
