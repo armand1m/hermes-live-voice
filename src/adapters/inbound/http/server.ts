@@ -17,6 +17,8 @@ import type { HermesRunsPort } from "../../../application/live-gateway/ports/her
 import type { TaskSupervisorPort } from "../../../application/live-gateway/ports/task-supervisor.port.js";
 import { LiveGatewaySession } from "../../../application/live-gateway/live-gateway-session.js";
 import { VoiceArbiter } from "../../../application/live-gateway/voice-arbiter.js";
+import { KnowledgeService } from "../../../application/knowledge/knowledge-service.js";
+import { openSqliteKnowledgeIndex } from "../../outbound/knowledge/sqlite-knowledge-index.js";
 import { TURN_STAGES, type StagePercentiles, type TurnStage } from "../../../application/live-gateway/speech-timing.js";
 import { TaskSupervisor } from "../../../application/task-supervisor/task-supervisor.js";
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
@@ -68,6 +70,8 @@ export interface StartServerOptions {
   externalMonitor?: ExternalAgentMonitor;
   /** Overrides the config-built delegation bridge (tests inject fakes). */
   delegations?: Pick<DelegationService, "delegate">;
+  /** Overrides the config-built knowledge service (tests inject an in-memory index). */
+  knowledge?: KnowledgeService;
   signal?: AbortSignal;
 }
 
@@ -87,6 +91,7 @@ export async function startServer({
   narration: providedNarration,
   externalMonitor: providedExternalMonitor,
   delegations: providedDelegations,
+  knowledge: providedKnowledge,
   signal,
 }: StartServerOptions): Promise<{
   close(): Promise<void>;
@@ -227,6 +232,35 @@ export async function startServer({
     });
     await externalMonitor.initialize();
   }
+  // Local knowledge index: best effort. A missing node:sqlite, an unreadable
+  // index file, or a failing source leaves recall on its Hermes path.
+  let knowledge = providedKnowledge;
+  if (!knowledge && config.knowledge?.enabled) {
+    try {
+      const index = await openSqliteKnowledgeIndex(config.knowledge.path);
+      if (index) {
+        knowledge = new KnowledgeService({
+          index,
+          hermes,
+          tasks: taskSupervisor,
+          ownerId: defaultOwnerId,
+          hermesHome: config.context.hermesHome,
+          excludedSessionTitles: [config.context.recallSessionTitle],
+          logger,
+        });
+      } else {
+        logger.info("knowledge index unavailable (node:sqlite with FTS5 not present)");
+      }
+    } catch (error) {
+      logger.warn("knowledge index disabled", { error: errorToMessage(error) });
+    }
+  }
+  if (knowledge) {
+    // Backfill in the background: startup never waits on Hermes or the index.
+    void knowledge.start().then(() => {
+      logger.info("knowledge index ready", knowledge!.counts());
+    }).catch((error: unknown) => logger.warn("knowledge index start failed", { error: errorToMessage(error) }));
+  }
   const sessions = new Set<LiveGatewaySession>();
   // Process/host signals for the browser diagnostics overlay (GET /v1/metrics).
   const metrics = createGatewayMetricsCollector();
@@ -299,6 +333,7 @@ export async function startServer({
         ...(layaShadow ? { layaShadow } : {}),
         voiceArbiter,
         ...(externalMonitor ? { externalMonitor } : {}),
+        ...(knowledge ? { knowledge } : {}),
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -408,6 +443,11 @@ export async function startServer({
         }
         try {
           await externalMonitor?.close();
+        } catch (error) {
+          shutdownFailures.push(error);
+        }
+        try {
+          knowledge?.close();
         } catch (error) {
           shutdownFailures.push(error);
         }

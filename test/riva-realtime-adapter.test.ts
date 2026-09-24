@@ -693,3 +693,39 @@ describe("Riva streamed brain", () => {
     await session.close();
   });
 });
+
+describe("Riva per-turn knowledge context", () => {
+  it("adds retrieved context just before the user's turn without persisting it", async () => {
+    const requests: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).endsWith("_sessions")) return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "It was the retry timeout." } }] }), { status: 200 });
+    });
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter({
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0, brainMaxTokens: 2048, brainReasoningEffort: "off", echoGuard: false,
+    }).connect({
+      sessionId: "ctx", systemInstruction: "System.", availableTools: [],
+      contextForTurn: (text) => text.includes("deploy") ? "[HERMES_LIVE_KNOWLEDGE_V1] deploy fix [/HERMES_LIVE_KNOWLEDGE_V1]" : undefined,
+      callbacks: { onEvent: (event) => events.push(event) },
+    });
+    await session.sendText("what fixed the deploy test");
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]!.messages.map((message) => message.role)).toEqual(["system", "system", "user"]);
+    expect(requests[0]!.messages[1]!.content).toContain("KNOWLEDGE");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
+
+    await session.sendText("thanks");
+    await vi.waitFor(() => expect(requests).toHaveLength(2));
+    // The earlier context never entered history; no context for this turn.
+    expect(requests[1]!.messages.filter((message) => message.content.includes("KNOWLEDGE"))).toHaveLength(0);
+    expect(requests[1]!.messages.map((message) => message.role)).toEqual(["system", "user", "assistant", "user"]);
+    await session.close();
+  });
+});

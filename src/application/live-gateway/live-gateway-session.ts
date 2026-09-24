@@ -55,6 +55,8 @@ import {
   type ExternalAnnouncement,
 } from "../external-work/external-announcement-policy.js";
 import { hasWatchAnnounced, hashWatchOwnerId } from "../../domain/external-work/index.js";
+import type { KnowledgeService } from "../knowledge/knowledge-service.js";
+import { localRecallResult, turnContextBlock } from "../knowledge/recall.js";
 import {
   nextTaskProgressAnnouncement,
   startTaskProgressTracking,
@@ -165,6 +167,8 @@ export interface LiveGatewaySessionDeps {
    * keeps the external-agent tools unlisted and the gateway inert.
    */
   externalMonitor?: ExternalAgentMonitor;
+  /** Local knowledge index: fast recall and optional per-turn context. */
+  knowledge?: Pick<KnowledgeService, "search" | "forgetTask">;
 }
 
 interface ProviderToolCallRecord {
@@ -466,6 +470,9 @@ export class LiveGatewaySession {
           ...(digest.text ? [digest.text] : []),
         ].join("\n\n"),
         availableTools,
+        ...(this.deps.knowledge && this.deps.config.knowledge?.turnContext === true
+          ? { contextForTurn: (userText: string) => turnContextBlock(this.deps.knowledge!.search(userText, { limit: 6 }), userText) }
+          : {}),
         safetyIdentifier: safetyIdentifierForSessionKey(this.sessionKey),
         callbacks: {
           onOpen: () => {
@@ -1390,6 +1397,13 @@ export class LiveGatewaySession {
         const query = stringArg(call, "query");
         if (!query) throw new Error("search_past_chats requires query.");
         validateText(query, this.deps.config.server.maxTextChars, "Past chat search query");
+        // Fast path: the local knowledge index answers from finished tasks,
+        // session titles, skills, and memory in milliseconds. Only a miss (or
+        // an explicit deep search) pays for a full Hermes recall turn.
+        if (this.deps.knowledge && !booleanArg(call, "deep", false)) {
+          const local = localRecallResult(this.deps.knowledge.search(query, { limit: 4 }), query);
+          if (local) return Promise.resolve(local);
+        }
         const chatSession = this.deps.hermes.chatSession;
         if (!chatSession || !this.deps.hermes.listSessions || !this.deps.hermes.createSession) {
           return Promise.resolve({ ok: false, error: "This Hermes installation cannot search past conversations." });
@@ -1613,7 +1627,10 @@ export class LiveGatewaySession {
               ? supervisor.deleteTask!(this.ownerId!, taskId)
               : supervisor.archiveTask!(this.ownerId!, taskId),
             "Unable to clean up that background task safely.",
-          ).then((task) => ({
+          ).then((task) => {
+            if (permanent) this.deps.knowledge?.forgetTask(task.taskId);
+            return task;
+          }).then((task) => ({
             spoken_response: permanent
               ? "Done — that task is permanently deleted."
               : "Done — that task is archived and out of your inbox.",

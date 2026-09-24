@@ -136,6 +136,12 @@ export interface LiveModelConnectParams {
   /** Only tools that can succeed for this negotiated client/session. */
   availableTools?: readonly LiveToolName[];
   safetyIdentifier?: string;
+  /**
+   * Optional per-turn reference context for a user utterance (local knowledge
+   * retrieval). Adapters that build their own model requests may add it to
+   * that turn only; it is never persisted into conversation history.
+   */
+  contextForTurn?: (userText: string) => string | undefined;
   callbacks: LiveModelCallbacks;
 }
 

@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeSessionKey, type AppConfig } from "../src/config.js";
+import type { KnowledgeService } from "../src/application/knowledge/knowledge-service.js";
 import type { Logger } from "../src/logger.js";
 import type { ApprovalChoice } from "../src/domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../src/domain/protocol/server-protocol.js";
@@ -590,6 +591,43 @@ describe("live gateway WebSocket", () => {
     expect(provider.latest.notificationCalls.some((notice) => notice.announcement?.includes("reports done"))).toBe(false);
     await monitor.close();
   }, 10_000);
+
+  it("answers search_past_chats from the local knowledge index, and goes deep on request", async () => {
+    const searches: string[] = [];
+    const knowledge = {
+      search(query: string) {
+        searches.push(query);
+        return [{
+          id: "task:1", kind: "task" as const, title: "Deploy test fix",
+          snippet: "Pinned the retry timeout; CI is green.", updatedAt: Date.UTC(2026, 8, 24), matchedTerms: 3,
+        }];
+      },
+      forgetTask() {},
+      async start() {},
+      close() {},
+      counts() { return {}; },
+    } as unknown as KnowledgeService;
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes, provider, knowledge });
+    await readyClient(server.url);
+
+    provider.emit({ type: "tool_call", call: { id: "recall_fast", name: "search_past_chats", args: { query: "flaky deploy test fix" } } });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "recall_fast")).resolves.toMatchObject({
+      response: {
+        ok: true,
+        source: "local_index",
+        results: [{ kind: "finished task", title: "Deploy test fix", excerpt: "Pinned the retry timeout; CI is green." }],
+      },
+    });
+    expect(searches).toEqual(["flaky deploy test fix"]);
+
+    // deep: true skips the index and takes the Hermes recall path.
+    provider.emit({ type: "tool_call", call: { id: "recall_deep", name: "search_past_chats", args: { query: "flaky deploy test fix", deep: true } } });
+    const deep = await provider.latest.toolResponses.wait((entry) => entry.call.id === "recall_deep");
+    expect(deep.response.source).toBeUndefined();
+    expect(searches).toHaveLength(1);
+  });
 
   it("never speaks another owner's external watch", async () => {
     const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
@@ -3325,8 +3363,10 @@ async function startTestServer(options: {
   logger?: Logger;
   speechDetection?: SpeechDetectionService;
   externalMonitor?: ExternalAgentMonitor;
+  knowledge?: KnowledgeService;
 }): Promise<TestServer> {
   const server = await startServer({
+    ...(options.knowledge ? { knowledge: options.knowledge } : {}),
     config: options.config,
     hermes: options.hermes,
     liveModel: options.provider,

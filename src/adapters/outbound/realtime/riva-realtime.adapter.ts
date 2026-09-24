@@ -315,7 +315,13 @@ class RivaRealtimeSession implements LiveModelSession {
 
   private async respond(input: string): Promise<void> {
     this.history.push({ role: "user", content: input });
-    await this.askBrain();
+    let turnContext: string | undefined;
+    try {
+      turnContext = this.params.contextForTurn?.(input);
+    } catch {
+      // Retrieval is optional: a failed lookup never blocks the turn.
+    }
+    await this.askBrain(turnContext);
   }
 
   private async completeToolResponse(): Promise<void> {
@@ -326,11 +332,17 @@ class RivaRealtimeSession implements LiveModelSession {
    * One brain request shape for turns and the cache prewarm: the system
    * prompt and tools render first, so both share the same cached prefix.
    */
-  private brainRequest(history: readonly BrainMessage[]): JsonObject {
+  private brainRequest(history: readonly BrainMessage[], turnContext?: string): JsonObject {
     const messages: BrainMessage[] = [
       { role: "system", content: this.params.systemInstruction },
       ...history,
     ];
+    // Reference context for this turn only, placed just before the user's
+    // utterance so the cached prefix (system prompt + earlier history) stays
+    // intact and history never accumulates retrieved text.
+    if (turnContext && messages.at(-1)?.role === "user") {
+      messages.splice(messages.length - 1, 0, { role: "system", content: turnContext });
+    }
     const tools = selectCompactOpenAIHermesLiveTools(this.params.availableTools).map((tool) => ({
       type: "function" as const,
       function: {
@@ -374,7 +386,7 @@ class RivaRealtimeSession implements LiveModelSession {
     }).then((response) => response.body?.cancel()).catch(() => undefined);
   }
 
-  private async askBrain(): Promise<void> {
+  private async askBrain(turnContext?: string): Promise<void> {
     if (this.closed) return;
     const responseId = randomUUID();
     const generation = this.generation;
@@ -384,7 +396,7 @@ class RivaRealtimeSession implements LiveModelSession {
     this.params.callbacks.onEvent({ type: "response", status: "started", responseId });
     let streamed: StreamedSpeech | undefined;
     try {
-      const request = this.brainRequest(boundedHistory(this.history, MAX_HISTORY));
+      const request = this.brainRequest(boundedHistory(this.history, MAX_HISTORY), turnContext);
       let outcome: { content: string; toolCalls: JsonObject[] };
       if (this.config.brainStreaming === true) {
         streamed = new StreamedSpeech((sentence) => this.speakStreamedSentence(sentence, generation));

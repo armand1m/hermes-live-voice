@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod/v3";
 
 export const MAX_COMPATIBLE_AUDIO_FRAME_BYTES = 5_900_000;
@@ -147,6 +147,8 @@ const EnvSchema = z.object({
   HERMES_LIVE_RIVA_BRAIN_STREAMING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_RIVA_BRAIN_THINKING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_RIVA_BRAIN_PREWARM: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_KNOWLEDGE_INDEX: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_TTS_URL: z.string().url().refine(isSafeHttpLocalUrl, {
     message: "HERMES_LIVE_TTS_URL must be a credential-free local HTTP(S) URL (tts sidecar).",
   }).optional(),
@@ -219,6 +221,15 @@ export interface ContextConfig {
   voiceThreadTitle: string;
   recallSessionTitle: string;
   recallTimeoutMs: number;
+}
+
+export interface KnowledgeConfig {
+  /** Build and use the local index for fast recall (default on). */
+  enabled: boolean;
+  /** Add strong matches as reference context to each voice brain turn (default off). */
+  turnContext: boolean;
+  /** Index file; a derived cache that is safe to delete. */
+  path: string;
 }
 
 export interface VadConfig {
@@ -366,6 +377,8 @@ export interface AppConfig {
   vad: VadConfig;
   filler: FillerConfig;
   context: ContextConfig;
+  /** Local knowledge index (node:sqlite FTS5); absent means disabled. */
+  knowledge?: KnowledgeConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -522,6 +535,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       voiceThreadTitle: parsed.HERMES_LIVE_VOICE_THREAD_TITLE,
       recallSessionTitle: parsed.HERMES_LIVE_RECALL_SESSION_TITLE,
       recallTimeoutMs: parsed.HERMES_LIVE_RECALL_TIMEOUT_MS,
+    },
+    knowledge: {
+      enabled: parsed.HERMES_LIVE_KNOWLEDGE_INDEX === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_KNOWLEDGE_INDEX),
+      turnContext: parsed.HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT),
+      path: join(dirname(parsed.HERMES_LIVE_TASK_STATE_FILE), "knowledge-v1.sqlite"),
     },
   };
 }

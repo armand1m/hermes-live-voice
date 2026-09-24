@@ -26,7 +26,7 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
   {
     name: "search_past_chats",
     description:
-      "Search the user's past Hermes conversations and memory for older context (previous chats, earlier decisions, forgotten details). Slower than answering directly: reserve it for history the current conversation does not contain.",
+      "Search the user's past Hermes conversations, finished tasks, skills, and memory for older context (previous chats, earlier decisions, past results, forgotten details). A fast local index answers first; pass deep: true to search full conversation history when those results do not cover the question. Reserve it for history the current conversation does not contain.",
     parametersJsonSchema: {
       type: "object",
       additionalProperties: false,
@@ -34,6 +34,10 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
         query: {
           type: "string",
           description: "Short search phrase naming what to find, for example 'cats names' or 'server migration decision'.",
+        },
+        deep: {
+          type: "boolean",
+          description: "Skip the fast local index and search full conversation history. Use when a fast search did not answer the question.",
         },
       },
       required: ["query"],
@@ -323,7 +327,7 @@ export const OPENAI_HERMES_LIVE_TOOLS = HERMES_LIVE_TOOL_DEFINITIONS.map((tool) 
 
 const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   continue_hermes_conversation: "Continue the selected saved Hermes chat for one short turn.",
-  search_past_chats: "Search past Hermes chats and memory for older context.",
+  search_past_chats: "Search past chats, finished tasks, skills, and memory; deep: true for full history.",
   remember: "Store a durable user fact in Hermes memory.",
   start_background_task: "Start durable Hermes work while the user keeps talking or disconnects.",
   list_background_tasks: "List active and recent tasks with their exact ids.",
