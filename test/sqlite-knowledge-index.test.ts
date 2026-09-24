@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openSqliteKnowledgeIndex } from "../src/adapters/outbound/knowledge/sqlite-knowledge-index.js";
 import { queryTerms } from "../src/application/knowledge/query-terms.js";
@@ -8,6 +11,7 @@ describe("queryTerms", () => {
       "flaky", "deploy", "tests", "near",
     ]);
     expect(queryTerms("how are you")).toEqual([]);
+    expect(queryTerms("what's my name")).toEqual(["name"]);
   });
 });
 
@@ -57,5 +61,19 @@ describe("SqliteKnowledgeIndex", () => {
     knowledge.retainOnly("skill", new Set(["skill:a"]));
     expect(knowledge.count("skill")).toBe(1);
     knowledge.close();
+  });
+
+  it("creates the index file and its WAL owner-only", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "knowledge-perms-"));
+    try {
+      const path = join(directory, "state", "knowledge-v1.sqlite");
+      const knowledge = await openSqliteKnowledgeIndex(path);
+      knowledge!.upsert([{ id: "task:1", kind: "task", title: "t", body: "b", updatedAt: 1 }]);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(statSync(`${path}-wal`).mode & 0o777).toBe(0o600);
+      knowledge!.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

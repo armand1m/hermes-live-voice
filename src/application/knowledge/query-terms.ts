@@ -8,6 +8,9 @@ const STOPWORDS = new Set([
   "had", "what", "when", "where", "which", "who", "why", "how", "can", "could", "would", "should", "about", "did",
   "does", "from", "into", "they", "them", "their", "there", "then", "than", "just", "like", "please", "tell", "me",
   "my", "our", "any", "some", "all", "out", "get", "got", "let", "its", "it's", "also", "again", "yes", "okay",
+  // Spoken contractions carry no content either.
+  "what's", "that's", "there's", "where's", "who's", "how's", "i'm", "i've", "i'd", "i'll", "you're", "we're",
+  "we've", "don't", "doesn't", "didn't", "can't", "won't", "isn't", "aren't", "wasn't", "let's",
 ]);
 
 /** Spoken question → distinct content terms safe to quote in an FTS5 query. */

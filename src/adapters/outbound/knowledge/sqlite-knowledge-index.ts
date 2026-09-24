@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
   KnowledgeDocument,
@@ -44,7 +44,13 @@ export async function openSqliteKnowledgeIndex(path: string): Promise<SqliteKnow
   } catch {
     return undefined;
   }
-  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    // The index holds task prompts and results: owner-only like the task
+    // store. SQLite gives its -wal/-shm files the main file's permissions.
+    closeSync(openSync(path, "a", 0o600));
+    chmodSync(path, 0o600);
+  }
   const db = new DatabaseSync(path);
   try {
     db.exec(`
