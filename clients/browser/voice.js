@@ -567,9 +567,24 @@ function renderTaskLine() {
     return;
   }
   taskLine.hidden = false;
-  const first = tasks[0];
+  // Lead with work that is actually executing; queued and delegated tasks are
+  // counted separately so a waiting task never reads as running.
+  const first = tasks.find((task) => task.state === "running") || tasks[0];
   const label = first.progress?.message || first.title || first.state;
-  taskLine.textContent = `Running · ${tasks.length > 1 ? `${tasks.length} · ` : ""}${label}`.slice(0, 72);
+  taskLine.textContent = `${taskStateSummary(tasks)} · ${label}`.slice(0, 96);
+}
+
+/** "2 running · 1 queued · 1 delegated · 1 needs review" — never conflates states. */
+function taskStateSummary(tasks) {
+  const count = (states) => tasks.filter((task) => states.includes(task.state)).length;
+  const parts = [
+    [count(["running"]), "running"],
+    [count(["accepted", "queued"]), "queued"],
+    [count(["delegated"]), "delegated"],
+    [count(["stopping"]), "stopping"],
+    [tasks.filter((task) => task.attention?.state === "needs_review").length, "needs review"],
+  ].filter(([number]) => number > 0).map(([number, label]) => `${number} ${label}`);
+  return parts.join(" · ") || `${tasks.length} active`;
 }
 
 /** Compact task-lifecycle row in both transcript views; never disturbs streaming utterances. */
@@ -588,7 +603,7 @@ function addTaskRow(text) {
 function syncStatusDetail() {
   const tasks = client.activeTasks || [];
   if (!tasks.length) return;
-  const count = `${tasks.length} task${tasks.length === 1 ? "" : "s"} running`;
+  const count = `Tasks: ${taskStateSummary(tasks)}`;
   if (audio.microphoneActive) {
     detail.textContent = `Listening · ${count} — keep talking`;
   } else {
