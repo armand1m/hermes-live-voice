@@ -287,6 +287,21 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
       required: ["watch_id"],
     },
   },
+  {
+    name: "resolve_delegated_task",
+    description:
+      "Close one delegated task with the outcome the user confirmed after checking the external agent's work. Monitoring never closes delegated work by itself: use this only when the user explicitly says the delegated work is done (completed) or did not work out (failed). Never infer the outcome from an agent report alone.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        task_id: TASK_ID_SCHEMA,
+        outcome: { type: "string", enum: ["completed", "failed"], description: "The outcome the user confirmed." },
+        summary: { type: "string", description: "One short sentence on the confirmed result, in the user's terms." },
+      },
+      required: ["task_id", "outcome"],
+    },
+  },
 ] as const satisfies ReadonlyArray<{
   name: LiveToolName;
   description: string;
@@ -322,6 +337,7 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   list_external_agents: "Discover herdr agents on one host with pane ids and status.",
   list_external_watches: "Summarize watched external agents and their linked delegated tasks.",
   stop_watching_agent: "Stop observing one external agent by watch id.",
+  resolve_delegated_task: "Close one delegated task as completed or failed, only on the user's explicit confirmation.",
 };
 
 export function selectHermesLiveToolDeclarations(names?: readonly LiveToolName[]) {

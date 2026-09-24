@@ -51,6 +51,8 @@ export interface TaskSupervisorPort {
   stop(ownerId: string, taskId: string, reason?: string): Promise<TaskRecord>;
   /** Enter the delegated phase after a verified external handoff (plan §C). */
   markDelegated(ownerId: string, taskId: string, summary?: string): Promise<TaskRecord>;
+  /** Record the owner-confirmed outcome of a delegated task (explicit disposition). */
+  resolveDelegated?(ownerId: string, taskId: string, outcome: "completed" | "failed", summary: string): Promise<TaskRecord>;
   /** Append a verified external-work observation to a task's progress log. */
   noteExternalObservation(ownerId: string, taskId: string, summary: string): Promise<TaskRecord>;
   /** Move one finished owner task into the durable archive, out of the inbox. */

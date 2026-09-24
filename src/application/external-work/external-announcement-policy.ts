@@ -34,7 +34,11 @@ export function externalAnnouncementFor(event: ExternalMonitorEvent): ExternalAn
     case "state-change": {
       const state = watch.lastObserved?.state;
       const evidence = watch.lastObserved?.excerpt ? ` Last output: ${trimExcerpt(watch.lastObserved.excerpt)}.` : "";
-      const message = stateMessage(state, where) + evidence;
+      // Delegated work only closes on the owner's word: say how, once checked.
+      const closeHint = state === "done" && watch.linkedTaskId
+        ? " Once you've checked it, tell me to close the task."
+        : "";
+      const message = stateMessage(state, where) + evidence + closeHint;
       return {
         watchId: watch.watchId,
         key: `${watch.watchId}:state:${state}:${watch.lastObserved?.stateChangeSeq ?? watch.sequence}`,

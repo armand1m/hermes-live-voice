@@ -21,7 +21,8 @@ export type LiveToolName =
   | "watch_external_agent"
   | "list_external_agents"
   | "list_external_watches"
-  | "stop_watching_agent";
+  | "stop_watching_agent"
+  | "resolve_delegated_task";
 
 export interface LiveModelAudio {
   data: string;

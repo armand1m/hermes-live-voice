@@ -26,7 +26,10 @@ import {
   markTaskStopRequested,
   markTaskNotificationAnnounced,
   noteTaskFreshness,
+  parseTaskRecord,
+  sanitizeTaskError,
   sanitizeTaskEventSummary,
+  sanitizeTaskOutput,
   transitionTask,
   type TaskRecord,
   type TaskStatus,
@@ -431,6 +434,46 @@ export class TaskSupervisor implements TaskSupervisorPort {
       }
       return record;
     });
+  }
+
+  /**
+   * Explicit owner disposition of a delegated task (plan §C). Monitoring never
+   * closes delegated work on its own; after the owner has checked the external
+   * agent's result, this records the outcome they confirmed. The owner just
+   * heard the confirmation, so the terminal notice counts as announced while
+   * staying unread in the inbox.
+   */
+  async resolveDelegated(
+    ownerId: string,
+    taskId: string,
+    outcome: "completed" | "failed",
+    summary: string,
+  ): Promise<TaskRecord> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    const parsedTaskId = TaskIdSchema.parse(taskId);
+    const note = summary.trim() || (outcome === "completed"
+      ? "The owner confirmed the delegated work is done."
+      : "The owner confirmed the delegated work did not succeed.");
+    const record = await this.mutatePersist(parsedTaskId, (current) => {
+      if (current.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
+      if (current.status !== "delegated" || isTaskOperationallyClosed(current)) {
+        throw new Error(`Only a delegated task can be resolved; this task is ${current.status}.`);
+      }
+      const now = this.now();
+      const resolved = transitionTask(current, outcome, {
+        now,
+        summary: sanitizeTaskEventSummary(`Delegated work resolved by its owner: ${outcome}.`),
+        ...(outcome === "completed" ? { output: sanitizeTaskOutput(note) } : { error: sanitizeTaskError(note) }),
+      });
+      // One revision per store write: fold the "already heard" marker into the
+      // terminal transition itself, so no session ever sees the completed
+      // record as an unspoken notice and races to announce it.
+      return parseTaskRecord({ ...resolved, notification: { ...resolved.notification, announcedAt: resolved.updatedAt } });
+    });
+    this.pollSuppressed.delete(record.taskId);
+    this.scheduleDrain();
+    return record;
   }
 
   /**

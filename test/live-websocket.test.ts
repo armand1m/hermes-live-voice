@@ -493,6 +493,20 @@ describe("live gateway WebSocket", () => {
     expect(spoken.some((notice) => notice.announcement?.includes("is working"))).toBe(true);
     expect(spoken.filter((notice) => notice.announcement?.includes("went idle"))).toHaveLength(1);
     expect(spoken.some((notice) => notice.announcement?.includes("percent"))).toBe(false);
+
+    // The owner checked the result and closes the delegated task explicitly.
+    provider.emit({
+      type: "tool_call",
+      call: { id: "resolve_diamond", name: "resolve_delegated_task", args: { task_id: taskId, outcome: "completed", summary: "The diamond renders." } },
+    });
+    provider.emit({ type: "response", status: "started", responseId: "turn_resolve" });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "resolve_diamond")).resolves
+      .toMatchObject({ response: { ok: true, task_id: taskId, spoken_response: expect.stringContaining("closed") } });
+    provider.emit({ type: "response", status: "completed", responseId: "turn_resolve" });
+    await waitForStoredTask(config.tasks.stateFile, taskId, "completed");
+    // No second spoken completion notice for what the user just confirmed.
+    await delay(300);
+    expect(provider.latest.notificationCalls.some((notice) => notice.announcement?.includes("is complete"))).toBe(false);
     await monitor.close();
   }, 15_000);
 

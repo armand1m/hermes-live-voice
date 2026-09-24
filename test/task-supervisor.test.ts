@@ -278,6 +278,37 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("resolves a delegated task only on explicit owner confirmation", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes, maxConcurrent: 1 });
+    await supervisor.initialize();
+    const ownerId = supervisor.registerOwner("alice", "session-a");
+    const first = await supervisor.submit({
+      ownerIdentity: "alice", sessionKey: "session-a", input: "Delegate the diamond fix", resourceKeys: ["repo:diamond"],
+    });
+    await waitFor(async () => (await store.load(first.taskId))?.status === "running");
+    await supervisor.markDelegated(ownerId, first.taskId, "herdr agent launched on exodia (w4:p1).");
+    const other = await supervisor.submit({
+      ownerIdentity: "alice", sessionKey: "session-a", input: "Inspect unrelated repo", resourceKeys: ["repo:other"],
+    });
+
+    // Another owner cannot resolve it, and only delegated tasks resolve.
+    const bobId = supervisor.registerOwner("bob", "session-b");
+    await expect(supervisor.resolveDelegated(bobId, first.taskId, "completed", "")).rejects.toThrow();
+    await expect(supervisor.resolveDelegated(ownerId, other.taskId, "completed", "")).rejects.toThrow(/Only a delegated task/);
+
+    const resolved = await supervisor.resolveDelegated(ownerId, first.taskId, "completed", "The diamond renders on the plot.");
+    expect(resolved.status).toBe("completed");
+    expect(resolved.output).toBe("The diamond renders on the plot.");
+    // The owner just heard the confirmation: no second spoken notice, but the
+    // result stays in the unread inbox.
+    expect(resolved.notification).toMatchObject({ unread: true, announcedAt: expect.any(Number) });
+    // Resolving twice is refused: the task is no longer delegated.
+    await expect(supervisor.resolveDelegated(ownerId, first.taskId, "failed", "")).rejects.toThrow(/Only a delegated task/);
+    await supervisor.close();
+  });
+
   it("persists an immediate queued receipt before dispatch and never persists the session key", async () => {
     const deferred = deferredValue<StartRunResult>();
     const store = new MemoryTaskStore();

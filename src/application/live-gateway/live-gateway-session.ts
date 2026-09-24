@@ -1334,6 +1334,7 @@ export class LiveGatewaySession {
     if (this.protocolVersion >= 9) tools.push("set_client_audio");
     if (this.deps.externalMonitor) {
       tools.push("watch_external_agent", "list_external_agents", "list_external_watches", "stop_watching_agent");
+      if (this.deps.taskSupervisor.resolveDelegated) tools.push("resolve_delegated_task");
     }
     return tools;
   }
@@ -1559,6 +1560,29 @@ export class LiveGatewaySession {
           spoken_response: task.status === "cancelled"
             ? "That task is cancelled; it never started running."
             : "I've asked Hermes to stop that task.",
+          ok: true,
+          task_id: task.taskId,
+          status: projectTaskSnapshot(task).state,
+        }));
+      }
+      case "resolve_delegated_task": {
+        const taskId = stringArg(call, "task_id");
+        const outcome = stringArg(call, "outcome");
+        if (!taskId) throw new Error("resolve_delegated_task requires task_id.");
+        if (outcome !== "completed" && outcome !== "failed") {
+          throw new Error("resolve_delegated_task outcome must be completed or failed.");
+        }
+        const supervisor = this.deps.taskSupervisor;
+        if (!supervisor.resolveDelegated) {
+          return Promise.resolve({ ok: false, error: "Resolving delegated tasks is not available on this gateway." });
+        }
+        return this.runTaskOperation(
+          () => supervisor.resolveDelegated!(this.ownerId!, taskId, outcome, optionalStringArg(call, "summary") ?? ""),
+          "Unable to resolve that delegated task safely.",
+        ).then((task) => ({
+          spoken_response: outcome === "completed"
+            ? `Done — I've closed ${task.title} as completed.`
+            : `Okay — I've closed ${task.title} as failed.`,
           ok: true,
           task_id: task.taskId,
           status: projectTaskSnapshot(task).state,
