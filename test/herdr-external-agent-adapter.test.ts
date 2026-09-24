@@ -124,4 +124,32 @@ describe("HerdrExternalAgentAdapter", () => {
     });
     await expect(adapter.readRecentOutput("exodia", "w4:p1", 10)).resolves.toBe("plain evidence\n");
   });
+
+  it("falls back to the visible screen when scrollback is unavailable on a working agent", async () => {
+    const commands: string[][] = [];
+    const adapter = adapterWith({
+      async run(command) {
+        commands.push([...command]);
+        if (!command.includes("visible")) {
+          // Live error observed 2026-09-24: alternate-screen agents cannot
+          // serve --source recent while working.
+          return {
+            stdout: "",
+            stderr: JSON.stringify({ error: { code: "agent_not_idle", message: "cannot read 80 lines while w4:p1 is working" } }),
+          };
+        }
+        return { stdout: "visible screen evidence\n", stderr: "" };
+      },
+    });
+    await expect(adapter.readRecentOutput("exodia", "w4:p1", 80)).resolves.toBe("visible screen evidence\n");
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toContain("visible");
+    // Unrelated failures still propagate.
+    const strict = adapterWith({
+      async run() {
+        return { stdout: "", stderr: JSON.stringify({ error: { code: "pane_gone", message: "no such pane" } }) };
+      },
+    });
+    await expect(strict.readRecentOutput("exodia", "w4:p1", 80)).rejects.toThrow(/pane_gone/);
+  });
 });

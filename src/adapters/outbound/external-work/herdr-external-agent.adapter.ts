@@ -104,13 +104,24 @@ export class HerdrExternalAgentAdapter implements ExternalAgentPort {
   ): Promise<string> {
     const lines = Math.max(1, Math.min(80, Math.floor(maxLines)));
     const validatedPane = PaneIdSchema.parse(paneId);
-    const stdout = await this.runHerdr(
-      host,
-      ["agent", "read", validatedPane, "--lines", String(lines), "--format", "text"],
-      READ_OUTPUT_BUDGET,
-      options.signal,
-    );
-    return unwrapTextOutput(stdout).slice(-READ_OUTPUT_BUDGET);
+    const args = ["agent", "read", validatedPane, "--lines", String(lines), "--format", "text"];
+    try {
+      const stdout = await this.runHerdr(host, args, READ_OUTPUT_BUDGET, options.signal);
+      return unwrapTextOutput(stdout).slice(-READ_OUTPUT_BUDGET);
+    } catch (error) {
+      // herdr cannot capture scrollback while an agent is working on an
+      // alternate screen (live error code agent_not_idle): the visible screen
+      // is still honest evidence, so fall back to it rather than losing the
+      // excerpt entirely.
+      if (!(error instanceof HerdrExternalAgentError) || !error.message.includes("agent_not_idle")) throw error;
+      const stdout = await this.runHerdr(
+        host,
+        [...args, "--source", "visible"],
+        READ_OUTPUT_BUDGET,
+        options.signal,
+      );
+      return unwrapTextOutput(stdout).slice(-READ_OUTPUT_BUDGET);
+    }
   }
 
   /**
