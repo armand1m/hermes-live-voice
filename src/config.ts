@@ -132,6 +132,9 @@ const EnvSchema = z.object({
   HERMES_LIVE_RIVA_BRAIN_API_KEY: z.string().optional(),
   HERMES_LIVE_RIVA_MINT_API_KEY: z.string().optional(),
   HERMES_LIVE_RIVA_ASR_WORD_BOOST: z.string().default("Hermes,herdr,exodia,Mac mini"),
+  // Riva recommends 20-100 for CTC models (the live Parakeet 1.1b CTC NIM)
+  // and 0.5-2.0 for RNNT/TDT; 0 disables boosting.
+  HERMES_LIVE_RIVA_ASR_WORD_BOOST_SCORE: z.coerce.number().min(0).max(100).default(30),
   HERMES_LIVE_EXTERNAL_WORK_ENABLED: z.string().optional(),
   HERMES_LIVE_PROGRESS_ANNOUNCEMENTS: z.string().optional(),
   HERMES_LIVE_HERDR_EXECUTABLE: z.string().min(1).default("herdr"),
@@ -297,6 +300,7 @@ export interface AppConfig {
   externalWork?: { enabled: boolean; progressAnnouncements: boolean; herdrExecutable: string; msshExecutable: string };
   riva: {
     asrWordBoost?: string[];
+    asrWordBoostScore?: number;
     asrUrl: string;
     ttsUrl: string;
     brainUrl: string;
@@ -420,6 +424,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     riva: {
       asrWordBoost: parsed.HERMES_LIVE_RIVA_ASR_WORD_BOOST.split(",").map((word) => word.trim()).filter(Boolean).slice(0, 100),
+      asrWordBoostScore: parsed.HERMES_LIVE_RIVA_ASR_WORD_BOOST_SCORE,
       asrUrl: parsed.HERMES_LIVE_RIVA_ASR_URL,
       ttsUrl: parsed.HERMES_LIVE_RIVA_TTS_URL,
       brainUrl: parsed.HERMES_LIVE_RIVA_BRAIN_URL,

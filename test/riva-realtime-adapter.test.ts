@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LiveModelEvent } from "../src/application/live-gateway/ports/realtime-model.port.js";
 import type { BrainMessage } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
-import { boundedHistory, mergeTranscriptParts, RivaRealtimeAdapter } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
+import { boundedHistory, mergeTranscriptParts, RivaRealtimeAdapter, wordBoosting } from "../src/adapters/outbound/realtime/riva-realtime.adapter.js";
 
 const mock = vi.hoisted(() => ({ sockets: [] as Array<{ intent: string; sent: Record<string, unknown>[]; emitEvent: (event: object) => void; close: () => void; pings: { count: number } }> }));
 
@@ -341,6 +341,43 @@ describe("boundedHistory", () => {
       .toEqual(["assistant", "tool", "user", "assistant"]);
     // A short history passes through untouched.
     expect(boundedHistory(messages.slice(0, 2), 4)).toEqual(messages.slice(0, 2));
+  });
+});
+
+describe("wordBoosting", () => {
+  it("sends the configured phrases as the single entry the Riva NIM applies", () => {
+    expect(wordBoosting({ asrWordBoost: ["Hermes", "herdr", "exodia", "Mac mini"], asrWordBoostScore: 30 })).toEqual({
+      word_boosting: {
+        enable_word_boosting: true,
+        word_boosting_list: [{ phrases: ["Hermes", "herdr", "exodia", "Mac mini"], boost: 30 }],
+      },
+    });
+  });
+
+  it("is carried in the ASR transcription_session.update on connect", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({ client_secret: null }), { status: 200 }));
+    mock.sockets.length = 0;
+    const session = await new RivaRealtimeAdapter({
+      asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+      ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+      brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+      brainModel: "qwen3.8-27b",
+      voice: "Magpie-Multilingual.EN-US.Jason",
+      wsKeepaliveMs: 0, brainMaxTokens: 2048, brainReasoningEffort: "off", echoGuard: false,
+      asrWordBoost: ["herdr", "exodia"], asrWordBoostScore: 40,
+    }).connect({ sessionId: "boost", systemInstruction: "Help.", availableTools: [], callbacks: { onEvent: () => {} } });
+    const update = mock.sockets[0]!.sent.find((event) => event.type === "transcription_session.update");
+    expect((update?.session as Record<string, unknown>).word_boosting).toEqual({
+      enable_word_boosting: true, word_boosting_list: [{ phrases: ["herdr", "exodia"], boost: 40 }],
+    });
+    await session.close();
+  });
+
+  it("omits the block when there are no phrases or the boost is zero", () => {
+    // The NIM rejects an empty phrase list, so nothing must be sent at all.
+    expect(wordBoosting({ asrWordBoost: [], asrWordBoostScore: 30 })).toEqual({});
+    expect(wordBoosting({ asrWordBoost: ["Hermes"], asrWordBoostScore: 0 })).toEqual({});
+    expect(wordBoosting({})).toEqual({});
   });
 });
 

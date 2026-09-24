@@ -89,6 +89,7 @@ class RivaRealtimeSession implements LiveModelSession {
         input_audio_transcription: { language: "en-US", model },
         input_audio_params: { sample_rate_hz: ASR_RATE, num_channels: 1 },
         recognition_config: { enable_automatic_punctuation: true },
+        ...wordBoosting(this.config),
       },
     });
   }
@@ -530,6 +531,18 @@ async function connectRivaSocket(url: string, sessionEndpoint: string, mintApiKe
     const onClose = (code: number) => { cleanup(); reject(new Error(`Riva WebSocket closed during connect (${code}).`)); };
     ws.once("open", onOpen); ws.once("error", onError); ws.once("close", onClose);
   });
+}
+
+/**
+ * Riva realtime `word_boosting` session block. The NIM applies only the first
+ * list entry and rejects an empty phrase list, so a single entry is sent and
+ * the block is omitted entirely when there is nothing (or zero boost) to send.
+ */
+export function wordBoosting(config: Pick<AppConfig["riva"], "asrWordBoost" | "asrWordBoostScore">): JsonObject {
+  const phrases = config.asrWordBoost ?? [];
+  const boost = config.asrWordBoostScore ?? 0;
+  if (!phrases.length || boost <= 0) return {};
+  return { word_boosting: { enable_word_boosting: true, word_boosting_list: [{ phrases: [...phrases], boost }] } };
 }
 
 function sendJson(ws: WebSocket, event: JsonObject): void {
