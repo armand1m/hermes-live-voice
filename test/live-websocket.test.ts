@@ -2772,6 +2772,37 @@ describe("gateway speech detection", () => {
     await waitUntil(() => provider.latest.audioInputs.length > 0);
   });
 
+  it("covers a whole burst of TTS chunks in the half-duplex drain window", async () => {
+    const config = gatewayVoiceConfig({ halfDuplex: true, turnTailMs: 150 });
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider, speechDetection: energyDetection(config) });
+    const client = await readyClient(server.url, { protocolVersion: 7 });
+
+    // Riva emits one utterance as a burst of 200 ms chunks. Regression: each
+    // chunk used to reset the deadline to now + 200 ms, so the echo window
+    // closed after the LAST chunk's length instead of the utterance's.
+    for (let i = 0; i < 5; i += 1) {
+      provider.emit({
+        type: "audio",
+        audio: { data: Buffer.alloc(2 * 4_800).toString("base64"), mimeType: "audio/pcm;rate=24000" },
+      });
+    }
+    await waitUntil(() => client.messages.observed.filter((message) => message.type === "audio.output").length === 5);
+
+    // 500 ms in, a 1 s utterance is still playing: loud echo must stay gated.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (let i = 0; i < 8; i += 1) send(client.socket, audioInputFrame(0.05, 10 + i));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(provider.latest.audioInputs).toHaveLength(0);
+    expect(client.messages.observed.some((message) => message.type === "input.speech_started")).toBe(false);
+
+    // Past the full 1 s drain + tail, speech opens a turn again.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    for (let i = 0; i < 8; i += 1) send(client.socket, audioInputFrame(0.05, 100 + i));
+    await expect(client.messages.wait("input.speech_started")).resolves.toMatchObject({ type: "input.speech_started" });
+  });
+
   it("keeps protocol v6 sessions on the legacy ungated audio path", async () => {
     const config = gatewayVoiceConfig();
     const hermes = new HermesHarness();

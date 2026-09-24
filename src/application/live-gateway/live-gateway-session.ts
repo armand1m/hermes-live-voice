@@ -3031,11 +3031,14 @@ export class LiveGatewaySession {
     // Playback-drain deadline: providers emit each utterance's frames in one
     // burst long before the browser finishes playing them, so response flags
     // alone under-cover the downlink window that echo suppression must span.
+    // Frames queue back-to-back in the browser, so each frame's duration
+    // extends the deadline from wherever playback already ends — a burst of
+    // 200 ms chunks covers the whole utterance, not just its last chunk.
     const samples = Buffer.from(message.data, "base64").length / 2;
     const rate = requirePcmSampleRate(message.mimeType);
     if (samples > 0 && rate > 0) {
       const drainMs = samples * 1_000 / rate;
-      this.downlinkUntilMs = Math.max(this.downlinkUntilMs, now + drainMs);
+      this.downlinkUntilMs = Math.max(this.downlinkUntilMs, now) + drainMs;
     }
   }
 
