@@ -306,6 +306,16 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
       required: ["task_id", "outcome"],
     },
   },
+  {
+    name: "suggest_work",
+    description:
+      "Suggest what the user could do next, from their own task history: delegated work waiting for confirmation, stalled runs, recent failures nobody followed up, unread results, and requests they keep repeating. Use when the user asks what to work on, what needs attention, or what is pending. Suggestions are only offers: start nothing without the user's explicit go-ahead.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
 ] as const satisfies ReadonlyArray<{
   name: LiveToolName;
   description: string;
@@ -342,6 +352,7 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   list_external_watches: "Summarize watched external agents and their linked delegated tasks.",
   stop_watching_agent: "Stop observing one external agent by watch id.",
   resolve_delegated_task: "Close one delegated task as completed or failed, only on the user's explicit confirmation.",
+  suggest_work: "Suggest next work from task history; start nothing without the user's go-ahead.",
 };
 
 export function selectHermesLiveToolDeclarations(names?: readonly LiveToolName[]) {

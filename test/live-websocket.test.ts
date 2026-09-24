@@ -115,6 +115,7 @@ describe("live gateway WebSocket", () => {
       "remember",
       "archive_background_task",
       "search_past_chats",
+      "suggest_work",
     ]);
   });
 
@@ -627,6 +628,18 @@ describe("live gateway WebSocket", () => {
     const deep = await provider.latest.toolResponses.wait((entry) => entry.call.id === "recall_deep");
     expect(deep.response.source).toBeUndefined();
     expect(searches).toHaveLength(1);
+  });
+
+  it("suggests work from the owner's task history", async () => {
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes, provider });
+    await readyClient(server.url);
+    expect(provider.latest.params.availableTools).toContain("suggest_work");
+    provider.emit({ type: "tool_call", call: { id: "suggest_1", name: "suggest_work", args: {} } });
+    await expect(provider.latest.toolResponses.wait((entry) => entry.call.id === "suggest_1")).resolves.toMatchObject({
+      response: { ok: true, suggestions: [], spoken_response: expect.stringContaining("Nothing is waiting on you") },
+    });
   });
 
   it("never speaks another owner's external watch", async () => {

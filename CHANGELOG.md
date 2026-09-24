@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a local knowledge index for fast recall (`HERMES_LIVE_KNOWLEDGE_INDEX`, default on). It is an SQLite FTS5 file (node:sqlite, Node ≥ 22.5; off automatically elsewhere), created owner-only next to the task state, covering finished tasks, Hermes session titles and previews, the skills catalog, and memory entries. `search_past_chats` answers from strong local matches in about a millisecond and falls back to the full Hermes recall turn on a miss or with `deep: true`. `HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT` (default off) adds strong matches as bounded reference context to each Riva brain turn.
+- Add `suggest_work`, deterministic suggestions from the owner's own history: delegated work an agent reports done, stalled runs, recent failures nobody followed up, unread results, and requests repeated on several days. Suggestions are offers only.
+- Hold a delegated task's explicitly declared resources against conflicting admission; the implicit shared `workspace:default` key never blocks.
+
 - Speak progress on running Hermes tasks (with `HERMES_LIVE_PROGRESS_ANNOUNCEMENTS` on). A task the session saw queued is announced when it starts; a long run reports its latest recorded step at most every four minutes; a run with no new activity is called out once. Template-only, lowest priority behind answers, external updates, and terminal notices.
 - Add `resolve_delegated_task`, so the owner can close a delegated task as completed or failed by voice after checking the external agent's work. Monitoring still never closes delegated work on its own. The confirmed outcome counts as already heard, so it is not re-announced. A linked agent's "reports done" announcement now says how to close the task.
 - Catch a reconnecting voice session up on watched-agent states that changed while no session was connected, once per unspoken update.

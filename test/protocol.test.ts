@@ -362,6 +362,7 @@ describe("protocol v11", () => {
       "list_external_watches",
       "stop_watching_agent",
       "resolve_delegated_task",
+      "suggest_work",
     ]);
     expect(OPENAI_HERMES_LIVE_TOOLS.every((tool) => tool.type === "function")).toBe(true);
     expect(OPENAI_HERMES_LIVE_TOOLS[0]).toHaveProperty("parameters");
@@ -386,6 +387,7 @@ describe("protocol v11", () => {
       "list_external_watches",
       "stop_watching_agent",
       "resolve_delegated_task",
+      "suggest_work",
     ]);
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).toHaveProperty("parametersJsonSchema");
     expect(HERMES_LIVE_TOOL_DECLARATIONS[0]).not.toHaveProperty("parameters");

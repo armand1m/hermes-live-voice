@@ -57,6 +57,7 @@ import {
 import { hasWatchAnnounced, hashWatchOwnerId } from "../../domain/external-work/index.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import { localRecallResult, turnContextBlock } from "../knowledge/recall.js";
+import { suggestWork, workSuggestionsSpokenSummary } from "../knowledge/work-suggester.js";
 import {
   nextTaskProgressAnnouncement,
   startTaskProgressTracking,
@@ -1338,6 +1339,7 @@ export class LiveGatewaySession {
     ) {
       tools.push("search_past_chats");
     }
+    tools.push("suggest_work");
     if (this.protocolVersion >= 6) tools.push("pause_voice_input");
     if (this.protocolVersion >= 9) tools.push("set_client_audio");
     if (this.deps.externalMonitor) {
@@ -1579,6 +1581,25 @@ export class LiveGatewaySession {
           task_id: task.taskId,
           status: projectTaskSnapshot(task).state,
         }));
+      }
+      case "suggest_work": {
+        const monitor = this.deps.externalMonitor;
+        return Promise.all([
+          this.deps.taskSupervisor.list(this.ownerId, 200),
+          monitor ? monitor.listWatches(this.sessionKey).catch(() => []) : Promise.resolve([]),
+        ]).then(([tasks, watches]) => {
+          const suggestions = suggestWork(tasks, watches, Date.now());
+          return {
+            spoken_response: workSuggestionsSpokenSummary(suggestions),
+            ok: true,
+            suggestions: suggestions.map((suggestion) => ({
+              kind: suggestion.kind,
+              task_id: suggestion.taskId,
+              title: suggestion.title,
+              reason: suggestion.reason,
+            })),
+          };
+        });
       }
       case "resolve_delegated_task": {
         const taskId = stringArg(call, "task_id");
