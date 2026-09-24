@@ -144,6 +144,9 @@ const EnvSchema = z.object({
   HERMES_LIVE_RIVA_BRAIN_MAX_TOKENS: z.coerce.number().int().min(128).max(8_192).default(2_048),
   HERMES_LIVE_RIVA_BRAIN_REASONING_EFFORT: z.enum(["off", "minimal", "low", "medium", "high"]).default("low"),
   HERMES_LIVE_RIVA_ECHO_GUARD: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_RIVA_BRAIN_STREAMING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_RIVA_BRAIN_THINKING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_RIVA_BRAIN_PREWARM: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_TTS_URL: z.string().url().refine(isSafeHttpLocalUrl, {
     message: "HERMES_LIVE_TTS_URL must be a credential-free local HTTP(S) URL (tts sidecar).",
   }).optional(),
@@ -314,6 +317,12 @@ export interface AppConfig {
     brainReasoningEffort: "off" | "minimal" | "low" | "medium" | "high";
     /** Drop user turns that match recently spoken assistant text (mic echo). */
     echoGuard: boolean;
+    /** Stream the brain answer and synthesize it sentence by sentence (default off). */
+    brainStreaming?: boolean;
+    /** False sends enable_thinking=false: no reasoning before the answer (default on). */
+    brainThinking?: boolean;
+    /** Prefill the prompt cache once per session so the first turn skips it (default on). */
+    brainPrewarm?: boolean;
   };
   tts: {
     /** Sidecar TTS base URL; unset routes all speech through the provider. */
@@ -437,6 +446,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       brainReasoningEffort: parsed.HERMES_LIVE_RIVA_BRAIN_REASONING_EFFORT,
       echoGuard: parsed.HERMES_LIVE_RIVA_ECHO_GUARD === undefined
         || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_RIVA_ECHO_GUARD),
+      brainStreaming: parsed.HERMES_LIVE_RIVA_BRAIN_STREAMING !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_RIVA_BRAIN_STREAMING),
+      brainThinking: parsed.HERMES_LIVE_RIVA_BRAIN_THINKING === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_RIVA_BRAIN_THINKING),
+      brainPrewarm: parsed.HERMES_LIVE_RIVA_BRAIN_PREWARM === undefined
+        || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_RIVA_BRAIN_PREWARM),
     },
     tts: {
       ...(parsed.HERMES_LIVE_TTS_URL ? { baseUrl: parsed.HERMES_LIVE_TTS_URL } : {}),

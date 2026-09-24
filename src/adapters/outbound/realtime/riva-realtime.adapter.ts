@@ -7,8 +7,9 @@ import type {
   LiveTaskNotification, LiveToolCall,
 } from "../../../application/live-gateway/ports/realtime-model.port.js";
 import { RivaEchoGuard } from "./riva-echo-guard.js";
+import { SentenceChunker, SseJsonDecoder, ThinkStripper, ToolCallAssembler } from "./brain-stream.js";
 import { normalizePcm16Audio } from "../../../domain/audio/pcm.js";
-import { prepareSpokenContent } from "../../../domain/speech/spoken-content.js";
+import { DEFAULT_SPOKEN_MAX_CHARS, prepareSpokenContent } from "../../../domain/speech/spoken-content.js";
 import type { RealtimeResponseTruncation } from "../../../domain/protocol/client-protocol.js";
 
 const ASR_RATE = 16_000;
@@ -40,6 +41,7 @@ export class RivaRealtimeAdapter implements LiveModelAdapter {
     const session = new RivaRealtimeSession(this.config, params, asr.ws, this.connectTimeoutMs);
     session.configureAsr(asr.ws, asr.session);
     params.callbacks.onOpen?.();
+    if (this.config.brainPrewarm === true) session.prewarmBrain();
     return session;
   }
 }
@@ -320,6 +322,58 @@ class RivaRealtimeSession implements LiveModelSession {
     await this.askBrain();
   }
 
+  /**
+   * One brain request shape for turns and the cache prewarm: the system
+   * prompt and tools render first, so both share the same cached prefix.
+   */
+  private brainRequest(history: readonly BrainMessage[]): JsonObject {
+    const messages: BrainMessage[] = [
+      { role: "system", content: this.params.systemInstruction },
+      ...history,
+    ];
+    const tools = selectCompactOpenAIHermesLiveTools(this.params.availableTools).map((tool) => ({
+      type: "function" as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }));
+    const request: JsonObject = {
+      model: this.config.brainModel, messages,
+      max_tokens: this.config.brainMaxTokens, stream: false,
+    };
+    if (this.config.brainThinking === false) {
+      // Qwen-style templates: answer directly, no reasoning phase at all.
+      request.chat_template_kwargs = { enable_thinking: false };
+    } else if (this.config.brainReasoningEffort !== "off") {
+      request.reasoning_effort = this.config.brainReasoningEffort;
+    }
+    if (tools.length) request.tools = tools;
+    return request;
+  }
+
+  /**
+   * Prefill the session's system prompt and tools into the server's prefix
+   * cache while the user is still getting started, so the first real turn
+   * does not pay the full prompt prefill (~1.5 s for ~3.6k tokens live).
+   * Best effort: failures only cost the first turn its warm cache.
+   */
+  prewarmBrain(): void {
+    const request: JsonObject = { ...this.brainRequest([{ role: "user", content: "." }]), max_tokens: 1 };
+    delete request.reasoning_effort;
+    request.chat_template_kwargs = { enable_thinking: false };
+    void fetch(this.config.brainUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(this.config.brainApiKey ? { Authorization: `Bearer ${this.config.brainApiKey}` } : {}),
+      },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),
+    }).then((response) => response.body?.cancel()).catch(() => undefined);
+  }
+
   private async askBrain(): Promise<void> {
     if (this.closed) return;
     const responseId = randomUUID();
@@ -328,26 +382,16 @@ class RivaRealtimeSession implements LiveModelSession {
     this.activeAbort = abort;
     this.activeResponseId = responseId;
     this.params.callbacks.onEvent({ type: "response", status: "started", responseId });
+    let streamed: StreamedSpeech | undefined;
     try {
-      const messages: BrainMessage[] = [
-        { role: "system", content: this.params.systemInstruction },
-        ...boundedHistory(this.history, MAX_HISTORY),
-      ];
-      const tools = selectCompactOpenAIHermesLiveTools(this.params.availableTools).map((tool) => ({
-        type: "function" as const,
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters,
-        },
-      }));
-      const request: JsonObject = {
-        model: this.config.brainModel, messages,
-        max_tokens: this.config.brainMaxTokens, stream: false,
-      };
-      if (this.config.brainReasoningEffort !== "off") request.reasoning_effort = this.config.brainReasoningEffort;
-      if (tools.length) request.tools = tools;
-      let outcome = await this.fetchBrain(request, abort.signal);
+      const request = this.brainRequest(boundedHistory(this.history, MAX_HISTORY));
+      let outcome: { content: string; toolCalls: JsonObject[] };
+      if (this.config.brainStreaming === true) {
+        streamed = new StreamedSpeech((sentence) => this.speakStreamedSentence(sentence, generation));
+        outcome = await this.fetchBrainStream({ ...request, stream: true }, abort.signal, streamed);
+      } else {
+        outcome = await this.fetchBrain(request, abort.signal);
+      }
       // A thinking brain can spend its whole budget reasoning and return empty
       // content (finish_reason "length"): retry once with the effort cap off
       // and a doubled budget before falling back to a spoken recovery line.
@@ -363,6 +407,9 @@ class RivaRealtimeSession implements LiveModelSession {
       const { content, toolCalls } = outcome;
       this.history.push({ role: "assistant", content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
       if (toolCalls.length) {
+        // A streamed preamble ("Let me check.") may already be speaking; it
+        // finishes in order before the tool's own spoken receipt.
+        streamed?.halt();
         for (const tool of toolCalls) {
           const fn = tool.function as JsonObject | undefined;
           if (typeof tool.id !== "string" || typeof fn?.name !== "string") {
@@ -381,11 +428,17 @@ class RivaRealtimeSession implements LiveModelSession {
           this.pendingCalls.set(call.id!, call);
           this.params.callbacks.onEvent({ type: "tool_call", call });
         }
+        await streamed?.finish();
+      } else if (streamed?.started) {
+        const spoken = await streamed.finish();
+        if (this.generation === generation) this.emitSpokenText(spoken);
       } else if (content) {
         await this.speakBrainAnswer(content, generation);
       }
       if (this.generation === generation) this.finish(responseId, "completed");
     } catch (error) {
+      streamed?.halt();
+      await streamed?.finish().catch(() => undefined);
       if (this.generation === generation && !this.closed) {
         this.params.callbacks.onError?.(error);
         this.finish(responseId, "failed");
@@ -393,6 +446,62 @@ class RivaRealtimeSession implements LiveModelSession {
     } finally {
       if (this.activeAbort === abort) this.activeAbort = undefined;
     }
+  }
+
+  /**
+   * Streamed brain call: answer text feeds the sentence pipeline as it
+   * arrives while tool-call fragments assemble; the returned outcome matches
+   * the non-streaming shape (full think-stripped content + tool calls).
+   */
+  private async fetchBrainStream(
+    request: JsonObject,
+    signal: AbortSignal,
+    speech: StreamedSpeech,
+  ): Promise<{ content: string; toolCalls: JsonObject[] }> {
+    const result = await fetch(this.config.brainUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(this.config.brainApiKey ? { Authorization: `Bearer ${this.config.brainApiKey}` } : {}),
+      },
+      body: JSON.stringify(request),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(BRAIN_TIMEOUT_MS)]),
+    });
+    if (!result.ok) throw new Error(`Riva brain returned HTTP ${result.status}.`);
+    if (!result.body) throw new Error("Riva brain returned an empty stream.");
+    const decoder = new SseJsonDecoder();
+    const think = new ThinkStripper();
+    const tools = new ToolCallAssembler();
+    let content = "";
+    const reader = result.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (const event of decoder.push(value)) {
+        const delta = ((event.choices as JsonObject[] | undefined)?.[0]?.delta ?? {}) as JsonObject;
+        if (delta.tool_calls !== undefined) {
+          tools.push(delta.tool_calls);
+          speech.halt();
+        }
+        if (typeof delta.content === "string" && delta.content) {
+          const visible = think.push(delta.content);
+          content += visible;
+          speech.push(visible);
+        }
+      }
+    }
+    const rest = think.flush();
+    content += rest;
+    speech.push(rest);
+    return { content: content.trim(), toolCalls: tools.result() };
+  }
+
+  /** One streamed sentence: transcript delta, echo-guard entry, synthesis. */
+  private async speakStreamedSentence(sentence: string, generation: number): Promise<void> {
+    if (this.closed || this.generation !== generation) return;
+    this.echoGuard?.note(sentence);
+    this.params.callbacks.onEvent({ type: "text", speaker: "assistant", text: `${sentence} `, final: false });
+    await this.synthesize(sentence, generation);
   }
 
   private async fetchBrain(request: JsonObject, signal: AbortSignal): Promise<{ content: string; toolCalls: JsonObject[] }> {
@@ -531,6 +640,73 @@ async function connectRivaSocket(url: string, sessionEndpoint: string, mintApiKe
     const onClose = (code: number) => { cleanup(); reject(new Error(`Riva WebSocket closed during connect (${code}).`)); };
     ws.once("open", onOpen); ws.once("error", onError); ws.once("close", onClose);
   });
+}
+
+/**
+ * Sentence pipeline for a streamed answer: text is chunked at sentence
+ * boundaries, prepared for speech, and synthesized strictly in order while
+ * the brain keeps generating. Each chunk still emits only after complete
+ * synthesis, so inference pauses cannot starve playback mid-word. A spoken
+ * budget mirrors the buffered path's cap.
+ */
+class StreamedSpeech {
+  private readonly chunker = new SentenceChunker();
+  private chain: Promise<void> = Promise.resolve();
+  private failure: unknown;
+  private readonly spoken: string[] = [];
+  private spokenChars = 0;
+  private halted = false;
+  private truncated = false;
+
+  constructor(private readonly speak: (sentence: string) => Promise<void>) {}
+
+  /** True once any sentence has been queued for speech. */
+  get started(): boolean {
+    return this.spoken.length > 0;
+  }
+
+  push(text: string): void {
+    if (this.halted || !text) return;
+    for (const chunk of this.chunker.push(text)) this.enqueue(chunk);
+  }
+
+  /** Stop taking new text (a tool call began or the turn failed). */
+  halt(): void {
+    this.halted = true;
+  }
+
+  /** Speak the remainder (unless halted) and wait for every queued sentence. */
+  async finish(): Promise<string> {
+    if (!this.halted) {
+      const rest = this.chunker.flush();
+      if (rest) this.enqueue(rest);
+    }
+    this.halted = true;
+    await this.chain;
+    if (this.failure !== undefined) throw this.failure;
+    return this.spoken.join(" ");
+  }
+
+  private enqueue(chunk: string): void {
+    if (this.truncated) return;
+    let sentence = prepareSpokenContent(chunk);
+    if (!sentence) return;
+    if (this.spokenChars + sentence.length > DEFAULT_SPOKEN_MAX_CHARS) {
+      sentence = "The rest is on screen.";
+      this.truncated = true;
+      this.halted = true;
+    }
+    this.spokenChars += sentence.length;
+    this.spoken.push(sentence);
+    this.chain = this.chain.then(async () => {
+      if (this.failure !== undefined) return;
+      try {
+        await this.speak(sentence);
+      } catch (error) {
+        this.failure = error;
+      }
+    });
+  }
 }
 
 /**

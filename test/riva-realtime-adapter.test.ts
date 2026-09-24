@@ -571,3 +571,123 @@ describe("Riva brain budget and reasoning", () => {
     await session.close();
   });
 });
+
+describe("Riva streamed brain", () => {
+  const streamConfig = {
+    asrUrl: "ws://127.0.0.1:19000/v1/realtime?intent=transcription",
+    ttsUrl: "ws://127.0.0.1:19001/v1/realtime?intent=synthesize",
+    brainUrl: "http://127.0.0.1:30000/v1/chat/completions",
+    brainModel: "qwen3.8-27b",
+    voice: "Magpie-Multilingual.EN-US.Jason",
+    wsKeepaliveMs: 0,
+    brainMaxTokens: 2_048,
+    brainReasoningEffort: "low" as const,
+    echoGuard: false,
+    brainStreaming: true,
+  };
+
+  /** An SSE body whose deltas arrive as separate reads. */
+  function sseResponse(deltas: object[]): Response {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const delta of deltas) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  function mockBrain(deltas: object[], requests: Array<Record<string, unknown>> = []) {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).endsWith("_sessions")) return new Response(JSON.stringify({ client_secret: null }), { status: 200 });
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return sseResponse(deltas);
+    });
+    return requests;
+  }
+
+  const synthesizedTexts = () => mock.sockets
+    .filter((socket) => socket.intent === "synthesize")
+    .map((socket) => socket.sent.find((event) => event.type === "input_text.append")?.text);
+
+  it("synthesizes each sentence as it streams and finalizes the full transcript", async () => {
+    const requests = mockBrain([
+      { content: "<think>plan</think>The deploy finished on exodia" },
+      { content: " without errors. All the canary checks" },
+      { content: " passed as well." },
+    ]);
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter(streamConfig).connect({
+      sessionId: "s", systemInstruction: "x", availableTools: [], callbacks: { onEvent: (event) => events.push(event) },
+    });
+    await session.sendText("how did the deploy go");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
+
+    expect(requests[0]).toMatchObject({ stream: true });
+    // One synthesis per sentence, in order, reasoning never spoken.
+    expect(synthesizedTexts()).toEqual([
+      "The deploy finished on exodia without errors.",
+      "All the canary checks passed as well.",
+    ]);
+    const assistant = events.filter((event) => event.type === "text" && event.speaker === "assistant");
+    expect(assistant.map((event) => (event as { final?: boolean }).final)).toEqual([false, false, true]);
+    expect(assistant.at(-1)).toMatchObject({
+      text: "The deploy finished on exodia without errors. All the canary checks passed as well.",
+    });
+    // Audio of the first sentence precedes the second sentence's transcript.
+    const firstAudio = events.findIndex((event) => event.type === "audio");
+    const secondSentence = events.findIndex((event) => event.type === "text" && event.text.startsWith("All the canary"));
+    expect(firstAudio).toBeGreaterThan(-1);
+    expect(firstAudio).toBeLessThan(secondSentence);
+    await session.close();
+  });
+
+  it("assembles streamed tool calls and stops speaking the preamble text", async () => {
+    mockBrain([
+      { content: "Let me check your running tasks now. " },
+      { tool_calls: [{ index: 0, id: "call_1", function: { name: "list_background_tasks", arguments: "" } }] },
+      { tool_calls: [{ index: 0, function: { arguments: '{"summary_only":true}' } }] },
+      { content: "This trailing text must not be spoken." },
+    ]);
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter(streamConfig).connect({
+      sessionId: "s", systemInstruction: "x", availableTools: ["list_background_tasks"], callbacks: { onEvent: (event) => events.push(event) },
+    });
+    await session.sendText("check my tasks");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "tool_call")).toBe(true));
+    expect(events.find((event) => event.type === "tool_call")).toMatchObject({
+      call: { id: "call_1", name: "list_background_tasks", args: { summary_only: true } },
+    });
+    await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
+    expect(synthesizedTexts()).toEqual(["Let me check your running tasks now."]);
+    await session.close();
+  });
+
+  it("disables thinking through the chat template when configured off", async () => {
+    const requests = mockBrain([{ content: "Four." }]);
+    const events: LiveModelEvent[] = [];
+    const session = await new RivaRealtimeAdapter({ ...streamConfig, brainThinking: false }).connect({
+      sessionId: "s", systemInstruction: "x", availableTools: [], callbacks: { onEvent: (event) => events.push(event) },
+    });
+    await session.sendText("two plus two");
+    await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
+    expect(requests[0]).toMatchObject({ chat_template_kwargs: { enable_thinking: false } });
+    expect(requests[0]).not.toHaveProperty("reasoning_effort");
+    await session.close();
+  });
+
+  it("prewarms the prompt cache once at connect with a one-token request", async () => {
+    const requests = mockBrain([]);
+    const session = await new RivaRealtimeAdapter({ ...streamConfig, brainPrewarm: true }).connect({
+      sessionId: "s", systemInstruction: "System prompt.", availableTools: ["list_background_tasks"], callbacks: { onEvent: () => {} },
+    });
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({ max_tokens: 1, messages: [{ role: "system", content: "System prompt." }, { role: "user" }] });
+    expect(requests[0]!.tools).toHaveLength(1);
+    await session.close();
+  });
+});

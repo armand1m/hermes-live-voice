@@ -2332,13 +2332,15 @@ export class LiveGatewaySession {
       if (!event.text || event.text.length > MAX_PROVIDER_TRANSCRIPT_CHARS) {
         throw new Error("Realtime provider transcript is empty or exceeds its limit.");
       }
+      // The first assistant text — a streamed sentence or the whole answer —
+      // marks the brain → TTS boundary of the turn timeline.
+      if ((event.speaker ?? "assistant") === "assistant") this.speechTiming.noteAssistantText(Date.now());
       if ((event.speaker ?? "assistant") === "user" && event.final) {
         this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
         this.noteLayaShadowTurn(event.text);
       } else if (event.final && event.speaker !== "system") {
-        if ((event.speaker ?? "assistant") === "assistant") this.speechTiming.noteAssistantText(Date.now());
         this.recordShadowTurn(event.speaker ?? "assistant", event.text);
       }
       this.send({
