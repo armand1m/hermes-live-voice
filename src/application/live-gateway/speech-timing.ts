@@ -68,7 +68,17 @@ export interface SpeechTimingMetrics {
   fillerInjections: number;
   /** Per-stage voice-turn latency over the recent turn window. */
   turnLatency: Record<TurnStage, StagePercentiles>;
+  /** Endpointing: last voiced audio → gate stop, the silence the user waited. */
+  silenceWait: StagePercentiles;
+  /** Gate stops, and how many were followed by speech within 1.5 s (likely cut-offs). */
+  gateStops: number;
+  gateResumes: number;
 }
+
+/** Chunk probability counted as voiced for the silence-wait measurement. */
+const VOICED_PROBABILITY = 0.5;
+/** Speech restarting this soon after a stop means the stop cut the user off. */
+export const RESUME_WINDOW_MS = 1_500;
 
 /**
  * Per-session timing tracker. All inputs are timestamps fed by the session's
@@ -85,6 +95,32 @@ export class SpeechTimingTracker {
     TURN_STAGES.map((stage) => [stage, new NumberRing()]),
   ) as Record<TurnStage, NumberRing>;
   private turn: TurnMarks | null = null;
+  private readonly silenceWait = new NumberRing();
+  private gateSpeaking = false;
+  private lastVoicedAt: number | undefined;
+  private lastGateStopAt: number | undefined;
+  private gateStops = 0;
+  private gateResumes = 0;
+
+  /** One gate frame: its chunk probabilities and decisions (endpointing telemetry). */
+  noteGateFrame(at: number, probabilities: readonly number[], started: boolean, stopped: boolean): void {
+    if (started) {
+      if (this.lastGateStopAt !== undefined && at - this.lastGateStopAt <= RESUME_WINDOW_MS) this.gateResumes += 1;
+      this.gateSpeaking = true;
+      this.lastVoicedAt = undefined;
+    }
+    if (this.gateSpeaking && probabilities.some((probability) => probability >= VOICED_PROBABILITY)) this.lastVoicedAt = at;
+    if (stopped) this.noteGateStopped(at);
+  }
+
+  /** A gate stop reported without a frame (speech expired when frames ceased). */
+  noteGateStopped(at: number): void {
+    if (!this.gateSpeaking) return;
+    this.gateSpeaking = false;
+    this.gateStops += 1;
+    this.lastGateStopAt = at;
+    if (this.lastVoicedAt !== undefined) this.silenceWait.push(at - this.lastVoicedAt);
+  }
 
   /** The gateway gate confirmed the end of user speech: a new voice turn begins. */
   noteSpeechEnded(at: number): void {
@@ -206,6 +242,9 @@ export class SpeechTimingTracker {
         p50Ms: this.turnStages[stage].percentile(0.5),
         p95Ms: this.turnStages[stage].percentile(0.95),
       }])) as Record<TurnStage, StagePercentiles>,
+      silenceWait: { p50Ms: this.silenceWait.percentile(0.5), p95Ms: this.silenceWait.percentile(0.95) },
+      gateStops: this.gateStops,
+      gateResumes: this.gateResumes,
     };
   }
 }

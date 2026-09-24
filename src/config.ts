@@ -204,6 +204,9 @@ const EnvSchema = z.object({
   HERMES_LIVE_VAD_ECHO_START_SUSTAIN_MS: z.coerce.number().int().min(32).max(1_000).default(200),
   HERMES_LIVE_VAD_PREROLL_MS: z.coerce.number().int().min(0).max(1_000).default(250),
   HERMES_LIVE_VAD_TAIL_MS: z.coerce.number().int().min(0).max(2_000).default(400),
+  HERMES_LIVE_VAD_RECORDING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
+  HERMES_LIVE_VAD_RECORDING_MAX_MB: z.coerce.number().int().min(10).max(20_000).default(500),
+  HERMES_LIVE_VAD_RECORDING_RETENTION_DAYS: z.coerce.number().int().min(1).max(90).default(7),
   HERMES_LIVE_HALF_DUPLEX: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_TURN_TAIL_MS: z.coerce.number().int().min(0).max(5_000).default(1_000),
 
@@ -233,6 +236,14 @@ export interface KnowledgeConfig {
   path: string;
   /** After substantial voice sessions, let Hermes update memory/skills from the transcript (default off). */
   reflection?: boolean;
+}
+
+export interface VadRecordingConfig {
+  enabled: boolean;
+  /** Owner-only directory next to the task state. */
+  directory: string;
+  maxTotalBytes: number;
+  retentionMs: number;
 }
 
 export interface VadConfig {
@@ -382,6 +393,8 @@ export interface AppConfig {
   context: ContextConfig;
   /** Local knowledge index (node:sqlite FTS5); absent means disabled. */
   knowledge?: KnowledgeConfig;
+  /** Opt-in local recording of what the speech gate heard, for endpointing tuning. */
+  vadRecording?: VadRecordingConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -538,6 +551,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       voiceThreadTitle: parsed.HERMES_LIVE_VOICE_THREAD_TITLE,
       recallSessionTitle: parsed.HERMES_LIVE_RECALL_SESSION_TITLE,
       recallTimeoutMs: parsed.HERMES_LIVE_RECALL_TIMEOUT_MS,
+    },
+    vadRecording: {
+      enabled: parsed.HERMES_LIVE_VAD_RECORDING !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_VAD_RECORDING),
+      directory: join(dirname(parsed.HERMES_LIVE_TASK_STATE_FILE), "vad-recordings"),
+      maxTotalBytes: parsed.HERMES_LIVE_VAD_RECORDING_MAX_MB * 1024 * 1024,
+      retentionMs: parsed.HERMES_LIVE_VAD_RECORDING_RETENTION_DAYS * 86_400_000,
     },
     knowledge: {
       enabled: parsed.HERMES_LIVE_KNOWLEDGE_INDEX === undefined

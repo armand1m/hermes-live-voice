@@ -7,6 +7,7 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeSessionKey, type AppConfig } from "../src/config.js";
 import type { KnowledgeService } from "../src/application/knowledge/knowledge-service.js";
+import { readVadRecordings } from "../src/adapters/outbound/vad-recording/file-vad-recorder.js";
 import type { Logger } from "../src/logger.js";
 import type { ApprovalChoice } from "../src/domain/protocol/client-protocol.js";
 import type { HermesRunEvent } from "../src/domain/protocol/server-protocol.js";
@@ -3026,6 +3027,40 @@ describe("gateway speech detection", () => {
       type: "input.speech_stopped",
       provider: "gateway",
     });
+  });
+
+  it("records gate inputs for replay and reports endpointing telemetry", async () => {
+    const config = gatewayVoiceConfig();
+    const recordings = join(dirname(config.tasks.stateFile), "vad-recordings");
+    config.vadRecording = { enabled: true, directory: recordings, maxTotalBytes: 50_000_000, retentionMs: 86_400_000 };
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider, speechDetection: energyDetection(config) });
+    const client = await readyClient(server.url, { protocolVersion: 7 });
+
+    for (let i = 0; i < 8; i += 1) send(client.socket, audioInputFrame(0.05, 100 + i));
+    await client.messages.wait("input.speech_started");
+    for (let i = 0; i < 20; i += 1) send(client.socket, audioInputFrame(0.001, 500 + i));
+    await client.messages.wait("input.speech_stopped");
+    provider.emit({ type: "text", speaker: "user", text: "check the deploy", final: true });
+
+    const metrics = await fetch(`${server.url}/v1/metrics`).then((response) => response.json());
+    expect(metrics.gateStops).toBe(1);
+    expect(metrics.gateResumes).toBe(0);
+    expect(metrics.silenceWait.p50Ms).toEqual(expect.any(Number));
+
+    client.socket.close();
+    await waitUntil(() => readVadRecordings(recordings).some((recording) =>
+      recording.events.some((event) => event.type === "user_final")));
+    const [recording] = readVadRecordings(recordings);
+    const frames = recording!.events.filter((event) => event.type === "frame") as Array<{ started?: boolean; stopped?: boolean }>;
+    expect(frames).toHaveLength(28);
+    expect(frames.filter((event) => event.started)).toHaveLength(1);
+    // The stop is either a frame decision or, when frames end before the tail
+    // drains, the gate's expiry timer — both are recorded for replay.
+    const expiries = recording!.events.filter((event) => event.type === "expired").length;
+    expect(frames.filter((event) => event.stopped).length + expiries).toBe(1);
+    expect(recording!.events).toContainEqual(expect.objectContaining({ type: "user_final", text: "check the deploy", fromVoice: true }));
   });
 
   it("suppresses echo turns in half-duplex mode while provider audio drains", async () => {

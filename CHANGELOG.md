@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add an endpointing tuning loop ([docs/vad-tuning.md](docs/vad-tuning.md)). `HERMES_LIVE_VAD_RECORDING` (default off) records what the speech gate heard in each voice session: frames with arrival times, per-chunk probabilities, decisions, echo-window changes, and transcripts. Recordings are local and owner-only, pruned by age and size. `hermes-live vad replay` runs the recordings through the real gate and Silero model on a virtual clock with a grid of stop/tail settings, and ranks them by turns, split turns, silence wait, and clipped speech against the live settings. `GET /v1/metrics` now reports `silenceWait` p50/p95 and `gateStops`/`gateResumes`.
+
 - Add opt-in post-session learning (`HERMES_LIVE_KNOWLEDGE_REFLECTION`, default off). After a voice session with at least four user turns, one quiet Hermes run (not a supervised task: no inbox entry, no announcement) reviews the bounded transcript and updates memory and skills with Hermes' own tools, treating the transcript as data. Voice turns bypass Hermes, so its learning loop otherwise never sees them.
 
 - Add a local knowledge index for fast recall (`HERMES_LIVE_KNOWLEDGE_INDEX`, default on). It is an SQLite FTS5 file (node:sqlite, Node ≥ 22.5; off automatically elsewhere), created owner-only next to the task state, covering finished tasks, Hermes session titles and previews, the skills catalog, and memory entries. `search_past_chats` answers from strong local matches in about a millisecond and falls back to the full Hermes recall turn on a miss or with `deep: true`. `HERMES_LIVE_KNOWLEDGE_TURN_CONTEXT` (default off) adds strong matches as bounded reference context to each Riva brain turn.

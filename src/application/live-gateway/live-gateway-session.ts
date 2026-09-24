@@ -86,7 +86,8 @@ import {
 } from "./tool-call-args.js";
 import type { DelegationHost } from "../../domain/tasks/delegation.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
-import type { SpeechGate } from "./vad/speech-gate.js";
+import type { SpeechGate, SpeechGateObserver } from "./vad/speech-gate.js";
+import type { VadRecorderPort, VadSessionRecording } from "./ports/vad-recorder.port.js";
 import {
   isTaskNotificationState,
   projectSupersededTaskNotification,
@@ -174,6 +175,8 @@ export interface LiveGatewaySessionDeps {
    * keeps the external-agent tools unlisted and the gateway inert.
    */
   externalMonitor?: ExternalAgentMonitor;
+  /** Opt-in recorder of what the speech gate heard (endpointing tuning). */
+  vadRecorder?: VadRecorderPort;
   /** Local knowledge index: fast recall and optional per-turn context. */
   knowledge?: Pick<KnowledgeService, "search" | "forgetTask">;
 }
@@ -252,6 +255,7 @@ export class LiveGatewaySession {
   private readonly taskProgress = new Map<string, { record: TaskRecord; tracking: TaskProgressTracking }>();
   private pendingProgressAnnouncements: TaskProgressAnnouncement[] = [];
   private readonly reflectionTranscript = new ReflectionTranscript();
+  private vadRecording?: VadSessionRecording;
   private taskProgressTimer?: ReturnType<typeof setInterval>;
   private lastExternalAnnouncementAt?: number;
   private sessionStartedAt = Date.now();
@@ -408,6 +412,7 @@ export class LiveGatewaySession {
         ? this.deps.speechDetection.createGate({
           streamThrough: this.deps.config.openai.turnDetection === "semantic_vad",
           onSpeechExpired: () => this.handleConfirmedSpeechStopped(),
+          observer: this.speechGateObserver(),
         }).catch((error: unknown) => {
           this.deps.logger.warn("gateway speech detection unavailable, using client VAD", {
             sessionId: this.id,
@@ -540,6 +545,7 @@ export class LiveGatewaySession {
             }
           },
           onDroppedTurn: (drop) => {
+            this.vadRecording?.note({ type: "echo_dropped", text: drop.text });
             this.deps.logger.info("echo-dropped user turn", {
               sessionId: this.id,
               kind: drop.kind,
@@ -741,6 +747,29 @@ export class LiveGatewaySession {
     this.startSessionReflection();
     this.closePromise = this.performClose();
     return this.closePromise;
+  }
+
+  /**
+   * One observer for the gate: endpointing telemetry always, plus the opt-in
+   * recording of every gate input for offline replay.
+   */
+  private speechGateObserver(): SpeechGateObserver {
+    if (this.deps.config.vadRecording?.enabled) {
+      this.vadRecording = this.deps.vadRecorder?.start(this.id, this.deps.config.vad);
+    }
+    const recording = this.vadRecording?.observer;
+    return {
+      onDownlink: (active, holdMs, at) => recording?.onDownlink?.(active, holdMs, at),
+      onIngest: (record) => {
+        this.speechTiming.noteGateFrame(record.at, record.probabilities, record.started, record.stopped);
+        recording?.onIngest?.(record);
+      },
+      onReset: (at) => recording?.onReset?.(at),
+      onExpired: (at) => {
+        this.speechTiming.noteGateStopped(at);
+        recording?.onExpired?.(at);
+      },
+    };
   }
 
   /**
@@ -2447,6 +2476,7 @@ export class LiveGatewaySession {
       if ((event.speaker ?? "assistant") === "user" && event.final) {
         // Typed turns were recorded at input; only spoken finals add here.
         if (this.lastTurnHadSpeech) this.reflectionTranscript.add("user", event.text);
+        this.vadRecording?.note({ type: "user_final", text: event.text, fromVoice: this.lastTurnHadSpeech });
         this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
@@ -2497,6 +2527,7 @@ export class LiveGatewaySession {
       this.providerResponseActive = true;
       this.stopFiller();
       this.speechTiming.noteResponseStarted(event.scope, Date.now());
+      this.vadRecording?.note({ type: "response_started", ...(event.scope ? { scope: event.scope } : {}) });
       const responseId = publicProviderIdentifier(event.responseId);
       this.send({ type: "response.started", ...(responseId ? { responseId } : {}), ...this.responseScopeField(event.scope), ...this.notificationCorrelation(event.scope, event.notificationId) });
       return;
@@ -3214,6 +3245,7 @@ export class LiveGatewaySession {
 
   private async performClose(): Promise<void> {
     this.playbackDelivery.close();
+    void this.vadRecording?.close();
     this.externalSubscription?.();
     this.externalSubscription = undefined;
     this.deps.externalMonitor?.releaseAnnouncementsFor(this.id);

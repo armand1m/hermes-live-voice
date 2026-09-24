@@ -19,6 +19,7 @@ import {
   type PluginInstallOptions,
 } from "./cli/plugin-installer.js";
 import { applyManagedConfigToProcess } from "./cli/managed-config.js";
+import { runVadCommand, vadCommandHelp } from "./cli/vad-command.js";
 import { runServiceAction, type ServiceAction } from "./cli/service-manager.js";
 import { runSetupCommand } from "./cli/setup.js";
 import { runDoctorCommand } from "./cli/doctor.js";
@@ -92,6 +93,11 @@ async function main(): Promise<void> {
 
   if (command === "tasks") {
     await runOfflineTaskCommand(process.argv.slice(3), loadConfig());
+    return;
+  }
+
+  if (command === "vad") {
+    await runVadCommand(process.argv.slice(3), loadConfig());
     return;
   }
 
@@ -252,6 +258,7 @@ function usesManagedRuntimeConfig(command: string): boolean {
     "provider-smoke",
     "check-live-provider",
     "tasks",
+    "vad",
     "local",
     "print-config",
   ].includes(command);
@@ -266,6 +273,10 @@ function printRequestedCommandHelp(command: string, args: readonly string[]): bo
   }
   if (command === "tasks") {
     console.log(taskCommandHelp());
+    return true;
+  }
+  if (command === "vad") {
+    console.log(vadCommandHelp());
     return true;
   }
 
@@ -377,6 +388,7 @@ Advanced:
   hermes-live serve         Run the gateway in the foreground
   hermes-live client "..."  Submit one prompt and wait for its exact task
   hermes-live tasks --help  Offline task recovery
+  hermes-live vad replay    Tune endpointing from recorded voice sessions
   hermes-live plugin <status|install|path>
 
 Setup manages the normal local Hermes bridge, its private credential, the

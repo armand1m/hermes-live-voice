@@ -19,6 +19,7 @@ import { LiveGatewaySession } from "../../../application/live-gateway/live-gatew
 import { VoiceArbiter } from "../../../application/live-gateway/voice-arbiter.js";
 import { KnowledgeService } from "../../../application/knowledge/knowledge-service.js";
 import { openSqliteKnowledgeIndex } from "../../outbound/knowledge/sqlite-knowledge-index.js";
+import { FileVadRecorder } from "../../outbound/vad-recording/file-vad-recorder.js";
 import { TURN_STAGES, type StagePercentiles, type TurnStage } from "../../../application/live-gateway/speech-timing.js";
 import { TaskSupervisor } from "../../../application/task-supervisor/task-supervisor.js";
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
@@ -261,6 +262,14 @@ export async function startServer({
       logger.info("knowledge index ready", knowledge!.counts());
     }).catch((error: unknown) => logger.warn("knowledge index start failed", { error: errorToMessage(error) }));
   }
+  const vadRecorder = config.vadRecording?.enabled
+    ? new FileVadRecorder({
+      directory: config.vadRecording.directory,
+      maxTotalBytes: config.vadRecording.maxTotalBytes,
+      retentionMs: config.vadRecording.retentionMs,
+    })
+    : undefined;
+  if (vadRecorder) logger.info("vad recording enabled", { directory: config.vadRecording!.directory });
   const sessions = new Set<LiveGatewaySession>();
   // Process/host signals for the browser diagnostics overlay (GET /v1/metrics).
   const metrics = createGatewayMetricsCollector();
@@ -334,6 +343,7 @@ export async function startServer({
         voiceArbiter,
         ...(externalMonitor ? { externalMonitor } : {}),
         ...(knowledge ? { knowledge } : {}),
+        ...(vadRecorder ? { vadRecorder } : {}),
       });
       sessions.add(session);
       ws.once("close", () => {
@@ -773,6 +783,9 @@ async function handleHttp(
     const turnLatency = Object.fromEntries(
       TURN_STAGES.map((stage) => [stage, { p50Ms: null as number | null, p95Ms: null as number | null }]),
     ) as Record<TurnStage, StagePercentiles>;
+    const silenceWait: StagePercentiles = { p50Ms: null, p95Ms: null };
+    let gateStops = 0;
+    let gateResumes = 0;
     for (const session of options.sessions) {
       const audio = session.audioDeliveryMetrics();
       if (audio.lastOutputMsAgo !== null) {
@@ -806,6 +819,10 @@ async function handleHttp(
         if (sampled.p50Ms !== null) worst.p50Ms = Math.max(worst.p50Ms ?? 0, sampled.p50Ms);
         if (sampled.p95Ms !== null) worst.p95Ms = Math.max(worst.p95Ms ?? 0, sampled.p95Ms);
       }
+      if (timing.silenceWait.p50Ms !== null) silenceWait.p50Ms = Math.max(silenceWait.p50Ms ?? 0, timing.silenceWait.p50Ms);
+      if (timing.silenceWait.p95Ms !== null) silenceWait.p95Ms = Math.max(silenceWait.p95Ms ?? 0, timing.silenceWait.p95Ms);
+      gateStops += timing.gateStops;
+      gateResumes += timing.gateResumes;
     }
     json(req, res, 200, {
       ts: Date.now(),
@@ -821,6 +838,11 @@ async function handleHttp(
       announcementDelayP95Ms,
       fillerInjections,
       turnLatency,
+      // Endpointing: silence waited per turn end, and turn ends followed by
+      // speech within 1.5 s (likely cut-offs) — the two numbers VAD tuning moves.
+      silenceWait,
+      gateStops,
+      gateResumes,
       voiceStackCpuPct: processMetrics.voiceStackCpuPct,
       voiceStackPid: processMetrics.voiceStackPid,
       eventLagMs: processMetrics.eventLagMs,
