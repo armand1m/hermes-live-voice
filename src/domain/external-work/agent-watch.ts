@@ -53,8 +53,8 @@ export const WatchIdSchema = z.string().regex(
   /^watch_[0-9a-f]{32}$/u,
   "Watch ID must use the watch_<32 lowercase hex> format.",
 );
-/** herdr pane identifiers look like w4:p1 — tightly patterned, never free text. */
-export const PaneIdSchema = z.string().regex(/^w[0-9a-z]{1,8}:p[0-9]{1,4}$/u, "Pane ID must look like w4:p1.");
+/** herdr pane identifiers look like w4:p1 or wC:p1 — tightly patterned, never free text. */
+export const PaneIdSchema = z.string().regex(/^w[0-9a-zA-Z]{1,8}:p[0-9]{1,4}$/u, "Pane ID must look like w4:p1.");
 export const AgentSessionValueSchema = z.string().min(1).max(256).refine(
   isSafeSingleLine,
   "Agent session identity contains unsafe characters.",
