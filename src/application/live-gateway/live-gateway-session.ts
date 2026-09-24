@@ -29,7 +29,7 @@ import type {
   HermesSessionChatResult,
   HermesSessionSummary,
 } from "./ports/hermes-runs.port.js";
-import type { TaskSupervisorPort } from "./ports/task-supervisor.port.js";
+import type { ArchivedTasksSummary, TaskSupervisorPort } from "./ports/task-supervisor.port.js";
 import {
   type LiveModelEvent,
   type LiveToolCall,
@@ -1282,6 +1282,12 @@ export class LiveGatewaySession {
       "stop_background_task",
       "remember",
     ];
+    // Archive needs no client cooperation: archived tasks simply stop
+    // appearing in later list/snapshot responses, which every protocol
+    // version already handles.
+    if (this.deps.taskSupervisor.archiveTask && this.deps.taskSupervisor.archiveTerminalTasks) {
+      tools.push("archive_background_task");
+    }
     if (this.protocolVersion >= 4 && this.deps.taskSupervisor.followUp) {
       tools.push("follow_up_background_task");
     }
@@ -1527,6 +1533,51 @@ export class LiveGatewaySession {
           ok: true,
           task_id: task.taskId,
           status: projectTaskSnapshot(task).state,
+        }));
+      }
+      case "archive_background_task": {
+        const taskId = optionalStringArg(call, "task_id");
+        const allFinished = booleanArg(call, "all_finished", false);
+        const permanent = booleanArg(call, "delete", false);
+        if (!taskId && !allFinished) throw new Error("archive_background_task requires task_id or all_finished.");
+        if (taskId && allFinished) {
+          throw new Error("archive_background_task accepts either task_id or all_finished, not both.");
+        }
+        if (permanent && allFinished) {
+          return Promise.resolve({
+            ok: false,
+            error: "Bulk permanent deletion is not available. Archive the finished tasks first, then delete single tasks if needed.",
+          });
+        }
+        const supervisor = this.deps.taskSupervisor;
+        if (!supervisor.archiveTask || !supervisor.archiveTerminalTasks || !supervisor.deleteTask) {
+          return Promise.resolve({ ok: false, error: "Task archiving is not available on this gateway." });
+        }
+        if (taskId) {
+          return this.runTaskOperation(
+            () => permanent
+              ? supervisor.deleteTask!(this.ownerId!, taskId)
+              : supervisor.archiveTask!(this.ownerId!, taskId),
+            "Unable to clean up that background task safely.",
+          ).then((task) => ({
+            spoken_response: permanent
+              ? "Done — that task is permanently deleted."
+              : "Done — that task is archived and out of your inbox.",
+            ok: true,
+            task_id: task.taskId,
+            disposition: permanent ? "deleted" : "archived",
+            status: task.status,
+          }));
+        }
+        return this.runTaskOperation(
+          () => supervisor.archiveTerminalTasks!(this.ownerId!),
+          "Unable to clean up the background task inbox safely.",
+        ).then((summary) => ({
+          spoken_response: archiveSweepSpokenSummary(summary),
+          ok: true,
+          archived: summary.archived,
+          task_ids: summary.taskIds,
+          ...(summary.skippedUnread > 0 ? { skipped_unread: summary.skippedUnread } : {}),
         }));
       }
       case "pause_voice_input": {
@@ -3397,6 +3448,27 @@ function taskInboxSpokenSummary(records: readonly TaskRecord[], now = Date.now()
     [count(["unknown", "dispatch_unknown"]), "with an uncertain outcome"],
   ].filter(([number]) => Number(number) > 0).map(([number, state]) => `${number} ${state}`);
   return `Your tasks: ${parts.join(", ")}.`;
+}
+
+function archiveSweepSpokenSummary(summary: ArchivedTasksSummary): string {
+  const parts: string[] = [];
+  if (summary.archived > 0) {
+    parts.push(
+      summary.archived === 1
+        ? "I archived one finished task"
+        : `I archived ${summary.archived} finished tasks`,
+    );
+  } else {
+    parts.push("There are no finished tasks to archive right now");
+  }
+  if (summary.skippedUnread > 0) {
+    parts.push(
+      summary.skippedUnread === 1
+        ? "one finished task still has an unheard announcement, so I left it in the inbox"
+        : `${summary.skippedUnread} finished tasks still have unheard announcements, so I left them in the inbox`,
+    );
+  }
+  return `${parts.join(", and ")}.`;
 }
 
 function publicHermesCapabilities(

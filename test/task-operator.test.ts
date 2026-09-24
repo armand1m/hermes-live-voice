@@ -8,7 +8,7 @@ import {
 } from "../src/adapters/outbound/task-store/file-task-store.js";
 import { runOfflineTaskCommand } from "../src/cli/task-operator.js";
 import { loadConfig } from "../src/config.js";
-import { createTaskRecord, transitionTask } from "../src/domain/tasks/index.js";
+import { acknowledgeTaskNotification, createTaskRecord, transitionTask } from "../src/domain/tasks/index.js";
 
 const cleanup: string[] = [];
 
@@ -198,3 +198,151 @@ describe("offline task containment", () => {
     await expect(runOfflineTaskCommand(["unresolved"], config, () => undefined)).rejects.toBe(closeFailure);
   });
 });
+
+describe("offline task cleanup", () => {
+  it("archives finished tasks, sweeps the rest, and lists the archive", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hermes-live-operator-archive-"));
+    cleanup.push(root);
+    const stateFile = join(root, "tasks-v1.json");
+    const config = loadConfig({ HERMES_LIVE_TASK_STATE_FILE: stateFile });
+    const completed = acknowledgeTaskNotification(
+      finishedTask({ ownerIdentity: "alice", input: "Completed work", now: 10 }, "completed"),
+      20,
+    );
+    const cancelled = acknowledgeTaskNotification(
+      finishedTask({ ownerIdentity: "alice", input: "Cancelled work", now: 30 }, "cancelled"),
+      40,
+    );
+    const unresolved = finishedTask({ ownerIdentity: "alice", input: "Unresolved work", now: 50 }, "unknown");
+    // Deterministic store clock: with the wall clock, the fixed fixture
+    // timestamps read as weeks-stale terminal records and put() retention
+    // prunes them before the CLI ever sees the file.
+    const store = new FileTaskStore({ directory: root, now: () => 1_000 });
+    for (const record of [completed, cancelled, unresolved]) await store.put(record);
+    await store.close();
+
+    const output: string[] = [];
+    await runOfflineTaskCommand(["archive", completed.taskId], config, (value) => output.push(value));
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      object: "hermes_live.task_archived",
+      task: { taskId: completed.taskId, status: "completed" },
+      archiveFile: join(root, "tasks-v1.archive.json"),
+    });
+
+    output.length = 0;
+    await runOfflineTaskCommand(["archive", "--all-finished"], config, (value) => output.push(value));
+    expect(JSON.parse(output[0]!)).toEqual({
+      object: "hermes_live.task_archive_sweep",
+      archived: 1,
+      taskIds: [cancelled.taskId],
+      skippedUnread: 0,
+    });
+
+    output.length = 0;
+    await runOfflineTaskCommand(["archive", "--list"], config, (value) => output.push(value));
+    const listing = JSON.parse(output[0]!);
+    expect(listing).toMatchObject({ object: "hermes_live.archived_tasks", count: 2 });
+    expect(listing.tasks.map((task: { taskId: string }) => task.taskId).sort()).toEqual(
+      [cancelled.taskId, completed.taskId].sort(),
+    );
+
+    const live = JSON.parse(await readFile(stateFile, "utf8"));
+    expect(live.tasks).toHaveLength(1);
+    expect(live.tasks[0]).toMatchObject({ taskId: unresolved.taskId, status: "unknown" });
+    const archive = JSON.parse(await readFile(join(root, "tasks-v1.archive.json"), "utf8"));
+    expect(archive).toMatchObject({ schemaVersion: 1, tasks: expect.any(Array) });
+    expect(archive.tasks.map((task: { taskId: string }) => task.taskId).sort()).toEqual(
+      [cancelled.taskId, completed.taskId].sort(),
+    );
+  });
+
+  it("refuses to archive or delete tasks that are not terminal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hermes-live-operator-refuse-"));
+    cleanup.push(root);
+    const stateFile = join(root, "tasks-v1.json");
+    const config = loadConfig({ HERMES_LIVE_TASK_STATE_FILE: stateFile });
+    const queued = createTaskRecord({ ownerIdentity: "alice", input: "Still queued", now: 1 });
+    const store = new FileTaskStore({ directory: root });
+    await store.put(queued);
+    await store.close();
+
+    await expect(runOfflineTaskCommand(["archive", queued.taskId], config, () => undefined)).rejects.toThrow(
+      /Only terminal tasks can be archived/,
+    );
+    await expect(
+      runOfflineTaskCommand(["delete", queued.taskId, "--confirm-permanent"], config, () => undefined),
+    ).rejects.toThrow(/Only terminal tasks can be deleted/);
+    await expect(runOfflineTaskCommand(["delete", queued.taskId], config, () => undefined)).rejects.toThrow(
+      /--confirm-permanent/,
+    );
+    const live = JSON.parse(await readFile(stateFile, "utf8"));
+    expect(live.tasks).toHaveLength(1);
+  });
+
+  it("restores an archived task and permanently deletes archived copies", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hermes-live-operator-restore-"));
+    cleanup.push(root);
+    const stateFile = join(root, "tasks-v1.json");
+    const config = loadConfig({ HERMES_LIVE_TASK_STATE_FILE: stateFile });
+    const kept = acknowledgeTaskNotification(
+      finishedTask({ ownerIdentity: "alice", input: "Keep me", now: 10 }, "completed"),
+      20,
+    );
+    const erased = acknowledgeTaskNotification(
+      finishedTask({ ownerIdentity: "alice", input: "Erase me", now: 30 }, "failed", { error: "Broken." }),
+      40,
+    );
+    // Deterministic store clock so put() retention cannot prune the fixed
+    // fixture timestamps before the archive writes below.
+    const store = new FileTaskStore({ directory: root, now: () => 1_000 });
+    for (const record of [kept, erased]) await store.put(record);
+    await store.archive(kept.taskId);
+    await store.archive(erased.taskId);
+    await store.close();
+
+    const output: string[] = [];
+    await runOfflineTaskCommand(["restore", kept.taskId], config, (value) => output.push(value));
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      object: "hermes_live.task_restored",
+      task: { taskId: kept.taskId, status: "completed" },
+    });
+    output.length = 0;
+    await runOfflineTaskCommand(["delete", erased.taskId, "--confirm-permanent"], config, (value) => output.push(value));
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      object: "hermes_live.task_deleted",
+      taskId: erased.taskId,
+      deleted: true,
+      deletedFromArchive: true,
+    });
+
+    const live = JSON.parse(await readFile(stateFile, "utf8"));
+    expect(live.tasks.map((task: { taskId: string }) => task.taskId)).toEqual([kept.taskId]);
+    const archive = JSON.parse(await readFile(join(root, "tasks-v1.archive.json"), "utf8"));
+    expect(archive.tasks).toEqual([]);
+
+    // The live-inbox deletion path: a finished task that was never archived.
+    output.length = 0;
+    await runOfflineTaskCommand(["delete", kept.taskId, "--confirm-permanent"], config, (value) => output.push(value));
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      object: "hermes_live.task_deleted",
+      task: { taskId: kept.taskId, status: "completed" },
+      deleted: true,
+    });
+    expect(JSON.parse(await readFile(stateFile, "utf8")).tasks).toEqual([]);
+  });
+});
+
+function finishedTask(
+  input: { ownerIdentity: string; input: string; now: number },
+  status: "completed" | "failed" | "cancelled" | "unknown",
+  options: { output?: string; error?: string } = {},
+) {
+  let record = createTaskRecord(input);
+  record = transitionTask(record, "dispatching", { now: input.now + 1 });
+  record = transitionTask(record, "running", { now: input.now + 2, runId: `run-${input.now}` });
+  return transitionTask(record, status, {
+    now: input.now + 3,
+    ...(options.output !== undefined ? { output: options.output } : {}),
+    ...(options.error !== undefined ? { error: options.error } : {}),
+  });
+}

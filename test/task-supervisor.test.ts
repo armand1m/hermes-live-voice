@@ -9,6 +9,8 @@ import type {
   StartRunResult,
 } from "../src/application/live-gateway/ports/hermes-runs.port.js";
 import type {
+  TaskArchiveTerminalOptions,
+  TaskArchiveTerminalResult,
   TaskListOptions,
   TaskPruneOptions,
   TaskPruneResult,
@@ -29,6 +31,7 @@ import {
   containIndeterminateTask,
   createTaskRecord,
   hashTaskOwnerId,
+  isTaskTerminal,
   markTaskStopRequested,
   parseTaskRecord,
   transitionTask,
@@ -1430,6 +1433,89 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("archives or deletes finished owner tasks and refuses unfinished or foreign work", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes });
+    await supervisor.initialize();
+    const ownerId = supervisor.registerOwner("alice", "session-a");
+
+    const archived = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "Summarize the logs" });
+    await waitFor(() => hermes.startCalls.length === 1);
+    const archivedRunId = (await store.load(archived.taskId))?.runId!;
+    hermes.pushEvent(archivedRunId, { event: "run.completed", run_id: archivedRunId, output: "Summary." });
+    await waitFor(async () => (await store.load(archived.taskId))?.status === "completed");
+    await supervisor.acknowledgeNotification(ownerId, archived.taskId);
+
+    await expect(supervisor.archiveTask(ownerId, archived.taskId)).resolves.toMatchObject({
+      taskId: archived.taskId,
+      status: "completed",
+    });
+    await expect(supervisor.get(ownerId, archived.taskId)).resolves.toBeUndefined();
+    await expect(supervisor.listUnreadNotifications(ownerId)).resolves.toEqual([]);
+
+    const deleted = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "Draft the memo" });
+    await waitFor(() => hermes.startCalls.length === 2);
+    const deletedRunId = (await store.load(deleted.taskId))?.runId!;
+    hermes.pushEvent(deletedRunId, { event: "run.completed", run_id: deletedRunId, output: "Memo." });
+    await waitFor(async () => (await store.load(deleted.taskId))?.status === "completed");
+    await expect(supervisor.deleteTask(ownerId, deleted.taskId)).resolves.toMatchObject({
+      taskId: deleted.taskId,
+      status: "completed",
+    });
+    await expect(supervisor.get(ownerId, deleted.taskId)).resolves.toBeUndefined();
+
+    const running = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "Long work" });
+    await waitFor(() => hermes.startCalls.length === 3);
+    await waitFor(async () => (await store.load(running.taskId))?.status === "running");
+    await expect(supervisor.archiveTask(ownerId, running.taskId)).rejects.toThrow(/Only finished tasks/);
+    await expect(supervisor.deleteTask(ownerId, running.taskId)).rejects.toThrow(/Only finished tasks/);
+    await expect(supervisor.archiveTask(ownerId, "task_00000000000000000000000000000000")).rejects.toThrow(TaskNotFoundError);
+    await expect(supervisor.archiveTask(hashTaskOwnerId("bob"), running.taskId)).rejects.toThrow(TaskNotFoundError);
+    await expect(supervisor.list(ownerId)).resolves.toMatchObject([{ taskId: running.taskId }]);
+
+    await supervisor.close();
+  });
+
+  it("sweeps finished owner tasks while keeping unread notifications and running work", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes });
+    await supervisor.initialize();
+    const ownerId = supervisor.registerOwner("alice", "session-a");
+
+    const read = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "First check" });
+    await waitFor(() => hermes.startCalls.length === 1);
+    const readRunId = (await store.load(read.taskId))?.runId!;
+    hermes.pushEvent(readRunId, { event: "run.completed", run_id: readRunId, output: "First done." });
+    await waitFor(async () => (await store.load(read.taskId))?.status === "completed");
+    await supervisor.acknowledgeNotification(ownerId, read.taskId);
+
+    const unread = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "Second check" });
+    await waitFor(() => hermes.startCalls.length === 2);
+    const unreadRunId = (await store.load(unread.taskId))?.runId!;
+    hermes.pushEvent(unreadRunId, { event: "run.completed", run_id: unreadRunId, output: "Second done." });
+    await waitFor(async () => (await store.load(unread.taskId))?.status === "completed");
+
+    const running = await supervisor.submit({ ownerIdentity: "alice", sessionKey: "session-a", input: "Third check" });
+    await waitFor(() => hermes.startCalls.length === 3);
+    await waitFor(async () => (await store.load(running.taskId))?.status === "running");
+
+    await expect(supervisor.archiveTerminalTasks(ownerId)).resolves.toEqual({
+      archived: 1,
+      taskIds: [read.taskId],
+      skippedUnread: 1,
+    });
+    await expect(supervisor.list(ownerId)).resolves.toMatchObject([
+      { taskId: running.taskId, status: "running" },
+      { taskId: unread.taskId, status: "completed" },
+    ]);
+    await expect(supervisor.listUnreadNotifications(ownerId)).resolves.toMatchObject([{ taskId: unread.taskId }]);
+    await expect(supervisor.get(ownerId, read.taskId)).resolves.toBeUndefined();
+
+    await supervisor.close();
+  });
+
   it("waits for an in-flight dispatch abort to persist its ambiguous outcome before close returns", async () => {
     const store = new MemoryTaskStore();
     const hermes = new HermesHarness();
@@ -1451,6 +1537,7 @@ describe("TaskSupervisor", () => {
 
 class MemoryTaskStore implements TaskStorePort {
   private readonly records = new Map<string, TaskRecord>();
+  private readonly archivedRecords = new Map<string, TaskRecord>();
   readonly writes: TaskRecord[] = [];
 
   async load(taskId: string): Promise<TaskRecord | undefined> {
@@ -1502,11 +1589,66 @@ class MemoryTaskStore implements TaskStorePort {
   }
 
   async delete(taskId: string): Promise<boolean> {
+    const record = this.records.get(taskId);
+    if (!record) return false;
+    if (!isTaskTerminal(record.status)) {
+      throw Object.assign(
+        new Error(`Only terminal tasks can be deleted: ${taskId} is ${record.status}.`),
+        { name: "TaskStoreConflictError" },
+      );
+    }
     return this.records.delete(taskId);
   }
 
   async prune(_options?: TaskPruneOptions): Promise<TaskPruneResult> {
     return { deleted: 0, taskIds: [] };
+  }
+
+  async archive(taskId: string): Promise<TaskRecord | undefined> {
+    const record = this.records.get(taskId);
+    if (!record) return undefined;
+    if (!isTaskTerminal(record.status)) {
+      throw Object.assign(
+        new Error(`Only terminal tasks can be archived: ${taskId} is ${record.status}.`),
+        { name: "TaskStoreConflictError" },
+      );
+    }
+    this.archivedRecords.set(taskId, clone(record)!);
+    this.records.delete(taskId);
+    return clone(record)!;
+  }
+
+  async archiveTerminal(options: TaskArchiveTerminalOptions = {}): Promise<TaskArchiveTerminalResult> {
+    const finished = [...this.records.values()]
+      .filter((record) => isTaskTerminal(record.status))
+      .filter((record) => !options.ownerId || record.ownerId === options.ownerId)
+      .sort((left, right) => left.updatedAt - right.updatedAt || left.taskId.localeCompare(right.taskId));
+    const eligible = finished.filter((record) => !record.notification.unread);
+    for (const record of eligible) {
+      this.archivedRecords.set(record.taskId, clone(record)!);
+      this.records.delete(record.taskId);
+    }
+    return {
+      archived: eligible.length,
+      taskIds: eligible.map((record) => record.taskId),
+      skippedUnread: finished.length - eligible.length,
+    };
+  }
+
+  async restore(taskId: string): Promise<TaskRecord | undefined> {
+    const record = this.archivedRecords.get(taskId);
+    if (!record) return undefined;
+    this.archivedRecords.delete(taskId);
+    if (!this.records.has(taskId)) this.records.set(taskId, clone(record)!);
+    return clone(record)!;
+  }
+
+  async deleteArchived(taskId: string): Promise<boolean> {
+    return this.archivedRecords.delete(taskId);
+  }
+
+  async listArchived(): Promise<TaskRecord[]> {
+    return [...this.archivedRecords.values()].map((record) => clone(record)!);
   }
 
   peek(taskId: string): TaskRecord | undefined {

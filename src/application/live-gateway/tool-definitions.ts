@@ -149,6 +149,28 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "archive_background_task",
+    description:
+      "Clear finished background tasks out of the inbox once the user knows their outcome. Only completed, failed, or cancelled tasks are eligible; queued or running work is never touched. Archiving (the default) moves the task to the private archive file and it disappears from lists; it stays recoverable offline by an operator. Use it when the user asks to clean up, clear, or tidy the task list, or after summarizing results they do not need anymore.",
+    parametersJsonSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        task_id: TASK_ID_SCHEMA,
+        all_finished: {
+          type: "boolean",
+          description:
+            "Archive every finished task in this inbox instead of one. Tasks whose outcome has not been announced yet are kept and reported as skipped.",
+        },
+        delete: {
+          type: "boolean",
+          description:
+            "Permanently erase the one named task instead of archiving it. Irreversible; requires clear user intent, and is never available together with all_finished.",
+        },
+      },
+    },
+  },
+  {
     name: "pause_voice_input",
     description:
       "Pause microphone listening only when the user explicitly asks to pause, mute, or stop listening. This keeps Live Voice connected and leaves every background task running; the user resumes from the client control.",
@@ -293,6 +315,7 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   get_background_task: "Get one task's exact status or retained result.",
   follow_up_background_task: "Start new durable work from one finished task.",
   stop_background_task: "Request cancellation of one exact task.",
+  archive_background_task: "Archive or permanently delete finished tasks to clear the inbox.",
   pause_voice_input: "Pause microphone input without stopping tasks or disconnecting.",
   set_client_audio: "Resume or pause the mic, or change interface sound effects, on explicit request.",
   watch_external_agent: "Watch one external herdr agent by host and pane; observation only.",

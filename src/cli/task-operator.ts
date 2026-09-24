@@ -90,6 +90,84 @@ export async function runOfflineTaskCommand(
       return;
     }
 
+    if (command === "archive") {
+      if (args.length === 2 && args[1] === "--list") {
+        const archived = await store.listArchived();
+        write(JSON.stringify({
+          object: "hermes_live.archived_tasks",
+          count: archived.length,
+          tasks: archived.map(operatorTaskSummary),
+        }, null, 2));
+        return;
+      }
+      if (args.length === 2 && args[1] === "--all-finished") {
+        const result = await store.archiveTerminal();
+        write(JSON.stringify({
+          object: "hermes_live.task_archive_sweep",
+          ...result,
+        }, null, 2));
+        return;
+      }
+      if (args.length !== 2 || args[1] === undefined) {
+        throw new Error(
+          "Usage: hermes-live tasks archive <taskId> | --all-finished | --list. " +
+          "Only completed, failed, and cancelled tasks can be archived.",
+        );
+      }
+      const taskId = TaskIdSchema.parse(args[1]);
+      const archived = await store.archive(taskId);
+      if (!archived) throw new Error(`Task not found: ${taskId}`);
+      write(JSON.stringify({
+        object: "hermes_live.task_archived",
+        task: operatorTaskSummary(archived),
+        archiveFile: store.archiveFilePath,
+      }, null, 2));
+      return;
+    }
+
+    if (command === "restore") {
+      if (args.length !== 2 || args[1] === undefined) {
+        throw new Error("Usage: hermes-live tasks restore <taskId>. Moves an archived task back into the live inbox.");
+      }
+      const taskId = TaskIdSchema.parse(args[1]);
+      const restored = await store.restore(taskId);
+      if (!restored) throw new Error(`Archived task not found: ${taskId}`);
+      write(JSON.stringify({
+        object: "hermes_live.task_restored",
+        task: operatorTaskSummary(restored),
+      }, null, 2));
+      return;
+    }
+
+    if (command === "delete") {
+      if (args.length !== 3 || args[2] !== "--confirm-permanent") {
+        throw new Error(
+          "Usage: hermes-live tasks delete <taskId> --confirm-permanent. " +
+          "Deletion is irreversible; prefer archive, which keeps a recoverable copy.",
+        );
+      }
+      const taskId = TaskIdSchema.parse(args[1]!);
+      const current = await store.load(taskId);
+      if (current) {
+        await store.delete(taskId);
+        write(JSON.stringify({
+          object: "hermes_live.task_deleted",
+          task: operatorTaskSummary(current),
+          deleted: true,
+        }, null, 2));
+        return;
+      }
+      const deletedFromArchive = await store.deleteArchived(taskId);
+      if (!deletedFromArchive) throw new Error(`Task not found: ${taskId}`);
+      write(JSON.stringify({
+        object: "hermes_live.task_deleted",
+        taskId,
+        deleted: true,
+        deletedFromArchive: true,
+      }, null, 2));
+      return;
+    }
+
     throw new Error(`Unknown tasks command: ${command}\n${taskCommandHelp()}`);
   } catch (error) {
     commandFailed = true;
@@ -122,10 +200,20 @@ export function taskCommandHelp(): string {
     "  hermes-live tasks contain <taskId> --confirm-contained",
     "  hermes-live tasks unlock --confirm-no-gateway",
     "",
+    "Inbox cleanup (finished tasks only: completed, failed, cancelled):",
+    "  hermes-live tasks archive <taskId>          Move one finished task to the archive file",
+    "  hermes-live tasks archive --all-finished    Archive every finished task (unread notices kept)",
+    "  hermes-live tasks archive --list            Show archived records",
+    "  hermes-live tasks restore <taskId>          Move an archived task back into the inbox",
+    "  hermes-live tasks delete <taskId> --confirm-permanent   Irreversibly remove one task",
+    "",
     "Stop Hermes Live first. Contain a task only after you have audited or stopped",
     "any Hermes work that may still be running. Containment preserves the unknown",
     "outcome and adds an audit event; it never retries the task. Unlock only",
     "clears a crash-left lock and refuses to clear a live same-host process.",
+    "Archive moves finished records verbatim into <state>.archive.json; they",
+    "disappear from the gateway inbox but stay recoverable. The state file",
+    "location follows HERMES_LIVE_TASK_STATE_FILE.",
   ].join("\n");
 }
 

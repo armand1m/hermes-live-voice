@@ -29,6 +29,13 @@ export interface TaskNotificationAnnouncementClaim {
   task: TaskRecord;
 }
 
+export interface ArchivedTasksSummary {
+  archived: number;
+  taskIds: string[];
+  /** Finished tasks kept because their terminal notification is still unread. */
+  skippedUnread: number;
+}
+
 /** Voice-facing surface of the server-owned runtime. */
 export interface TaskSupervisorPort {
   registerOwner(ownerIdentity: string, sessionKey: string): string;
@@ -46,6 +53,12 @@ export interface TaskSupervisorPort {
   markDelegated(ownerId: string, taskId: string, summary?: string): Promise<TaskRecord>;
   /** Append a verified external-work observation to a task's progress log. */
   noteExternalObservation(ownerId: string, taskId: string, summary: string): Promise<TaskRecord>;
+  /** Move one finished owner task into the durable archive, out of the inbox. */
+  archiveTask?(ownerId: string, taskId: string): Promise<TaskRecord>;
+  /** Archive every finished owner task whose terminal notice is not unread. */
+  archiveTerminalTasks?(ownerId: string): Promise<ArchivedTasksSummary>;
+  /** Permanently remove one finished owner task without keeping an archived copy. */
+  deleteTask?(ownerId: string, taskId: string): Promise<TaskRecord>;
   acknowledgeNotification(ownerId: string, taskId: string): Promise<TaskRecord>;
   markNotificationAnnounced(ownerId: string, taskId: string): Promise<TaskRecord>;
   claimNotificationAnnouncement(

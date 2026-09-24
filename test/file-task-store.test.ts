@@ -20,6 +20,7 @@ import {
   MAX_TASK_OUTPUT_CHARS,
   markTaskStopRequested,
   transitionTask,
+  type TaskRecord,
 } from "../src/domain/tasks/index.js";
 
 const cleanupPaths: string[] = [];
@@ -663,14 +664,168 @@ describe("FileTaskStore", () => {
     expect(await readFile(target, "utf8")).toContain("\"tasks\":[]");
   });
 
-  it("deletes exact records and leaves missing deletes idempotent", async () => {
+  it("deletes exact terminal records and leaves missing deletes idempotent", async () => {
     const { directory } = await temporaryStoreDirectory();
     const store = new FileTaskStore({ directory });
-    const task = createTaskRecord({ ownerIdentity: "alice", input: "Temporary", now: 1 });
+    const task = transitionTask(
+      createTaskRecord({ ownerIdentity: "alice", input: "Temporary", now: 1 }),
+      "cancelled",
+      { now: 2 },
+    );
     await store.put(task);
     await expect(store.delete(task.taskId)).resolves.toBe(true);
     await expect(store.delete(task.taskId)).resolves.toBe(false);
     await expect(store.load(task.taskId)).resolves.toBeUndefined();
+  });
+
+  it("refuses to delete records that are not terminal", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory });
+    const queued = createTaskRecord({ ownerIdentity: "alice", input: "Queued", now: 1 });
+    await store.put(queued);
+    await expect(store.delete(queued.taskId)).rejects.toThrow(TaskStoreConflictError);
+
+    const unknown = finishedRecord({ ownerIdentity: "alice", input: "Uncertain", now: 10 }, "unknown");
+    await store.put(unknown);
+    await expect(store.delete(unknown.taskId)).rejects.toThrow(/Only terminal tasks can be deleted/);
+    await expect(store.load(queued.taskId)).resolves.toMatchObject({ status: "queued" });
+    await expect(store.load(unknown.taskId)).resolves.toMatchObject({ status: "unknown" });
+    await store.close();
+  });
+
+  it("moves a terminal record verbatim into the archive file and out of the live document", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory, now: () => 500 });
+    const completed = acknowledgeTaskNotification(
+      finishedRecord({ ownerIdentity: "alice", input: "Ship the release", now: 10 }, "completed", { output: "Shipped." }),
+      20,
+    );
+    await store.put(completed);
+
+    await expect(store.archive(completed.taskId)).resolves.toEqual(completed);
+    await expect(store.load(completed.taskId)).resolves.toBeUndefined();
+    await expect(store.list()).resolves.toEqual([]);
+    const rawArchive = JSON.parse(await readFile(store.archiveFilePath, "utf8"));
+    expect(rawArchive).toMatchObject({
+      schemaVersion: 1,
+      updatedAt: 500,
+      tasks: [{ taskId: completed.taskId, status: "completed", output: "Shipped." }],
+    });
+    if (platform() !== "win32") {
+      expect((await stat(store.archiveFilePath)).mode & 0o777).toBe(0o600);
+    }
+    expect((await readdir(directory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+
+    await store.close();
+    const reloaded = new FileTaskStore({ directory });
+    await expect(reloaded.load(completed.taskId)).resolves.toBeUndefined();
+    await expect(reloaded.listArchived()).resolves.toEqual([completed]);
+    await reloaded.close();
+  });
+
+  it("refuses to archive records that are not terminal", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory });
+    const task = createTaskRecord({ ownerIdentity: "alice", input: "Queued", now: 1 });
+    await store.put(task);
+
+    await expect(store.archive(task.taskId)).rejects.toThrow(/Only terminal tasks can be archived/);
+    await expect(store.archive("task_00000000000000000000000000000000")).resolves.toBeUndefined();
+    await expect(store.load(task.taskId)).resolves.toEqual(task);
+    await expect(store.archiveFilePath).toBe(join(directory, "tasks-v1.archive.json"));
+    await store.close();
+  });
+
+  it("sweeps finished records while keeping unread notifications in the inbox", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory, now: () => 1_000 });
+    const readCompleted = acknowledgeTaskNotification(
+      finishedRecord({ ownerIdentity: "alice", input: "Read completed", now: 10 }, "completed", { output: "Done." }),
+      20,
+    );
+    const unreadFailed = finishedRecord({ ownerIdentity: "alice", input: "Unread failed", now: 30 }, "failed", { error: "Broken." });
+    const otherOwnerCancelled = acknowledgeTaskNotification(
+      finishedRecord({ ownerIdentity: "bob", input: "Other owner", now: 50 }, "cancelled"),
+      60,
+    );
+    const unresolved = finishedRecord({ ownerIdentity: "alice", input: "Still unresolved", now: 70 }, "unknown");
+    for (const record of [readCompleted, unreadFailed, otherOwnerCancelled, unresolved]) {
+      await store.put(record);
+    }
+
+    await expect(store.archiveTerminal({ ownerId: readCompleted.ownerId })).resolves.toEqual({
+      archived: 1,
+      taskIds: [readCompleted.taskId],
+      skippedUnread: 1,
+    });
+    await expect(store.list()).resolves.toMatchObject([
+      { taskId: unresolved.taskId, status: "unknown" },
+      { taskId: otherOwnerCancelled.taskId, status: "cancelled" },
+      { taskId: unreadFailed.taskId, status: "failed" },
+    ]);
+    await expect(store.listArchived()).resolves.toEqual([readCompleted]);
+
+    await expect(store.archiveTerminal()).resolves.toMatchObject({
+      archived: 1,
+      taskIds: [otherOwnerCancelled.taskId],
+      skippedUnread: 1,
+    });
+    await expect(store.list()).resolves.toMatchObject([
+      { taskId: unresolved.taskId },
+      { taskId: unreadFailed.taskId },
+    ]);
+    await store.close();
+  });
+
+  it("restores an archived record back into the live document", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory, now: () => 1_000 });
+    const completed = acknowledgeTaskNotification(
+      finishedRecord({ ownerIdentity: "alice", input: "Restore me", now: 10 }, "completed", { output: "Done." }),
+      20,
+    );
+    await store.put(completed);
+    await store.archive(completed.taskId);
+
+    await expect(store.restore(completed.taskId)).resolves.toEqual(completed);
+    await expect(store.load(completed.taskId)).resolves.toEqual(completed);
+    await expect(store.listArchived()).resolves.toEqual([]);
+    await expect(JSON.parse(await readFile(store.archiveFilePath, "utf8")).tasks).toEqual([]);
+    await expect(store.restore(completed.taskId)).resolves.toBeUndefined();
+    await store.close();
+  });
+
+  it("permanently removes archived records on request", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    const store = new FileTaskStore({ directory });
+    const completed = acknowledgeTaskNotification(
+      finishedRecord({ ownerIdentity: "alice", input: "Erase me", now: 10 }, "completed"),
+      20,
+    );
+    await store.put(completed);
+    await store.archive(completed.taskId);
+
+    await expect(store.deleteArchived(completed.taskId)).resolves.toBe(true);
+    await expect(store.deleteArchived(completed.taskId)).resolves.toBe(false);
+    await expect(store.listArchived()).resolves.toEqual([]);
+    await expect(store.restore(completed.taskId)).resolves.toBeUndefined();
+    await store.close();
+  });
+
+  it("refuses to reset a corrupted archive document", async () => {
+    const { directory } = await temporaryStoreDirectory();
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await writeFile(join(directory, "tasks-v1.json"), JSON.stringify({
+      schemaVersion: 1,
+      updatedAt: 0,
+      tasks: [],
+    }), { mode: 0o600 });
+    await writeFile(join(directory, "tasks-v1.archive.json"), "{not json", { mode: 0o600 });
+
+    const store = new FileTaskStore({ directory });
+    await expect(store.listArchived()).rejects.toThrow(TaskStoreCorruptionError);
+    await expect(store.archiveTerminal()).rejects.toThrow(TaskStoreCorruptionError);
+    await store.close();
   });
 });
 
@@ -678,4 +833,19 @@ async function temporaryStoreDirectory(): Promise<{ root: string; directory: str
   const root = await mkdtemp(join(tmpdir(), "hermes-live-task-store-"));
   cleanupPaths.push(root);
   return { root, directory: join(root, "state") };
+}
+
+function finishedRecord(
+  input: { ownerIdentity: string; input: string; now: number },
+  status: "completed" | "failed" | "cancelled" | "unknown",
+  options: { output?: string; error?: string } = {},
+): TaskRecord {
+  let record = createTaskRecord(input);
+  record = transitionTask(record, "dispatching", { now: input.now + 1 });
+  record = transitionTask(record, "running", { now: input.now + 2, runId: `run-${input.now}` });
+  return transitionTask(record, status, {
+    now: input.now + 3,
+    ...(options.output !== undefined ? { output: options.output } : {}),
+    ...(options.error !== undefined ? { error: options.error } : {}),
+  });
 }

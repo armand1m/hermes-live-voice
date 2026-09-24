@@ -112,6 +112,7 @@ describe("live gateway WebSocket", () => {
       "get_background_task",
       "stop_background_task",
       "remember",
+      "archive_background_task",
       "search_past_chats",
     ]);
   });

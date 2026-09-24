@@ -15,6 +15,7 @@ export type LiveToolName =
   | "get_background_task"
   | "follow_up_background_task"
   | "stop_background_task"
+  | "archive_background_task"
   | "pause_voice_input"
   | "set_client_audio"
   | "watch_external_agent"

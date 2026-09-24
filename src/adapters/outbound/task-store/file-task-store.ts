@@ -6,6 +6,9 @@ import { basename, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod/v3";
 import type {
+  TaskArchiveTerminalOptions,
+  TaskArchiveTerminalResult,
+  TaskListArchivedOptions,
   TaskListOptions,
   TaskPruneOptions,
   TaskPruneResult,
@@ -129,6 +132,7 @@ export class TaskStoreLockedError extends Error {
 
 export class FileTaskStore implements TaskStorePort {
   readonly filePath: string;
+  readonly archiveFilePath: string;
   private readonly directory: string;
   private readonly lockDirectory: string;
   private readonly lockOwnerPath: string;
@@ -154,6 +158,7 @@ export class FileTaskStore implements TaskStorePort {
     const resolved = resolveStorePaths(options);
     this.directory = resolved.directory;
     this.filePath = resolved.filePath;
+    this.archiveFilePath = resolved.archiveFilePath;
     this.lockDirectory = `${this.filePath}.lock`;
     this.lockOwnerPath = join(this.lockDirectory, LOCK_OWNER_FILENAME);
     this.maxRecords = positiveInteger(options.maxRecords ?? DEFAULT_MAX_RECORDS, "maxRecords");
@@ -356,7 +361,16 @@ export class FileTaskStore implements TaskStorePort {
     const id = TaskIdSchema.parse(taskId);
     return this.serialized(async () => {
       await this.ensureLoaded();
-      if (!this.records!.has(id)) return false;
+      const record = this.records!.get(id);
+      if (!record) return false;
+      // Permanent removal is reserved for finished work. Queued, running, and
+      // indeterminate outcomes must flow through their own stop or containment
+      // paths; deleting them here could hide live or unresolved effects.
+      if (!isTaskTerminal(record.status)) {
+        throw new TaskStoreConflictError(
+          `Only terminal tasks can be deleted: ${id} is ${record.status}.`,
+        );
+      }
       const next = new Map(this.records);
       next.delete(id);
       await this.persist(next);
@@ -380,6 +394,130 @@ export class FileTaskStore implements TaskStorePort {
         this.records = next;
       }
       return { deleted: taskIds.length, taskIds };
+    });
+  }
+
+  archive(taskId: string): Promise<TaskRecord | undefined> {
+    const id = TaskIdSchema.parse(taskId);
+    return this.serialized(async () => {
+      await this.ensureLoaded();
+      const record = this.records!.get(id);
+      if (!record) return undefined;
+      if (!isTaskTerminal(record.status)) {
+        throw new TaskStoreConflictError(
+          `Only terminal tasks can be archived: ${id} is ${record.status}.`,
+        );
+      }
+      const archive = await this.readArchiveDocument();
+      const merged = new Map(archive.tasks.map((task) => [task.taskId, task]));
+      merged.set(id, cloneTask(record)!);
+      await this.writeArchiveDocument([...merged.values()], archive.updatedAt);
+      // The archive is written first: a crash between the two writes can only
+      // leave the record in both documents, never in neither. restore()
+      // resolves that duplicate idempotently with the live copy winning.
+      const next = new Map(this.records);
+      next.delete(id);
+      await this.persist(next);
+      this.records = next;
+      return cloneTask(record);
+    });
+  }
+
+  archiveTerminal(options: TaskArchiveTerminalOptions = {}): Promise<TaskArchiveTerminalResult> {
+    const ownerId = options.ownerId === undefined ? undefined : TaskOwnerIdSchema.parse(options.ownerId);
+    return this.serialized(async () => {
+      await this.ensureLoaded();
+      // Read eagerly even when nothing is eligible: a sweep must surface a
+      // corrupted archive instead of silently succeeding beside one.
+      const archive = await this.readArchiveDocument();
+      const finished = [...this.records!.values()]
+        .filter((record) => isTaskTerminal(record.status))
+        .filter((record) => !ownerId || record.ownerId === ownerId)
+        .sort((left, right) => left.updatedAt - right.updatedAt || left.taskId.localeCompare(right.taskId));
+      // A sweep must never swallow a terminal outcome the user has not been
+      // told about yet. Unread items stay in the inbox for an explicit
+      // single-task archive or a later acknowledgement.
+      const eligible = finished.filter((record) => !record.notification.unread);
+      const skippedUnread = finished.length - eligible.length;
+      if (eligible.length > 0) {
+        const merged = new Map(archive.tasks.map((task) => [task.taskId, task]));
+        for (const record of eligible) merged.set(record.taskId, cloneTask(record)!);
+        await this.writeArchiveDocument([...merged.values()], archive.updatedAt);
+        const next = new Map(this.records);
+        for (const record of eligible) next.delete(record.taskId);
+        await this.persist(next);
+        this.records = next;
+      }
+      return { archived: eligible.length, taskIds: eligible.map((record) => record.taskId), skippedUnread };
+    });
+  }
+
+  restore(taskId: string): Promise<TaskRecord | undefined> {
+    const id = TaskIdSchema.parse(taskId);
+    return this.serialized(async () => {
+      await this.ensureLoaded();
+      const archive = await this.readArchiveDocument();
+      const archived = archive.tasks.find((task) => task.taskId === id);
+      if (!archived) return undefined;
+      if (this.records!.has(id)) {
+        // The crash window in archive() can leave the record in both
+        // documents. Keep the live copy and drop the stale archived one so a
+        // single source of truth is re-established without touching the live
+        // document.
+        await this.writeArchiveDocument(
+          archive.tasks.filter((task) => task.taskId !== id),
+          archive.updatedAt,
+        );
+        return cloneTask(this.records!.get(id));
+      }
+      const restored = parseTaskRecord(archived);
+      const next = new Map(this.records);
+      if (this.automaticPruning) {
+        this.pruneMap(next, this.now() - this.retentionMs, this.maxRecords - 1);
+      }
+      if (next.size >= this.maxRecords) {
+        throw new TaskStoreCapacityError(
+          `Task store reached its ${this.maxRecords}-record capacity and cannot restore ${id}.`,
+        );
+      }
+      next.set(id, cloneTask(restored)!);
+      await this.persist(next, {
+        protectedTaskIds: new Set([id]),
+        capacityLimitBytes: this.maxStoreBytes,
+      });
+      await this.writeArchiveDocument(
+        archive.tasks.filter((task) => task.taskId !== id),
+        archive.updatedAt,
+      );
+      this.records = next;
+      return cloneTask(restored);
+    });
+  }
+
+  deleteArchived(taskId: string): Promise<boolean> {
+    const id = TaskIdSchema.parse(taskId);
+    return this.serialized(async () => {
+      await this.ensureLoaded();
+      const archive = await this.readArchiveDocument();
+      if (!archive.tasks.some((task) => task.taskId === id)) return false;
+      await this.writeArchiveDocument(
+        archive.tasks.filter((task) => task.taskId !== id),
+        archive.updatedAt,
+      );
+      return true;
+    });
+  }
+
+  listArchived(options: TaskListArchivedOptions = {}): Promise<TaskRecord[]> {
+    return this.serialized(async () => {
+      await this.ensureLoaded();
+      const limit = positiveInteger(options.limit ?? Number.MAX_SAFE_INTEGER, "archived list limit");
+      const archive = await this.readArchiveDocument();
+      return archive.tasks
+        .slice()
+        .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId))
+        .slice(0, limit)
+        .map((task) => cloneTask(task)!);
     });
   }
 
@@ -592,6 +730,84 @@ export class FileTaskStore implements TaskStorePort {
         throw this.poisoned;
       }
       throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await unlink(tempPath).catch((error) => {
+        if (!isNodeError(error, "ENOENT")) throw error;
+      });
+    }
+  }
+
+  /**
+   * Read the archive document. The archive shares the live store's writer lock
+   * and document schema, but is deliberately not capacity-fitted or pruned: it
+   * exists to preserve finished records verbatim for forensics.
+   */
+  private async readArchiveDocument(): Promise<TaskStoreDocument> {
+    await this.assertLockOwned();
+    let handle;
+    try {
+      handle = await open(this.archiveFilePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return { schemaVersion: TASK_RECORD_SCHEMA_VERSION, updatedAt: 0, tasks: [] };
+      }
+      if (isNodeError(error, "ELOOP")) {
+        throw new TaskStoreCorruptionError("Task archive path must not be a symbolic link.", { cause: error });
+      }
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        throw new TaskStoreCorruptionError("Task archive path is not a regular file.");
+      }
+      if (stat.size > this.maximumStoreBytes) {
+        throw new TaskStoreCorruptionError(
+          `Task archive exceeds its ${this.maximumStoreBytes}-byte bounded safety limit.`,
+        );
+      }
+      await handle.chmod(0o600);
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(await handle.readFile("utf8"));
+      } catch (error) {
+        throw new TaskStoreCorruptionError("Task archive contains invalid JSON; refusing to reset it.", { cause: error });
+      }
+      const parsed = TaskStoreDocumentSchema.safeParse(parsedJson);
+      if (!parsed.success) {
+        throw new TaskStoreCorruptionError(
+          `Task archive failed schema validation; refusing to reset it: ${parsed.error.issues[0]?.message ?? "invalid document"}`,
+        );
+      }
+      return {
+        schemaVersion: parsed.data.schemaVersion,
+        updatedAt: parsed.data.updatedAt,
+        tasks: parsed.data.tasks.map((task) => cloneTask(task)!),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async writeArchiveDocument(tasks: readonly TaskRecord[], previousUpdatedAt: number): Promise<void> {
+    await this.ensureDirectory();
+    await this.assertLockOwned();
+    const updatedAt = Math.max(previousUpdatedAt, parseTaskTimestamp(this.now(), "Store timestamp"));
+    const document = buildTaskStoreDocument(new Map(tasks.map((task) => [task.taskId, task])), updatedAt);
+    TaskStoreDocumentSchema.parse(document);
+    const payload = `${JSON.stringify(document)}\n`;
+    const tempPath = join(this.directory, `.${basename(this.archiveFilePath)}.${process.pid}.${randomUUID()}.tmp`);
+    let handle;
+    try {
+      handle = await open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      await handle.writeFile(payload, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await chmod(tempPath, 0o600);
+      await rename(tempPath, this.archiveFilePath);
+      await syncDirectory(this.directory);
     } finally {
       await handle?.close().catch(() => undefined);
       await unlink(tempPath).catch((error) => {
@@ -985,7 +1201,7 @@ function cloneTaskMap(records: ReadonlyMap<string, TaskRecord>): Map<string, Tas
 
 function resolveStorePaths(
   options: Pick<FileTaskStoreOptions, "directory" | "filename">,
-): { directory: string; filePath: string } {
+): { directory: string; filePath: string; archiveFilePath: string } {
   if (!isAbsolute(options.directory) || options.directory.includes("\0")) {
     throw new Error("Task store directory must be an absolute safe path.");
   }
@@ -993,7 +1209,11 @@ function resolveStorePaths(
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\.json$/u.test(filename)) {
     throw new Error("Task store filename must be a simple .json filename.");
   }
-  return { directory: options.directory, filePath: join(options.directory, filename) };
+  return {
+    directory: options.directory,
+    filePath: join(options.directory, filename),
+    archiveFilePath: join(options.directory, filename.replace(/\.json$/u, ".archive.json")),
+  };
 }
 
 async function readLockOwner(

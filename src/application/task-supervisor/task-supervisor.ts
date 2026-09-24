@@ -1,4 +1,5 @@
 import type {
+  ArchivedTasksSummary,
   FollowUpBackgroundTaskInput,
   SubmitBackgroundTaskInput,
   TaskNotificationAnnouncementClaim,
@@ -450,6 +451,50 @@ export class TaskSupervisor implements TaskSupervisorPort {
     });
   }
 
+  async archiveTask(ownerId: string, taskId: string): Promise<TaskRecord> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    const parsedTaskId = TaskIdSchema.parse(taskId);
+    return this.serialized(async () => {
+      this.requireArchiveSupport();
+      const current = await this.store.load(parsedTaskId);
+      if (!current || current.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
+      assertTaskCleanupEligible(current);
+      const archived = await this.store.archive!(parsedTaskId);
+      if (!archived) throw new TaskNotFoundError(parsedTaskId);
+      return cloneTask(archived);
+    });
+  }
+
+  async archiveTerminalTasks(ownerId: string): Promise<ArchivedTasksSummary> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    return this.serialized(async () => {
+      this.requireArchiveSupport();
+      const result = await this.store.archiveTerminal!({ ownerId: parsedOwnerId });
+      return {
+        archived: result.archived,
+        taskIds: result.taskIds,
+        skippedUnread: result.skippedUnread,
+      };
+    });
+  }
+
+  async deleteTask(ownerId: string, taskId: string): Promise<TaskRecord> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    const parsedTaskId = TaskIdSchema.parse(taskId);
+    return this.serialized(async () => {
+      this.requireArchiveSupport();
+      const current = await this.store.load(parsedTaskId);
+      if (!current || current.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
+      assertTaskCleanupEligible(current);
+      const deleted = await this.store.delete(parsedTaskId);
+      if (!deleted) throw new TaskNotFoundError(parsedTaskId);
+      return cloneTask(current);
+    });
+  }
+
   acknowledgeNotification(ownerId: string, taskId: string): Promise<TaskRecord> {
     return this.updateOwnedNotification(ownerId, taskId, (record) =>
       acknowledgeTaskNotification(record, this.now()));
@@ -654,6 +699,15 @@ export class TaskSupervisor implements TaskSupervisorPort {
     const record = await this.store.load(parsedTaskId);
     if (!record || record.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
     return record;
+  }
+
+  private requireArchiveSupport(): void {
+    if (typeof this.store.archive !== "function" || typeof this.store.archiveTerminal !== "function") {
+      throw new Error("The configured task store does not support archiving.");
+    }
+    if (typeof this.store.delete !== "function") {
+      throw new Error("The configured task store does not support task deletion.");
+    }
   }
 
   private assertReady(): void {
@@ -1561,6 +1615,18 @@ function activityTimerKey(taskId: string): string {
 
 function observationTimerKey(taskId: string): string {
   return `observation:${taskId}`;
+}
+
+/**
+ * Inbox cleanup may touch only provably finished work. An unknown outcome can
+ * still be reconciled and must keep its containment recovery path instead.
+ */
+function assertTaskCleanupEligible(record: TaskRecord): void {
+  if (!isTaskTerminal(record.status)) {
+    throw new Error(
+      `Only finished tasks (completed, failed, cancelled) can be archived or deleted; ${record.taskId} is ${record.status}.`,
+    );
+  }
 }
 
 function validateSessionKey(value: string): string {
