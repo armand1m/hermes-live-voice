@@ -21,7 +21,7 @@ import {
   isHermesLiveProtocolVersion,
   type HermesLiveProtocolVersion,
 } from "../../domain/protocol/version.js";
-import type { TaskExecutionMode, TaskRecord } from "../../domain/tasks/index.js";
+import type { TaskRecord } from "../../domain/tasks/index.js";
 import { realtimeClientCapabilities } from "./client-capabilities.js";
 import type { ClientConnectionPort, ClientInboundFrame } from "./ports/client-connection.port.js";
 import type {
@@ -29,7 +29,7 @@ import type {
   HermesSessionChatResult,
   HermesSessionSummary,
 } from "./ports/hermes-runs.port.js";
-import type { ArchivedTasksSummary, TaskSupervisorPort } from "./ports/task-supervisor.port.js";
+import type { TaskSupervisorPort } from "./ports/task-supervisor.port.js";
 import {
   type LiveModelEvent,
   type LiveToolCall,
@@ -54,12 +54,25 @@ import {
   externalCheckInMessage,
   type ExternalAnnouncement,
 } from "../external-work/external-announcement-policy.js";
-import { hashWatchOwnerId, type AgentWatchRecord } from "../../domain/external-work/index.js";
+import { hashWatchOwnerId } from "../../domain/external-work/index.js";
+import {
+  archiveSweepSpokenSummary,
+  externalWatchesSpokenSummary,
+  notificationDigest,
+  taskInboxSpokenSummary,
+} from "./spoken-summaries.js";
+import {
+  arrayArg,
+  booleanArg,
+  executionModeArg,
+  optionalStringArg,
+  resourceKeysArg,
+  stringArg,
+} from "./tool-call-args.js";
 import type { DelegationHost } from "../../domain/tasks/delegation.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
 import {
-  TASK_REVIEW_THRESHOLD_MS,
   isTaskNotificationState,
   projectSupersededTaskNotification,
   projectTaskLifecycle,
@@ -106,7 +119,6 @@ const MAX_PROVIDER_TOOL_CALL_ARGS_BYTES = 100_000;
 const MAX_PROVIDER_TOOL_RESPONSE_BYTES = 256_000;
 const MAX_CACHED_PROVIDER_TOOL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PUBLIC_TASKS = 100;
-const MAX_TOOL_RESOURCE_KEYS = 8;
 /** Deferred answers held per session; evicted oldest-first when exceeded. */
 const MAX_DEFERRED_ANSWERS = 16;
 /** After this long undelivered, an "answer ready" filler clip escalates. */
@@ -3316,17 +3328,6 @@ function mergeTaskRecords(records: TaskRecord[]): TaskRecord[] {
   );
 }
 
-function notificationDigest(records: TaskRecord[]): string {
-  return records.slice(0, 3).map((record) => {
-    const title = record.title.slice(0, 100);
-    if (record.status === "completed") {
-      const result = record.output?.trim();
-      return `${title} is complete.${result ? ` ${result.slice(0, 180)}` : " The result is available in the task inbox."}`;
-    }
-    return `${title} needs attention: ${record.status.replaceAll("_", " ")}.`;
-  }).join(" ").slice(0, 500);
-}
-
 function validateAudioFrame(data: string, mimeType: string, maxBytes: number): void {
   if (!mimeType || mimeType.length > 128) throw new Error("Audio frame MIME type is invalid.");
   const decoded = decodeBase64Audio(data, maxBytes);
@@ -3374,69 +3375,6 @@ function safetyIdentifierForSessionKey(sessionKey: string): string {
   return createHash("sha256").update(sessionKey).digest("hex");
 }
 
-function stringArg(call: LiveToolCall, name: string): string {
-  const value = call.args[name];
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function optionalStringArg(call: LiveToolCall, name: string): string | undefined {
-  const value = stringArg(call, name);
-  return value || undefined;
-}
-
-function arrayArg(call: LiveToolCall, name: string): string[] | undefined {
-  const value = call.args[name];
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error(`Tool argument ${name} must be an array.`);
-  return value.map((item) => {
-    if (typeof item !== "string" || !item.trim()) throw new Error(`Tool argument ${name} must contain non-empty strings.`);
-    return item.trim();
-  });
-}
-
-/** Honest spoken summary of watched external work; never claims completion. */
-function externalWatchesSpokenSummary(watches: readonly AgentWatchRecord[]): string {
-  const byState = new Map<string, number>();
-  for (const watch of watches) {
-    const state = watch.lastObserved?.state ?? "not-yet-observed";
-    byState.set(state, (byState.get(state) ?? 0) + 1);
-  }
-  const hosts = [...new Set(watches.map((watch) => watch.host))].join(" and ");
-  const parts = [...byState.entries()].map(([state, count]) => `${count} ${state.replace("-", " ")}`);
-  return `You are watching ${watches.length} agent${watches.length === 1 ? "" : "s"} on ${hosts}: ${parts.join(", ")}. Idle means the outcome needs inspection, not completion.`;
-}
-
-function booleanArg(call: LiveToolCall, name: string, fallback: boolean): boolean {
-  const value = call.args[name];
-  if (value === undefined) return fallback;
-  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean.`);
-  return value;
-}
-
-function executionModeArg(call: LiveToolCall): TaskExecutionMode {
-  const value = call.args.execution_mode;
-  if (value === undefined) return "exclusive";
-  if (value !== "exclusive" && value !== "parallel_read_only") {
-    throw new Error("execution_mode must be exclusive or parallel_read_only.");
-  }
-  return value;
-}
-
-function resourceKeysArg(call: LiveToolCall): string[] | undefined {
-  const value = call.args.resource_keys;
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TOOL_RESOURCE_KEYS) {
-    throw new Error(`resource_keys must contain between 1 and ${MAX_TOOL_RESOURCE_KEYS} strings.`);
-  }
-  const keys = value.map((item) => {
-    if (typeof item !== "string" || !item.trim() || item.length > 256 || /[\u0000-\u001f\u007f]/u.test(item)) {
-      throw new Error("resource_keys contains an invalid value.");
-    }
-    return item.trim();
-  });
-  return [...new Set(keys)];
-}
-
 function requireProviderToolCallId(call: LiveToolCall): string {
   if (!call.name || call.name.length > 128 || !/^[A-Za-z0-9_.:-]+$/u.test(call.name)) {
     throw new Error("Realtime provider emitted a tool call with an invalid name.");
@@ -3475,47 +3413,6 @@ function boundedProviderToolResponse(response: Record<string, unknown>): Record<
   return safeJsonByteLength(response) <= MAX_PROVIDER_TOOL_RESPONSE_BYTES
     ? response
     : { ok: false, error: "Task result exceeded the safe provider response limit." };
-}
-
-function taskInboxSpokenSummary(records: readonly TaskRecord[], now = Date.now()): string {
-  if (!records.length) return "Your background task inbox is empty.";
-  const count = (states: string[]) => records.filter((record) => states.includes(record.status)).length;
-  const needsReview = records.filter((record) =>
-    record.status === "running"
-    && now - (record.lastMeaningfulProgressAt ?? record.lastActivityAt ?? record.createdAt)
-      >= TASK_REVIEW_THRESHOLD_MS).length;
-  const running = count(["running", "dispatching"]);
-  const parts = [
-    [running - needsReview, "running"],
-    [count(["queued"]), "queued"],
-    [count(["delegated"]), "delegated to external agents"],
-    [needsReview, "running without verified progress and needing review"],
-    [count(["stopping", "waiting_for_approval"]), "awaiting attention"],
-    [count(["completed", "failed", "cancelled"]), "finished"],
-    [count(["unknown", "dispatch_unknown"]), "with an uncertain outcome"],
-  ].filter(([number]) => Number(number) > 0).map(([number, state]) => `${number} ${state}`);
-  return `Your tasks: ${parts.join(", ")}.`;
-}
-
-function archiveSweepSpokenSummary(summary: ArchivedTasksSummary): string {
-  const parts: string[] = [];
-  if (summary.archived > 0) {
-    parts.push(
-      summary.archived === 1
-        ? "I archived one finished task"
-        : `I archived ${summary.archived} finished tasks`,
-    );
-  } else {
-    parts.push("There are no finished tasks to archive right now");
-  }
-  if (summary.skippedUnread > 0) {
-    parts.push(
-      summary.skippedUnread === 1
-        ? "one finished task still has an unheard announcement, so I left it in the inbox"
-        : `${summary.skippedUnread} finished tasks still have unheard announcements, so I left them in the inbox`,
-    );
-  }
-  return `${parts.join(", and ")}.`;
 }
 
 function publicHermesCapabilities(
