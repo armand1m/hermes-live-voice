@@ -2195,6 +2195,25 @@ describe("transport, tool-call, and notification safety", () => {
     expect(metrics.gatewayAudioGapP95Ms).toEqual(expect.any(Number));
   });
 
+  it("reports per-stage turn latency through /v1/metrics", async () => {
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider });
+    const client = await readyClient(server.url);
+
+    provider.emit({ type: "text", speaker: "user", text: "What time is it?", final: true });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    provider.emit({ type: "text", speaker: "assistant", text: "It is noon.", final: true });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    provider.emit({ type: "audio", audio: { data: Buffer.alloc(64, 1).toString("base64"), mimeType: "audio/pcm;rate=24000" } });
+    await client.messages.wait("audio.output");
+
+    const metrics = await fetch(`${server.url}/v1/metrics`).then((response) => response.json());
+    expect(metrics.turnLatency.brain.p50Ms).toBeGreaterThanOrEqual(30);
+    expect(metrics.turnLatency.tts.p50Ms).toBeGreaterThanOrEqual(30);
+    expect(metrics.turnLatency.response.p50Ms).toBeGreaterThanOrEqual(60);
+    expect(metrics.turnLatency.endpoint).toEqual({ p50Ms: null, p95Ms: null });
+  });
+
   it("fails closed when a provider emits an oversized audio frame", async () => {
     const provider = new RecordingLiveAdapter();
     const server = await startTestServer({

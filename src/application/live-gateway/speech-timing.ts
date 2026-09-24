@@ -29,6 +29,32 @@ class NumberRing {
   }
 }
 
+/** p50/p95 of one turn stage, in ms; null until a turn has been sampled. */
+export interface StagePercentiles {
+  p50Ms: number | null;
+  p95Ms: number | null;
+}
+
+export const TURN_STAGES = ["endpoint", "asr", "brain", "tts", "response", "total"] as const;
+export type TurnStage = typeof TURN_STAGES[number];
+
+/**
+ * One completed turn, split at the boundaries the gateway can observe:
+ * endpoint = gate speech-stop → provider commit; asr = commit → user final;
+ * brain = user final → first spoken assistant text; tts = that text → first
+ * provider audio frame; response = user final → first audio; total = speech
+ * stop → first audio. Stages the turn never crossed (text input has no
+ * endpoint or ASR) are absent.
+ */
+export type TurnLatencySample = Partial<Record<TurnStage, number>>;
+
+interface TurnMarks {
+  speechEndAt?: number;
+  commitAt?: number;
+  userFinalAt?: number;
+  assistantTextAt?: number;
+}
+
 export interface SpeechTimingMetrics {
   /** Provider response start latency after a tool call began, p50/p95 in ms. */
   toolSpeechP50Ms: number | null;
@@ -38,6 +64,8 @@ export interface SpeechTimingMetrics {
   announcementDelayP95Ms: number | null;
   /** Gateway-injected filler clips spoken this session (filler side-channel). */
   fillerInjections: number;
+  /** Per-stage voice-turn latency over the recent turn window. */
+  turnLatency: Record<TurnStage, StagePercentiles>;
 }
 
 /**
@@ -51,6 +79,58 @@ export class SpeechTimingTracker {
   private readonly announcementFirstSeenAt = new Map<string, number>();
   private pendingToolStartedAt: number | null = null;
   private fillerInjections = 0;
+  private readonly turnStages = Object.fromEntries(
+    TURN_STAGES.map((stage) => [stage, new NumberRing()]),
+  ) as Record<TurnStage, NumberRing>;
+  private turn: TurnMarks | null = null;
+
+  /** The gateway gate confirmed the end of user speech: a new voice turn begins. */
+  noteSpeechEnded(at: number): void {
+    this.turn = { speechEndAt: at };
+  }
+
+  /** The provider accepted the turn's audio commit. */
+  noteTurnCommitted(at: number): void {
+    if (this.turn?.speechEndAt !== undefined && this.turn.commitAt === undefined) this.turn.commitAt = at;
+  }
+
+  /**
+   * The final user transcript arrived. A text turn (or a voice final with no
+   * open voice timeline) starts fresh here, so a stale speech-stop left by a
+   * dropped echo turn never inflates the next turn's endpoint/total.
+   */
+  noteUserFinal(at: number, fromVoice: boolean): void {
+    if (!fromVoice || !this.turn || this.turn.userFinalAt !== undefined) this.turn = {};
+    this.turn.userFinalAt = at;
+  }
+
+  /** The first spoken assistant text of the answer (brain reply or receipt). */
+  noteAssistantText(at: number): void {
+    if (this.turn?.userFinalAt !== undefined && this.turn.assistantTextAt === undefined) this.turn.assistantTextAt = at;
+  }
+
+  /**
+   * The first provider audio frame of the answer closes the turn. Returns the
+   * completed sample (for logging) or undefined when no turn was pending.
+   */
+  noteFirstAudio(at: number): TurnLatencySample | undefined {
+    const turn = this.turn;
+    if (turn?.userFinalAt === undefined) return undefined;
+    this.turn = null;
+    const sample: TurnLatencySample = {};
+    const span = (stage: TurnStage, from: number | undefined, to: number | undefined): void => {
+      if (from === undefined || to === undefined || to < from) return;
+      sample[stage] = to - from;
+      this.turnStages[stage].push(to - from);
+    };
+    span("endpoint", turn.speechEndAt, turn.commitAt);
+    span("asr", turn.commitAt, turn.userFinalAt);
+    span("brain", turn.userFinalAt, turn.assistantTextAt);
+    span("tts", turn.assistantTextAt, at);
+    span("response", turn.userFinalAt, at);
+    span("total", turn.speechEndAt, at);
+    return sample;
+  }
 
   /** Earliest outstanding tool call wins: the user has been waiting since then. */
   noteToolCallStarted(at: number): void {
@@ -109,6 +189,10 @@ export class SpeechTimingTracker {
       announcementDelayP50Ms: this.announcementDelay.percentile(0.5),
       announcementDelayP95Ms: this.announcementDelay.percentile(0.95),
       fillerInjections: this.fillerInjections,
+      turnLatency: Object.fromEntries(TURN_STAGES.map((stage) => [stage, {
+        p50Ms: this.turnStages[stage].percentile(0.5),
+        p95Ms: this.turnStages[stage].percentile(0.95),
+      }])) as Record<TurnStage, StagePercentiles>,
     };
   }
 }

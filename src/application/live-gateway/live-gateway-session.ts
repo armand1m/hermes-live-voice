@@ -808,7 +808,10 @@ export class LiveGatewaySession {
         this.userSpeaking = false;
         this.lastTurnHadSpeech = true;
         await this.forwardRealtimeClientInput("audio turn", async () => {
-          if (await this.liveSession!.sendAudioStreamEnd()) this.providerResponseActive = true;
+          if (await this.liveSession!.sendAudioStreamEnd()) {
+            this.providerResponseActive = true;
+            this.speechTiming.noteTurnCommitted(Date.now());
+          }
         });
         // The turn end is the riva path's main idle signal: give a ready
         // deferred answer its chance to speak now.
@@ -2037,6 +2040,7 @@ export class LiveGatewaySession {
   private handleConfirmedSpeechStopped(): void {
     if (this.closing) return;
     this.userSpeaking = false;
+    this.speechTiming.noteSpeechEnded(Date.now());
     this.send({ type: "input.speech_stopped", provider: "gateway" });
     this.scheduleNotificationFlush();
   }
@@ -2298,6 +2302,8 @@ export class LiveGatewaySession {
   private handleLiveModelEvent(event: LiveModelEvent): void {
     if (event.type === "audio") {
       validateAudioFrame(event.audio.data, event.audio.mimeType, this.deps.config.server.maxAudioBytes);
+      const turnLatency = this.speechTiming.noteFirstAudio(Date.now());
+      if (turnLatency) this.deps.logger.info("turn latency", { sessionId: this.id, ...turnLatency });
       const itemId = publicProviderIdentifier(event.audio.itemId);
       const contentIndex = publicContentIndex(event.audio.contentIndex);
       this.send({
@@ -2314,10 +2320,12 @@ export class LiveGatewaySession {
         throw new Error("Realtime provider transcript is empty or exceeds its limit.");
       }
       if ((event.speaker ?? "assistant") === "user" && event.final) {
+        this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
         this.noteLayaShadowTurn(event.text);
       } else if (event.final && event.speaker !== "system") {
+        if ((event.speaker ?? "assistant") === "assistant") this.speechTiming.noteAssistantText(Date.now());
         this.recordShadowTurn(event.speaker ?? "assistant", event.text);
       }
       this.send({

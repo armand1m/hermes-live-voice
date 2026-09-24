@@ -17,6 +17,7 @@ import type { HermesRunsPort } from "../../../application/live-gateway/ports/her
 import type { TaskSupervisorPort } from "../../../application/live-gateway/ports/task-supervisor.port.js";
 import { LiveGatewaySession } from "../../../application/live-gateway/live-gateway-session.js";
 import { VoiceArbiter } from "../../../application/live-gateway/voice-arbiter.js";
+import { TURN_STAGES, type StagePercentiles, type TurnStage } from "../../../application/live-gateway/speech-timing.js";
 import { TaskSupervisor } from "../../../application/task-supervisor/task-supervisor.js";
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
 import { HermesClient } from "../../outbound/hermes/hermes-runs.client.js";
@@ -729,6 +730,9 @@ async function handleHttp(
     let announcementDelayP50Ms: number | null = null;
     let announcementDelayP95Ms: number | null = null;
     let fillerInjections = 0;
+    const turnLatency = Object.fromEntries(
+      TURN_STAGES.map((stage) => [stage, { p50Ms: null as number | null, p95Ms: null as number | null }]),
+    ) as Record<TurnStage, StagePercentiles>;
     for (const session of options.sessions) {
       const audio = session.audioDeliveryMetrics();
       if (audio.lastOutputMsAgo !== null) {
@@ -756,6 +760,12 @@ async function handleHttp(
         announcementDelayP95Ms = Math.max(announcementDelayP95Ms ?? 0, timing.announcementDelayP95Ms);
       }
       fillerInjections += timing.fillerInjections;
+      for (const stage of TURN_STAGES) {
+        const worst = turnLatency[stage];
+        const sampled = timing.turnLatency[stage];
+        if (sampled.p50Ms !== null) worst.p50Ms = Math.max(worst.p50Ms ?? 0, sampled.p50Ms);
+        if (sampled.p95Ms !== null) worst.p95Ms = Math.max(worst.p95Ms ?? 0, sampled.p95Ms);
+      }
     }
     json(req, res, 200, {
       ts: Date.now(),
@@ -770,6 +780,7 @@ async function handleHttp(
       announcementDelayP50Ms,
       announcementDelayP95Ms,
       fillerInjections,
+      turnLatency,
       voiceStackCpuPct: processMetrics.voiceStackCpuPct,
       voiceStackPid: processMetrics.voiceStackPid,
       eventLagMs: processMetrics.eventLagMs,

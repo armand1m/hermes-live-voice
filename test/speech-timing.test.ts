@@ -64,4 +64,38 @@ describe("SpeechTimingTracker", () => {
     tracker.noteAnnouncementDelivered("task_79", 158);
     expect(tracker.metrics().announcementDelayP50Ms).toBe(79);
   });
+
+  it("splits a voice turn into endpoint, asr, brain, tts, response, and total", () => {
+    const tracker = new SpeechTimingTracker();
+    tracker.noteSpeechEnded(1_000);
+    tracker.noteTurnCommitted(1_050);
+    tracker.noteUserFinal(1_400, true);
+    tracker.noteAssistantText(3_400);
+    expect(tracker.noteFirstAudio(4_100)).toEqual({
+      endpoint: 50, asr: 350, brain: 2_000, tts: 700, response: 2_700, total: 3_100,
+    });
+    // Later frames of the same answer are not new turns.
+    expect(tracker.noteFirstAudio(4_300)).toBeUndefined();
+    expect(tracker.metrics().turnLatency.total).toEqual({ p50Ms: 3_100, p95Ms: 3_100 });
+  });
+
+  it("times text turns from the user final and ignores stale voice marks", () => {
+    const tracker = new SpeechTimingTracker();
+    // A voice turn that never produced a user final (e.g. a dropped echo).
+    tracker.noteSpeechEnded(1_000);
+    tracker.noteTurnCommitted(1_100);
+    tracker.noteUserFinal(9_000, false);
+    tracker.noteAssistantText(9_500);
+    expect(tracker.noteFirstAudio(9_800)).toEqual({ brain: 500, tts: 300, response: 800 });
+    const latency = tracker.metrics().turnLatency;
+    expect(latency.endpoint.p50Ms).toBeNull();
+    expect(latency.total.p50Ms).toBeNull();
+  });
+
+  it("does not sample audio with no pending user turn (notifications, fillers)", () => {
+    const tracker = new SpeechTimingTracker();
+    tracker.noteAssistantText(1_000);
+    expect(tracker.noteFirstAudio(1_500)).toBeUndefined();
+    expect(tracker.metrics().turnLatency.response.p50Ms).toBeNull();
+  });
 });
