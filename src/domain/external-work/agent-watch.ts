@@ -19,6 +19,7 @@ export const MAX_WATCH_OBJECTIVE_CHARS = 4_000;
 export const MAX_WATCH_ACCEPTANCE_ITEMS = 8;
 export const MAX_WATCH_ACCEPTANCE_CHARS = 500;
 export const MAX_WATCH_EVENTS = 64;
+export const MAX_RECENT_ANNOUNCED_KEYS = 16;
 export const MAX_WATCH_EVENT_SUMMARY_CHARS = 2_000;
 export const MAX_WATCH_OUTPUT_EXCERPT_CHARS = 600;
 
@@ -130,6 +131,8 @@ export const AgentWatchRecordSchema = z.object({
   /** Dedupe key of the last announcement derived from this watch. */
   lastAnnouncedKey: z.string().min(1).max(200).optional(),
   lastAnnouncedAt: WatchTimestampSchema.optional(),
+  /** Bounded history of spoken keys, so an older key never repeats after a newer one. */
+  recentAnnouncedKeys: z.array(z.string().min(1).max(200)).max(MAX_RECENT_ANNOUNCED_KEYS).optional(),
 }).strict().superRefine((record, context) => {
   if (record.updatedAt < record.createdAt) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "Watch updatedAt precedes createdAt." });
@@ -342,16 +345,26 @@ export function stopWatch(value: AgentWatchRecord, input: { now?: number; reason
   });
 }
 
+/** True when this exact announcement key was already spoken for the watch. */
+export function hasWatchAnnounced(record: AgentWatchRecord, key: string): boolean {
+  const bounded = key.slice(0, 200);
+  return record.lastAnnouncedKey === bounded || (record.recentAnnouncedKeys?.includes(bounded) ?? false);
+}
+
 export function noteWatchAnnounced(value: AgentWatchRecord, key: string, now = Date.now()): AgentWatchRecord {
   const record = AgentWatchRecordSchema.parse(value);
   const timestamp = Math.max(record.updatedAt, parseWatchTimestamp(now, "Watch announcement timestamp"));
   if (record.lastAnnouncedKey === key && record.lastAnnouncedAt === timestamp) return record;
+  const bounded = key.slice(0, 200);
+  const recent = [...(record.recentAnnouncedKeys ?? []).filter((existing) => existing !== bounded), bounded]
+    .slice(-MAX_RECENT_ANNOUNCED_KEYS);
   return AgentWatchRecordSchema.parse({
     ...record,
     updatedAt: timestamp,
     revision: record.revision + 1,
-    lastAnnouncedKey: key.slice(0, 200),
+    lastAnnouncedKey: bounded,
     lastAnnouncedAt: timestamp,
+    recentAnnouncedKeys: recent,
   });
 }
 

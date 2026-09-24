@@ -2,6 +2,7 @@ import {
   createAgentWatchRecord,
   hashWatchOwnerId,
   markWatchMismatched,
+  hasWatchAnnounced,
   noteWatchAnnounced,
   recordWatchHostFailure,
   recordWatchObservation,
@@ -106,6 +107,8 @@ export class ExternalAgentMonitor {
   private readonly listeners = new Set<(event: ExternalMonitorEvent) => void>();
   private readonly hosts = new Map<DelegationHost, HostState>();
   private readonly watchers = new Map<string, () => void>();
+  /** In-memory speaker leases: `${watchId}\n${key}` → claimant session id. */
+  private readonly announcementLeases = new Map<string, string>();
   private closed = false;
   private initialized = false;
 
@@ -208,16 +211,42 @@ export class ExternalAgentMonitor {
   }
 
   /**
-   * Single-speak claim for announcements derived from a watch: the first
-   * caller for a given key wins durably, so two open voice sessions cannot
-   * both say the same update (plan §D).
+   * Single-speaker claim for an announcement derived from a watch: an
+   * in-memory lease makes sure two open voice sessions cannot both say the
+   * same update (plan §D). Nothing durable is written here — the claimant
+   * calls completeAnnouncement only after the speech was actually delivered,
+   * or releaseAnnouncement so the update stays eligible after a failure.
    */
-  async claimAnnouncement(watchId: string, key: string): Promise<boolean> {
+  async claimAnnouncement(watchId: string, key: string, claimant: string): Promise<boolean> {
     const current = await this.store.load(watchId);
     if (!current || current.status === "stopped") return false;
-    if (current.lastAnnouncedKey === key) return false;
-    await this.updateWatch(current, (watch) => noteWatchAnnounced(watch, key, this.now()));
+    if (hasWatchAnnounced(current, key)) return false;
+    const lease = announcementLeaseKey(watchId, key);
+    const holder = this.announcementLeases.get(lease);
+    if (holder !== undefined && holder !== claimant) return false;
+    this.announcementLeases.set(lease, claimant);
     return true;
+  }
+
+  /** Durably record a delivered announcement and drop the claimant's lease. */
+  async completeAnnouncement(watchId: string, key: string, claimant: string): Promise<void> {
+    this.releaseAnnouncement(watchId, key, claimant);
+    const current = await this.store.load(watchId);
+    if (!current || hasWatchAnnounced(current, key)) return;
+    await this.updateWatch(current, (watch) => noteWatchAnnounced(watch, key, this.now()));
+  }
+
+  /** Give up a lease without recording delivery: the update stays eligible. */
+  releaseAnnouncement(watchId: string, key: string, claimant: string): void {
+    const lease = announcementLeaseKey(watchId, key);
+    if (this.announcementLeases.get(lease) === claimant) this.announcementLeases.delete(lease);
+  }
+
+  /** Drop every lease a closing voice session still holds. */
+  releaseAnnouncementsFor(claimant: string): void {
+    for (const [lease, holder] of this.announcementLeases) {
+      if (holder === claimant) this.announcementLeases.delete(lease);
+    }
   }
 
   private hostState(host: DelegationHost): HostState {
@@ -406,4 +435,8 @@ function observationSummary(observation: NonNullable<AgentWatchRecord["lastObser
     default:
       return "Agent status is unknown.";
   }
+}
+
+function announcementLeaseKey(watchId: string, key: string): string {
+  return `${watchId}\n${key}`;
 }

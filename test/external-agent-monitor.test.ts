@@ -344,4 +344,55 @@ describe("ExternalAgentMonitor", () => {
     expect(Object.keys(agents).sort()).not.toContain("sendKeys");
     await monitor.close();
   });
+
+  it("leases announcements in memory and records them only on completion", async () => {
+    const { monitor, agents, store } = await newMonitor();
+    agents.snapshots = [snapshotFixture()];
+    const watch = await monitor.registerWatch({ ownerIdentity: "alice", host: "exodia", harness: "herdr", agentSessionValue: SESSION_A, paneId: "w4:p1", objective: "A", acceptanceCriteria: ["x"] });
+    const key = `${watch.watchId}:state:done:361`;
+
+    // Claiming reserves the speaker but writes nothing durable.
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "session_1")).toBe(true);
+    expect((await store.load(watch.watchId)).lastAnnouncedKey).toBeUndefined();
+    // A second session cannot speak the same update while the lease is held…
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "session_2")).toBe(false);
+    // …but the holder can re-claim after a retry.
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "session_1")).toBe(true);
+
+    // Failed delivery: releasing keeps the update eligible for anyone.
+    monitor.releaseAnnouncement(watch.watchId, key, "session_1");
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "session_2")).toBe(true);
+
+    // Delivered: recorded durably, never claimable again.
+    await monitor.completeAnnouncement(watch.watchId, key, "session_2");
+    expect((await store.load(watch.watchId)).lastAnnouncedKey).toBe(key);
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "session_1")).toBe(false);
+    await monitor.close();
+  });
+
+  it("never repeats an older announcement after a newer one was spoken", async () => {
+    const { monitor, agents } = await newMonitor();
+    agents.snapshots = [snapshotFixture()];
+    const watch = await monitor.registerWatch({ ownerIdentity: "alice", host: "exodia", harness: "herdr", agentSessionValue: SESSION_A, paneId: "w4:p1", objective: "A", acceptanceCriteria: ["x"] });
+    const older = `${watch.watchId}:state:working:360`;
+    const newer = `${watch.watchId}:state:idle:361`;
+    await monitor.claimAnnouncement(watch.watchId, older, "s");
+    await monitor.completeAnnouncement(watch.watchId, older, "s");
+    await monitor.claimAnnouncement(watch.watchId, newer, "s");
+    await monitor.completeAnnouncement(watch.watchId, newer, "s");
+    // Regression: only the last key used to be remembered.
+    expect(await monitor.claimAnnouncement(watch.watchId, older, "s")).toBe(false);
+    await monitor.close();
+  });
+
+  it("drops every lease a closing session holds", async () => {
+    const { monitor, agents } = await newMonitor();
+    agents.snapshots = [snapshotFixture()];
+    const watch = await monitor.registerWatch({ ownerIdentity: "alice", host: "exodia", harness: "herdr", agentSessionValue: SESSION_A, paneId: "w4:p1", objective: "A", acceptanceCriteria: ["x"] });
+    const key = `${watch.watchId}:registered`;
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "closing")).toBe(true);
+    monitor.releaseAnnouncementsFor("closing");
+    expect(await monitor.claimAnnouncement(watch.watchId, key, "other")).toBe(true);
+    await monitor.close();
+  });
 });

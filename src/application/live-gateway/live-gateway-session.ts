@@ -54,7 +54,7 @@ import {
   externalCheckInMessage,
   type ExternalAnnouncement,
 } from "../external-work/external-announcement-policy.js";
-import type { AgentWatchRecord } from "../../domain/external-work/index.js";
+import { hashWatchOwnerId, type AgentWatchRecord } from "../../domain/external-work/index.js";
 import type { DelegationHost } from "../../domain/tasks/delegation.js";
 import type { SpeechDetectionService } from "./vad/detection-service.js";
 import type { SpeechGate } from "./vad/speech-gate.js";
@@ -214,6 +214,7 @@ export class LiveGatewaySession {
   private readonly pendingNotifications = new Map<string, TaskRecord>();
   /** External-work announcements (plan §D) riding the same speech flush. */
   private pendingExternalAnnouncements: ExternalAnnouncement[] = [];
+  private readonly externalDeliveryAttempts = new Map<string, number>();
   private externalSubscription?: () => void;
   private externalCheckInTimer?: ReturnType<typeof setTimeout>;
   private lastExternalAnnouncementAt?: number;
@@ -2613,23 +2614,7 @@ export class LiveGatewaySession {
         return;
       }
 
-      this.notificationResponsePending = true;
-      // Spoken-content preparation at the notification TTS boundary (plan §E):
-      // task titles and result excerpts arrive as Markdown and must never
-      // reach synthesis with structure markers intact.
-      const announcement = prepareSpokenContent(notificationDigest(records));
-      const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
-      this.activeNotificationId = notificationId;
-      const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
-      playback?.catch(() => undefined);
-      const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
-      await withAbortAndDeadline(
-        this.liveSession.sendTaskNotification({ context, announcement, notificationId }),
-        this.abort.signal,
-        120_000,
-        "Realtime provider task notification did not settle before the safety deadline.",
-      );
-      if (playback) await playback;
+      await this.speakNotification(notificationDigest(records));
       // v11 clients confirm playback before the announcement counts as heard.
       // Older clients cannot attest playback: the provider accepting the
       // announcement remains the delivery proof, and the durable unread item
@@ -2687,9 +2672,37 @@ export class LiveGatewaySession {
   }
 
   /**
-   * Speak coalesced external-work announcements through the exact task
-   * notification channel: provider handoff, v11 playback confirmation, and
-   * durable single-speak claims on the watch (plan §D).
+   * Hand one announcement to the provider's task-notification channel and
+   * wait until it is heard: provider acceptance under a safety deadline, then
+   * v11 playback confirmation. The caller owns the flush latch and any claims.
+   */
+  private async speakNotification(text: string): Promise<void> {
+    const liveSession = this.liveSession;
+    if (!liveSession?.sendTaskNotification) throw new Error("Realtime provider cannot speak task notifications.");
+    this.notificationResponsePending = true;
+    // Spoken-content preparation at the notification TTS boundary (plan §E):
+    // task titles, result excerpts, and agent output arrive as Markdown and
+    // must never reach synthesis with structure markers intact.
+    const announcement = prepareSpokenContent(text);
+    const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
+    this.activeNotificationId = notificationId;
+    const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
+    playback?.catch(() => undefined);
+    const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
+    await withAbortAndDeadline(
+      liveSession.sendTaskNotification({ context, announcement, notificationId }),
+      this.abort.signal,
+      120_000,
+      "Realtime provider task notification did not settle before the safety deadline.",
+    );
+    if (playback) await playback;
+  }
+
+  /**
+   * Speak coalesced external-work announcements through the task
+   * notification channel. The monitor lease only reserves the speaker;
+   * delivery is recorded durably after playback, and a failed delivery
+   * releases the lease and retries within a bounded budget (plan §D).
    */
   private async deliverExternalAnnouncements(): Promise<boolean> {
     const monitor = this.deps.externalMonitor;
@@ -2700,10 +2713,9 @@ export class LiveGatewaySession {
     const claimed: ExternalAnnouncement[] = [];
     for (const item of batch) {
       try {
-        if (await monitor.claimAnnouncement(item.watchId, item.key)) claimed.push(item);
+        if (await monitor.claimAnnouncement(item.watchId, item.key, this.id)) claimed.push(item);
       } catch (error) {
-        // Unclaimable right now (store hiccup, watch stopped): requeue once.
-        this.pendingExternalAnnouncements.push(item);
+        this.requeueExternalAnnouncement(item);
         this.deps.logger.warn("failed to claim external announcement", {
           sessionId: this.id,
           watchId: item.watchId,
@@ -2714,23 +2726,27 @@ export class LiveGatewaySession {
     if (claimed.length === 0) return false;
     const message = claimed.map((item) => item.message).join(" ").slice(0, 500);
     try {
-      this.notificationResponsePending = true;
-      const announcement = prepareSpokenContent(message);
-      const notificationId = `notice_${randomUUID().replaceAll("-", "")}`;
-      this.activeNotificationId = notificationId;
-      const playback = this.protocolVersion >= 11 ? this.playbackDelivery.wait(notificationId) : undefined;
-      playback?.catch(() => undefined);
-      const context = `[HERMES_LIVE_TASK_EVENT_V1:${this.notificationToken}] ${JSON.stringify({ announcement })}`;
-      await withAbortAndDeadline(
-        this.liveSession.sendTaskNotification({ context, announcement, notificationId }),
-        this.abort.signal,
-        120_000,
-        "Realtime provider task notification did not settle before the safety deadline.",
-      );
-      if (playback) await playback;
+      await this.speakNotification(message);
       this.lastExternalAnnouncementAt = Date.now();
+      for (const item of claimed) {
+        this.externalDeliveryAttempts.delete(item.key);
+        try {
+          await monitor.completeAnnouncement(item.watchId, item.key, this.id);
+        } catch (error) {
+          // Spoken but not recorded: a later session may repeat it once.
+          this.deps.logger.warn("failed to record external announcement delivery", {
+            sessionId: this.id,
+            watchId: item.watchId,
+            error: errorToMessage(error),
+          });
+        }
+      }
     } catch (error) {
       this.notificationResponsePending = false;
+      for (const item of claimed) {
+        monitor.releaseAnnouncement(item.watchId, item.key, this.id);
+        this.requeueExternalAnnouncement(item);
+      }
       if (!this.closing) {
         this.deps.logger.warn("external announcement speech delivery failed", {
           sessionId: this.id,
@@ -2747,9 +2763,31 @@ export class LiveGatewaySession {
     return true;
   }
 
+  /**
+   * Put an undelivered announcement back at the front of the queue with
+   * backoff, unless its budget is spent or a newer update of the same watch
+   * and category superseded it meanwhile.
+   */
+  private requeueExternalAnnouncement(item: ExternalAnnouncement): void {
+    if (this.closing) return;
+    const attempt = (this.externalDeliveryAttempts.get(item.key) ?? 0) + 1;
+    if (attempt >= MAX_NOTIFICATION_DELIVERY_ATTEMPTS) {
+      this.externalDeliveryAttempts.delete(item.key);
+      return;
+    }
+    const superseded = this.pendingExternalAnnouncements.some((pending) => sameExternalCategory(pending, item));
+    if (superseded) return;
+    this.externalDeliveryAttempts.set(item.key, attempt);
+    this.pendingExternalAnnouncements.unshift(item);
+    this.scheduleNotificationRetry(NOTIFICATION_RETRY_BASE_MS * (2 ** (attempt - 1)));
+  }
+
   /** Queue one external monitor event as (at most) one announcement. */
   private handleExternalMonitorEvent(event: ExternalMonitorEvent): void {
     if (this.closing || this.voiceDemoted) return;
+    // The monitor broadcasts gateway-wide: speak only this owner's watches,
+    // matching the owner-scoped check-ins and watch tools.
+    if (!this.sessionKey || event.watch.ownerId !== hashWatchOwnerId(this.sessionKey)) return;
     const announcement = externalAnnouncementFor(event);
     if (!announcement) {
       this.armExternalCheckIn();
@@ -2757,11 +2795,8 @@ export class LiveGatewaySession {
     }
     // Superseded messages never pile up: a newer key for the same watch and
     // category replaces an unspoken older one.
-    this.pendingExternalAnnouncements = this.pendingExternalAnnouncements.filter((pending) => {
-      const sameCategory = pending.watchId === announcement.watchId
-        && pending.key.split(":")[1] === announcement.key.split(":")[1];
-      return !sameCategory;
-    });
+    this.pendingExternalAnnouncements = this.pendingExternalAnnouncements
+      .filter((pending) => !sameExternalCategory(pending, announcement));
     this.pendingExternalAnnouncements.push(announcement);
     if (this.pendingExternalAnnouncements.length > 10) {
       this.pendingExternalAnnouncements.splice(0, this.pendingExternalAnnouncements.length - 10);
@@ -2938,6 +2973,7 @@ export class LiveGatewaySession {
     this.playbackDelivery.close();
     this.externalSubscription?.();
     this.externalSubscription = undefined;
+    this.deps.externalMonitor?.releaseAnnouncementsFor(this.id);
     if (this.externalCheckInTimer) {
       clearTimeout(this.externalCheckInTimer);
       this.externalCheckInTimer = undefined;
@@ -3603,4 +3639,9 @@ async function withAbortAndDeadline<T>(
     signal.removeEventListener("abort", onAbort);
     if (timeout) clearTimeout(timeout);
   }
+}
+
+/** Same watch and announcement category (registered, state, offline, …). */
+function sameExternalCategory(a: ExternalAnnouncement, b: ExternalAnnouncement): boolean {
+  return a.watchId === b.watchId && a.key.split(":")[1] === b.key.split(":")[1];
 }

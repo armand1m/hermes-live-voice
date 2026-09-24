@@ -496,6 +496,74 @@ describe("live gateway WebSocket", () => {
     await monitor.close();
   }, 15_000);
 
+  it("records an external announcement only after it was spoken and retries a failed delivery", async () => {
+    const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const watchStore = new FileAgentWatchStore({ directory: dirname(config.tasks.stateFile) });
+    const agents: ExternalAgentPort = {
+      async listAgents() {
+        return [{
+          host: "exodia", harness: "herdr", agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+          paneId: "w4:p1", status: "working", revision: 23, stateChangeSeq: 360, cwd: "/repositories/diamond",
+        }];
+      },
+      async readRecentOutput() { return "building…"; },
+    };
+    const monitor = new ExternalAgentMonitor({ store: watchStore, agents, pollIntervalMs: 60_000 });
+    const server = await startTestServer({ config, hermes, provider, externalMonitor: monitor });
+    await readyClient(server.url);
+
+    // The first speech attempt fails (provider/TTS error); later ones succeed.
+    let attempts = 0;
+    provider.latest.notificationBehavior = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("TTS unavailable");
+    };
+    provider.emit({
+      type: "tool_call",
+      call: { id: "watch_retry", name: "watch_external_agent", args: { host: "exodia", pane_id: "w4:p1", objective: "Fix it." } },
+    });
+    provider.emit({ type: "response", status: "started", responseId: "turn_watch_retry" });
+    const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === "watch_retry");
+    provider.emit({ type: "response", status: "completed", responseId: "turn_watch_retry" });
+    const watchId = String(receipt.response.watch_id);
+
+    // Regression: the key used to be recorded before speaking, so the failed
+    // attempt lost "Now watching" for good. It must be retried and spoken.
+    await waitUntil(() => provider.latest.notifications.items.some((notice) => notice.announcement?.includes("Now watching")), 5_000);
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    await waitUntil(async () => (await watchStore.load(watchId))?.lastAnnouncedKey === `${watchId}:registered`, 2_000);
+    await monitor.close();
+  }, 10_000);
+
+  it("never speaks another owner's external watch", async () => {
+    const config = testConfig({ externalWork: { enabled: true, progressAnnouncements: true } });
+    const provider = new RecordingLiveAdapter();
+    const watchStore = new FileAgentWatchStore({ directory: dirname(config.tasks.stateFile) });
+    const agents: ExternalAgentPort = {
+      async listAgents() {
+        return [{
+          host: "exodia", harness: "herdr", agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2",
+          paneId: "w4:p1", status: "working", revision: 23, stateChangeSeq: 360, cwd: "/repositories/diamond",
+        }];
+      },
+      async readRecentOutput() { return "building…"; },
+    };
+    const monitor = new ExternalAgentMonitor({ store: watchStore, agents, pollIntervalMs: 60_000 });
+    const server = await startTestServer({ config, hermes: new HermesHarness(), provider, externalMonitor: monitor });
+    await readyClient(server.url);
+
+    await monitor.registerWatch({
+      ownerIdentity: "someone-else", host: "exodia", harness: "herdr",
+      agentSessionValue: "4432988d-611f-437a-8b3a-9937984a86e2", paneId: "w4:p1",
+      objective: "Their work.", acceptanceCriteria: ["x"],
+    });
+    await delay(400);
+    expect(provider.latest.notificationCalls).toHaveLength(0);
+    await monitor.close();
+  });
+
   it("returns a durable receipt immediately and keeps realtime conversation responsive during dispatch", async () => {
     const start = deferred<StartRunResult>();
     const hermes = new HermesHarness();
