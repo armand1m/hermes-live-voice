@@ -1,8 +1,10 @@
 import type { AgentWatchRecord } from "../../../domain/external-work/index.js";
+import type { DelegationHost } from "../../../domain/tasks/delegation.js";
 
 export interface AgentWatchListOptions {
   ownerId?: string;
   statuses?: readonly AgentWatchRecord["status"][];
+  host?: DelegationHost;
   linkedTaskId?: string;
   limit?: number;
 }

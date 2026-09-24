@@ -90,6 +90,7 @@ export class FileAgentWatchStore implements AgentWatchStorePort {
       const filtered = [...records.values()].filter((record) =>
         (options.ownerId === undefined || record.ownerId === options.ownerId)
         && (options.statuses === undefined || options.statuses.includes(record.status))
+        && (options.host === undefined || record.host === options.host)
         && (options.linkedTaskId === undefined || record.linkedTaskId === options.linkedTaskId));
       const ordered = filtered.sort(
         (left, right) => right.updatedAt - left.updatedAt || left.watchId.localeCompare(right.watchId));
