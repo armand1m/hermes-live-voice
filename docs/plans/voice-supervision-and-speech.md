@@ -76,10 +76,15 @@ Hermes remains the reasoning and execution agent. The gateway owns observation, 
 
 ### Stage 3 — measured speech improvements
 
-- Configurable ASR word boosting (Hermes, herdr, exodia, Mac mini, project names).
-- ASR result correlation by item/content identity and finality; partial transcripts for display only, tools dispatch on finalization only.
-- Endpointing changes validated against recorded audio before changing silence defaults.
-- Sentence-sized buffered synthesis and text-flushing controls behind a feature flag, after measuring first-audio latency; pronunciation dictionaries where supported. Keep full-utterance buffering as the default until measurements justify otherwise.
+Status (2026-09-24): partly done and deployed live on exodia. See [Latency and recognition tuning](../riva-migration.md#latency-and-recognition-tuning).
+
+- **Done:** ASR word boosting is sent to the NIM (`HERMES_LIVE_RIVA_ASR_WORD_BOOST` + `_SCORE`). Deriving phrases automatically from project names is still open.
+- **Done:** per-stage turn latency (`turn latency` journal line and `turnLatency` in `GET /v1/metrics`), used as the baseline for every change below.
+- **Done:** sentence-sized buffered synthesis behind `HERMES_LIVE_RIVA_BRAIN_STREAMING`, measured at 6.9 s → 2.9 s first audio on a four-sentence answer. It is enabled live; the code default stays off.
+- **Done:** the half-duplex playback-drain deadline now spans the whole TTS burst, not only its last 200 ms chunk.
+- **Open:** ASR result correlation by item/content identity and finality; partial transcripts for display only, tools dispatch on finalization only.
+- **Open:** endpointing changes validated against recorded audio before changing silence defaults. This needs an opt-in turn recorder first.
+- **Open:** pronunciation dictionaries where supported.
 
 ## Validation
 

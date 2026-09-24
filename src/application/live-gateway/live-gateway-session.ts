@@ -838,6 +838,7 @@ export class LiveGatewaySession {
         }
         this.userSpeaking = false;
         this.lastTurnHadSpeech = false;
+        this.speechTiming.noteTextInput(Date.now());
         await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(message.text), true);
         return;
       case "response.cancel":

@@ -53,6 +53,8 @@ interface TurnMarks {
   commitAt?: number;
   userFinalAt?: number;
   assistantTextAt?: number;
+  /** Opened by typed input rather than a transcript final. */
+  textInput?: boolean;
 }
 
 export interface SpeechTimingMetrics {
@@ -100,8 +102,19 @@ export class SpeechTimingTracker {
    * dropped echo turn never inflates the next turn's endpoint/total.
    */
   noteUserFinal(at: number, fromVoice: boolean): void {
+    // A typed turn already opened by noteTextInput keeps its earlier start
+    // when the provider echoes the user text back as a final.
+    if (!fromVoice && this.turn?.textInput && this.turn.assistantTextAt === undefined) return;
     if (!fromVoice || !this.turn || this.turn.userFinalAt !== undefined) this.turn = {};
     this.turn.userFinalAt = at;
+  }
+
+  /**
+   * The client typed a turn. Providers such as Riva never echo typed text
+   * as a user final, so the timeline starts here instead.
+   */
+  noteTextInput(at: number): void {
+    this.turn = { userFinalAt: at, textInput: true };
   }
 
   /** The first spoken assistant text of the answer (brain reply or receipt). */

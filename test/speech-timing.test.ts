@@ -98,4 +98,17 @@ describe("SpeechTimingTracker", () => {
     expect(tracker.noteFirstAudio(1_500)).toBeUndefined();
     expect(tracker.metrics().turnLatency.response.p50Ms).toBeNull();
   });
+
+  it("times typed turns from the client input even without a provider user final", () => {
+    const tracker = new SpeechTimingTracker();
+    tracker.noteTextInput(1_000);
+    tracker.noteAssistantText(1_900);
+    expect(tracker.noteFirstAudio(2_300)).toEqual({ brain: 900, tts: 400, response: 1_300 });
+
+    // A provider that echoes the typed text as a final keeps the earlier start.
+    tracker.noteTextInput(5_000);
+    tracker.noteUserFinal(5_050, false);
+    tracker.noteAssistantText(5_600);
+    expect(tracker.noteFirstAudio(5_800)).toEqual({ brain: 600, tts: 200, response: 800 });
+  });
 });
