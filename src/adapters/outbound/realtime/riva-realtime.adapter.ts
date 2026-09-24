@@ -479,7 +479,9 @@ class RivaRealtimeSession implements LiveModelSession {
       if (done) break;
       for (const event of decoder.push(value)) {
         const delta = ((event.choices as JsonObject[] | undefined)?.[0]?.delta ?? {}) as JsonObject;
-        if (delta.tool_calls !== undefined) {
+        // Servers send `tool_calls: null` on every plain-text delta when tools
+        // are offered; only a real fragment means the answer is a tool call.
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
           tools.push(delta.tool_calls);
           speech.halt();
         }

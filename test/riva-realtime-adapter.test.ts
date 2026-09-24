@@ -615,14 +615,16 @@ describe("Riva streamed brain", () => {
     .map((socket) => socket.sent.find((event) => event.type === "input_text.append")?.text);
 
   it("synthesizes each sentence as it streams and finalizes the full transcript", async () => {
+    // Real servers send tool_calls: null on plain-text deltas when tools are
+    // offered (regression: that null used to halt the sentence pipeline).
     const requests = mockBrain([
-      { content: "<think>plan</think>The deploy finished on exodia" },
-      { content: " without errors. All the canary checks" },
-      { content: " passed as well." },
+      { content: "<think>plan</think>The deploy finished on exodia", tool_calls: null },
+      { content: " without errors. All the canary checks", tool_calls: null },
+      { content: " passed as well.", tool_calls: null },
     ]);
     const events: LiveModelEvent[] = [];
     const session = await new RivaRealtimeAdapter(streamConfig).connect({
-      sessionId: "s", systemInstruction: "x", availableTools: [], callbacks: { onEvent: (event) => events.push(event) },
+      sessionId: "s", systemInstruction: "x", availableTools: ["list_background_tasks"], callbacks: { onEvent: (event) => events.push(event) },
     });
     await session.sendText("how did the deploy go");
     await vi.waitFor(() => expect(events.some((event) => event.type === "response" && event.status === "completed")).toBe(true));
