@@ -216,6 +216,65 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("delegates a running task: releases the Hermes slot, holds resources, never auto-completes", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    const supervisor = new TaskSupervisor({ store, hermes, maxConcurrent: 1 });
+    await supervisor.initialize();
+    const ownerId = supervisor.registerOwner("alice", "session-a");
+    const first = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Delegate the diamond fix",
+      resourceKeys: ["repo:diamond"],
+    });
+    await waitFor(async () => (await store.load(first.taskId))?.status === "running");
+    const runId = (await store.load(first.taskId))!.runId!;
+
+    // The verified handoff moves the task into the delegated phase.
+    const delegated = await supervisor.markDelegated(ownerId, first.taskId, "herdr agent launched on exodia (w4:p1).");
+    expect(delegated.status).toBe("delegated");
+    expect(delegated.events.at(-1)?.summary).toContain("exodia");
+    // Idempotent: re-registration does not duplicate the transition.
+    await expect(supervisor.markDelegated(ownerId, first.taskId)).resolves.toMatchObject({ revision: delegated.revision });
+
+    // The launch run completing must NOT complete the delegated task.
+    hermes.pushEvent(runId, { event: "run.completed", run_id: runId, output: "agent launched" });
+    hermes.setSnapshot(runId, { object: "hermes.run", run_id: runId, status: "completed", output: "agent launched", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    await delay(50);
+    expect((await store.load(first.taskId))?.status).toBe("delegated");
+
+    // The slot is free: a disjoint queued task is admitted even at
+    // maxConcurrent 1, but the same repo stays reserved.
+    const disjoint = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Inspect unrelated repo",
+      resourceKeys: ["repo:other"],
+    });
+    await waitFor(async () => (await store.load(disjoint.taskId))?.status === "running");
+    const conflicting = await supervisor.submit({
+      ownerIdentity: "alice",
+      sessionKey: "session-a",
+      input: "Mutate the same repo",
+      resourceKeys: ["repo:diamond"],
+    });
+    await delay(50);
+    expect((await store.load(conflicting.taskId))?.status).toBe("queued");
+
+    // Stopping the delegated shell cancels it without touching any run.
+    const stopped = await supervisor.stop(ownerId, first.taskId);
+    expect(stopped.status).toBe("cancelled");
+    expect(hermes.stopCalls.filter((id) => id === runId)).toHaveLength(0);
+    // Free the slot the disjoint task holds, then the repo-diamond reservation
+    // is gone too and the conflicting task admits.
+    const disjointRun = (await store.load(disjoint.taskId))!.runId!;
+    hermes.pushEvent(disjointRun, { event: "run.completed", run_id: disjointRun, output: "inspected" });
+    hermes.setSnapshot(disjointRun, { object: "hermes.run", run_id: disjointRun, status: "completed", output: "inspected", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+    await waitFor(async () => (await store.load(conflicting.taskId))?.status === "running");
+    await supervisor.close();
+  });
+
   it("persists an immediate queued receipt before dispatch and never persists the session key", async () => {
     const deferred = deferredValue<StartRunResult>();
     const store = new MemoryTaskStore();

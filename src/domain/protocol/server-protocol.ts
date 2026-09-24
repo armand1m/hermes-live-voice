@@ -97,6 +97,7 @@ export const PublicTaskStateSchema = z.enum([
   "accepted",
   "queued",
   "running",
+  "delegated",
   "stopping",
   "completed",
   "failed",

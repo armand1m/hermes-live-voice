@@ -53,6 +53,13 @@ const ACTIVE_TASK_STATUSES = new Set<TaskStatus>([
   "unknown",
   "dispatch_unknown",
 ]);
+/**
+ * Delegated work does not consume a Hermes execution slot (the run has handed
+ * off to an external harness agent), but it still holds its mutation
+ * reservation: a queued task on the same lineage or resource keys must not
+ * start a second mutation while the external agent works (plan §C).
+ */
+const RESOURCE_HOLDING_TASK_STATUSES = new Set<TaskStatus>([...ACTIVE_TASK_STATUSES, "delegated"]);
 const OWNER_ACTIVE_TASK_STATUSES: readonly TaskStatus[] = TaskStatusSchema.options.filter(
   (status) => !isTaskTerminal(status),
 );
@@ -352,6 +359,15 @@ export class TaskSupervisor implements TaskSupervisorPort {
       if (current.status === "queued") {
         return transitionTask(current, "cancelled", { now: this.now(), summary: cancellationSummary });
       }
+      if (current.status === "delegated") {
+        // The Hermes run already handed off. Stopping the task shell cancels
+        // the durable record; the external agent itself is never touched
+        // (observe-only monitoring, plan §B).
+        return transitionTask(current, "cancelled", {
+          now: this.now(),
+          summary: "Delegated task cancelled by its owner; the external agent was left untouched.",
+        });
+      }
       if (isTaskTerminal(current.status)) return current;
       return markTaskStopRequested(current, {
         now: this.now(),
@@ -377,6 +393,43 @@ export class TaskSupervisor implements TaskSupervisorPort {
     }
     if (!record.runId) return record;
     return this.requestStop(record, reason);
+  }
+
+  /**
+   * Record a verified handoff to an external harness agent (plan §C). The
+   * Hermes execution slot is released; resource reservations stay held and the
+   * task stays durably active until an explicit disposition.
+   */
+  markDelegated(ownerId: string, taskId: string, summary?: string): Promise<TaskRecord> {
+    this.assertReady();
+    const parsedOwnerId = TaskOwnerIdSchema.parse(ownerId);
+    const parsedTaskId = TaskIdSchema.parse(taskId);
+    return this.mutatePersist(parsedTaskId, (record) => {
+      if (record.ownerId !== parsedOwnerId) throw new TaskNotFoundError(parsedTaskId);
+      if (record.status === "delegated") return record;
+      if (!canTransitionTask(record.status, "delegated")) {
+        throw new Error(`A task in state ${record.status} cannot enter the delegated phase.`);
+      }
+      return transitionTask(record, "delegated", {
+        now: this.now(),
+        summary: sanitizeTaskEventSummary(summary ?? "Work handed off to an external agent; the gateway is monitoring."),
+      });
+    }).then((record) => {
+      if (record.status === "delegated" && !isTaskOperationallyClosed(record)) {
+        // The launch run is finished business: stop proving it while the
+        // external-work watch takes over observation. A pruned upstream run
+        // must never flip a delegated task to unknown.
+        this.pollSuppressed.add(record.taskId);
+        for (const key of [`poll:${record.taskId}`, `activity:${record.taskId}`, `observation:${record.taskId}`]) {
+          const handle = this.timers.get(key);
+          if (handle !== undefined) {
+            this.scheduler.clearTimeout(handle);
+            this.timers.delete(key);
+          }
+        }
+      }
+      return record;
+    });
   }
 
   acknowledgeNotification(ownerId: string, taskId: string): Promise<TaskRecord> {
@@ -502,9 +555,17 @@ export class TaskSupervisor implements TaskSupervisorPort {
         return;
       }
       if (record.runId && !isTaskOperationallyClosed(record)) {
+        if (record.status === "delegated") {
+          // Delegated work is observed by the external-work monitor, not by
+          // the launch run's watcher (plan §B/§C).
+          this.pollSuppressed.add(record.taskId);
+          return;
+        }
         await this.reconcileTask(record.taskId);
         const reconciled = await this.store.load(record.taskId);
-        if (reconciled?.runId && !isTaskOperationallyClosed(reconciled)) this.startWatcher(reconciled);
+        if (reconciled?.runId && !isTaskOperationallyClosed(reconciled) && reconciled.status !== "delegated") {
+          this.startWatcher(reconciled);
+        }
       }
     });
     this.initialized = true;
@@ -637,6 +698,12 @@ export class TaskSupervisor implements TaskSupervisorPort {
         && record.upstreamRunMissingAt === undefined
         && record.operatorContainedAt === undefined);
       if (active.length >= this.maxConcurrent) return undefined;
+      // Delegated tasks no longer consume a slot but still reserve their
+      // resources against conflicting admission.
+      const resourceHolders = records.filter((record) =>
+        RESOURCE_HOLDING_TASK_STATUSES.has(record.status)
+        && record.upstreamRunMissingAt === undefined
+        && record.operatorContainedAt === undefined);
       const now = this.now();
       const queued = records
         .filter((record) => record.status === "queued")
@@ -656,7 +723,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
         }
         if (!this.ownerSessionKeys.has(candidate.ownerId)) continue;
         if ((this.retryNotBefore.get(candidate.taskId) ?? 0) > now) continue;
-        if (!canAdmit(candidate, active, this.trustDeclaredReadOnly)) {
+        if (!canAdmit(candidate, resourceHolders, active.length, this.trustDeclaredReadOnly)) {
           // An exclusive task is a FIFO barrier so it cannot be starved by a
           // stream of later reads. A read blocked only by an overlapping key
           // does not need to head-of-line block later disjoint read-only work.
@@ -1165,6 +1232,13 @@ export class TaskSupervisor implements TaskSupervisorPort {
   ): Promise<TaskRecord> {
     let current = await this.requireTask(taskId);
     if (current.status === target || isTaskOperationallyClosed(current)) return current;
+    // Delegated work is external: upstream run lifecycle (a completed launch
+    // run, a stale running snapshot) must never terminate or resume it. Only
+    // an explicit disposition (cancellation, containment) moves it, and the
+    // run watcher keeps proving observability via freshness-only writes.
+    if (current.status === "delegated" && target !== "cancelled" && target !== "unknown") {
+      return current;
+    }
     if (target === "running") {
       if (current.status === "queued") current = await this.transitionPersist(taskId, "dispatching");
       if (["dispatching", "unknown", "dispatch_unknown", "waiting_for_approval"].includes(current.status)) {
@@ -1188,6 +1262,9 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private markUnknown(taskId: string, summary: string, upstreamRunMissing = false): Promise<TaskRecord> {
     return this.mutatePersist(taskId, (record) => {
       if (isTaskOperationallyClosed(record)) return record;
+      // A delegated task outlives its launch run; Hermes pruning that run is
+      // expected, not an unknown outcome (plan §C).
+      if (record.status === "delegated") return record;
       if (record.status === "unknown") {
         return upstreamRunMissing && record.upstreamRunMissingAt === undefined
           ? transitionTask(record, "unknown", { now: this.now(), summary, upstreamRunMissing: true })
@@ -1391,18 +1468,20 @@ const defaultScheduler: TaskSupervisorScheduler = {
 
 function canAdmit(
   candidate: TaskRecord,
-  active: readonly TaskRecord[],
+  resourceHolders: readonly TaskRecord[],
+  activeCount: number,
   trustDeclaredReadOnly: boolean,
 ): boolean {
-  if (active.length === 0) return true;
+  if (resourceHolders.length === 0) return true;
   const candidateRoot = candidate.rootTaskId ?? candidate.taskId;
-  if (active.some((record) => (record.rootTaskId ?? record.taskId) === candidateRoot)) return false;
+  if (resourceHolders.some((record) => (record.rootTaskId ?? record.taskId) === candidateRoot)) return false;
+  if (activeCount === 0) return true;
   // The policy flag also governs records created by an older release or a
   // previous configuration. Otherwise upgrading with the safer default could
   // silently preserve model-declared parallel execution from persisted state.
   if (!trustDeclaredReadOnly) return false;
   if (candidate.executionMode !== "parallel_read_only") return false;
-  return active.every((record) =>
+  return resourceHolders.every((record) =>
     record.executionMode === "parallel_read_only"
     && resourcesAreDisjoint(candidate.resourceKeys, record.resourceKeys));
 }

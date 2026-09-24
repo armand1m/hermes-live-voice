@@ -28,6 +28,7 @@ export type HermesLiveTaskState =
   | "accepted"
   | "queued"
   | "running"
+  | "delegated"
   | "stopping"
   | "completed"
   | "failed"

@@ -62,6 +62,7 @@ const ACTIVE_TASK_STATES = new Set([
   "accepted",
   "queued",
   "running",
+  "delegated",
   "stopping",
 ]);
 const TASK_STOP_RESPONSE_TYPES = new Set([
@@ -2280,6 +2281,7 @@ function validateTaskSnapshot(value) {
     "accepted",
     "queued",
     "running",
+    "delegated",
     "stopping",
     "completed",
     "failed",
@@ -2434,7 +2436,11 @@ function taskFromLifecycle(existing, message) {
       }, ["error"]);
     case "task.progress":
       return nextTaskSnapshot(existing, message, {
-        state: existing.state === "stopping" ? "stopping" : "running",
+        state: existing.state === "stopping"
+          ? "stopping"
+          : existing.state === "delegated"
+            ? "delegated"
+            : "running",
         progress: message.progress,
       }, ["error"]);
     case "task.stopping":

@@ -52,7 +52,7 @@ export function projectTaskSnapshot(record: TaskRecord, options: ProjectTaskOpti
     };
   } else if (state === "failed" || state === "unknown") {
     snapshot.error = publicTaskError(record);
-  } else if (state === "running" || state === "stopping") {
+  } else if (state === "running" || state === "stopping" || state === "delegated") {
     const summary = latestProgressSummary(record);
     if (summary) snapshot.progress = { message: summary };
   }
@@ -106,6 +106,10 @@ export function projectTaskLifecycle(record: TaskRecord, requestId?: string): Se
       return record.events.at(-1)?.type === "progress"
         ? { type: "task.progress", ...base, progress: { message: summary } }
         : { type: "task.started", ...base, title: record.title.slice(0, PUBLIC_TITLE_CHARS) };
+    case "delegated":
+      // External execution phase: progress facts only. The terminal outcome
+      // arrives by explicit disposition, never from observed idleness.
+      return { type: "task.progress", ...base, progress: { message: summary } };
     case "waiting_for_approval":
       // Current Hermes releases cannot target approval responses safely. The
       // supervisor immediately contains these runs, so clients receive a

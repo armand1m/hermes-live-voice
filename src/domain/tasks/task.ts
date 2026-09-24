@@ -56,6 +56,14 @@ export const TaskStatusSchema = z.enum([
   "queued",
   "dispatching",
   "running",
+  /**
+   * External execution phase (plan §C): a registered handoff moved the work to
+   * an external harness agent. The Hermes execution slot is released, but
+   * mutation reservations stay held and the gateway keeps monitoring. Terminal
+   * outcomes require explicit disposition — observed idleness is never treated
+   * as completion.
+   */
+  "delegated",
   "waiting_for_approval",
   "stopping",
   "completed",

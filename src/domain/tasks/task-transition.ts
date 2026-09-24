@@ -21,7 +21,11 @@ const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["completed", "failed", "canc
 const ALLOWED_TASK_TRANSITIONS: Readonly<Record<TaskStatus, ReadonlySet<TaskStatus>>> = {
   queued: new Set(["dispatching", "cancelled"]),
   dispatching: new Set(["queued", "running", "failed", "cancelled", "dispatch_unknown"]),
-  running: new Set(["waiting_for_approval", "stopping", "completed", "failed", "cancelled", "unknown"]),
+  running: new Set(["delegated", "waiting_for_approval", "stopping", "completed", "failed", "cancelled", "unknown"]),
+  // Entering delegated happens only through a registered, verified handoff.
+  // Leaving it is an explicit disposition (operator/brain tool or containment)
+  // — monitoring observations never terminate a delegated task on their own.
+  delegated: new Set(["completed", "failed", "cancelled", "unknown"]),
   waiting_for_approval: new Set(["running", "stopping", "failed", "cancelled", "unknown"]),
   stopping: new Set(["completed", "failed", "cancelled", "unknown"]),
   completed: new Set(),
