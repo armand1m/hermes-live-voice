@@ -891,6 +891,8 @@ export class LiveGatewaySession {
         this.userSpeaking = false;
         this.lastTurnHadSpeech = false;
         this.speechTiming.noteTextInput(Date.now());
+        // Riva never echoes typed text as a user final: record it here.
+        this.reflectionTranscript.add("user", message.text);
         await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(message.text), true);
         return;
       case "response.cancel":
@@ -2443,7 +2445,8 @@ export class LiveGatewaySession {
       // marks the brain → TTS boundary of the turn timeline.
       if ((event.speaker ?? "assistant") === "assistant") this.speechTiming.noteAssistantText(Date.now());
       if ((event.speaker ?? "assistant") === "user" && event.final) {
-        this.reflectionTranscript.add("user", event.text);
+        // Typed turns were recorded at input; only spoken finals add here.
+        if (this.lastTurnHadSpeech) this.reflectionTranscript.add("user", event.text);
         this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();

@@ -662,6 +662,27 @@ describe("live gateway WebSocket", () => {
     });
   });
 
+  it("counts typed turns toward reflection exactly once", async () => {
+    const config = { ...testConfig(), knowledge: { enabled: false, turnContext: false, path: "", reflection: true } };
+    const hermes = new HermesHarness();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config, hermes, provider });
+    const client = await readyClient(server.url);
+    for (let turn = 0; turn < 4; turn += 1) {
+      send(client.socket, { type: "text.input", id: `typed_${turn}`, text: `Typed question ${turn}.` });
+      // A provider that echoes typed text back must not double-count it.
+      provider.emit({ type: "text", speaker: "user", text: `Typed question ${turn}.`, final: true });
+      provider.emit({ type: "response", status: "started", responseId: `typed_resp_${turn}` });
+      provider.emit({ type: "text", speaker: "assistant", text: `Answer ${turn}.`, final: true });
+      provider.emit({ type: "response", status: "completed", responseId: `typed_resp_${turn}` });
+      await delay(20);
+    }
+    client.socket.close();
+    await waitUntil(() => hermes.startCalls.length === 1);
+    const input = hermes.startCalls[0]!.input;
+    expect(input.match(/User: Typed question 2\./gu)).toHaveLength(1);
+  });
+
   it("does not reflect on short voice sessions", async () => {
     const config = { ...testConfig(), knowledge: { enabled: false, turnContext: false, path: "", reflection: true } };
     const hermes = new HermesHarness();
