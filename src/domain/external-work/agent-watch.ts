@@ -198,7 +198,8 @@ export function createAgentWatchRecord(input: CreateAgentWatchInput): AgentWatch
     sequence: 1,
     type: "watch.started",
     timestamp: now,
-    summary: `Watching ${input.harness} on ${input.host}: ${objective.slice(0, 180)}`,
+    // Objectives are multi-line briefs; the event summary is one safe line.
+    summary: sanitizeSingleLine(`Watching ${input.harness} on ${input.host}: ${objective}`).slice(0, 180 + 40),
   };
   return AgentWatchRecordSchema.parse({
     schemaVersion: AGENT_WATCH_SCHEMA_VERSION,

@@ -125,7 +125,8 @@ export function prepareSpokenContent(
     // Punctuation spacing for speech: gaps before punctuation close up, and
     // run-together commas/colons gain a pause — unless digits sit astride the
     // mark (thousands separators, ratios, and versions stay verbatim).
-    .replace(/ +([,.;:!?])/gu, "$1")
+    // …but a period that starts a word (".ts", ".env") is not punctuation.
+    .replace(/ +([,;:!?]|\.(?![\p{L}\p{N}]))/gu, "$1")
     .replace(/([,;:])(?=[A-Za-z])/gu, "$1 ")
     .replace(/ {2,}/gu, " ")
     .trim();

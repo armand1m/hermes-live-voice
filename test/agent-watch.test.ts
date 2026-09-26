@@ -114,6 +114,16 @@ describe("agent watch domain", () => {
       .toThrow(/mismatch event/);
   });
 
+  it("accepts a multi-line objective brief (regression: the watch summary must stay one line)", () => {
+    const watch = createAgentWatchRecord({
+      ...WATCH_INPUT,
+      objective: "## Goal\nSummarize src/application/knowledge.\n\n## Done when\n- /tmp/knowledge-summary.md exists",
+      now: 100,
+    });
+    expect(watch.objective).toContain("\n");
+    expect(watch.events[0]!.summary).toBe("Watching herdr on exodia: ## Goal Summarize src/application/knowledge. ## Done when - /tmp/knowledge-summary.md exists");
+  });
+
   it("stops cleanly and tracks announcements idempotently", () => {
     let watch = createAgentWatchRecord({ ...WATCH_INPUT, now: 100 });
     watch = stopWatch(watch, { now: 150, reason: "Owner released the watch." });
