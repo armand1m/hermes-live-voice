@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { parseHostAgentDefaults, type HostAgentDefaults } from "./domain/external-work/agent-profiles.js";
 import { z } from "zod/v3";
 
 export const MAX_COMPATIBLE_AUDIO_FRAME_BYTES = 5_900_000;
@@ -139,6 +140,8 @@ const EnvSchema = z.object({
   HERMES_LIVE_PROGRESS_ANNOUNCEMENTS: z.string().optional(),
   HERMES_LIVE_HERDR_EXECUTABLE: z.string().min(1).default("herdr"),
   HERMES_LIVE_MSSH_EXECUTABLE: z.string().min(1).default("mssh"),
+  /** Default coding agent per host, e.g. "exodia=claude-glm,mac-mini=claude". */
+  HERMES_LIVE_DELEGATION_AGENTS: z.string().optional(),
   HERMES_LIVE_RIVA_VOICE: z.string().trim().min(1).max(128).default("Magpie-Multilingual.EN-US.Jason"),
   HERMES_LIVE_RIVA_WS_KEEPALIVE_MS: z.coerce.number().int().min(0).max(120_000).default(25_000),
   HERMES_LIVE_RIVA_BRAIN_MAX_TOKENS: z.coerce.number().int().min(128).max(8_192).default(2_048),
@@ -326,7 +329,14 @@ export interface AppConfig {
     /** Managed runtime compatibility mode; external upstream endpoints leave this unset. */
     ownsTurnRouting?: boolean;
   };
-  externalWork?: { enabled: boolean; progressAnnouncements: boolean; herdrExecutable: string; msshExecutable: string };
+  externalWork?: {
+    enabled: boolean;
+    progressAnnouncements: boolean;
+    herdrExecutable: string;
+    msshExecutable: string;
+    /** Coding agent launched per host when a delegation names none. */
+    agentDefaults?: HostAgentDefaults;
+  };
   riva: {
     asrWordBoost?: string[];
     asrWordBoostScore?: number;
@@ -462,6 +472,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       progressAnnouncements: parseBool(parsed.HERMES_LIVE_PROGRESS_ANNOUNCEMENTS),
       herdrExecutable: parsed.HERMES_LIVE_HERDR_EXECUTABLE,
       msshExecutable: parsed.HERMES_LIVE_MSSH_EXECUTABLE,
+      agentDefaults: parseHostAgentDefaults(parsed.HERMES_LIVE_DELEGATION_AGENTS),
     },
     riva: {
       asrWordBoost: parsed.HERMES_LIVE_RIVA_ASR_WORD_BOOST.split(",").map((word) => word.trim()).filter(Boolean).slice(0, 100),

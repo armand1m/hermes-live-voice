@@ -20,6 +20,12 @@ import { VoiceArbiter } from "../../../application/live-gateway/voice-arbiter.js
 import { KnowledgeService } from "../../../application/knowledge/knowledge-service.js";
 import { openSqliteKnowledgeIndex } from "../../outbound/knowledge/sqlite-knowledge-index.js";
 import { FileVadRecorder } from "../../outbound/vad-recording/file-vad-recorder.js";
+import {
+  AGENT_PROFILE_NAMES,
+  DEFAULT_HOST_AGENTS,
+  isAgentProfileName,
+  type HostAgentDefaults,
+} from "../../../domain/external-work/agent-profiles.js";
 import { TURN_STAGES, type StagePercentiles, type TurnStage } from "../../../application/live-gateway/speech-timing.js";
 import { TaskSupervisor } from "../../../application/task-supervisor/task-supervisor.js";
 import type { LiveModelAdapter } from "../../../application/live-gateway/ports/realtime-model.port.js";
@@ -158,6 +164,7 @@ export async function startServer({
   const delegations = providedDelegations ?? (externalWork?.enabled && externalMonitor
     ? new DelegationService({
         launches: new HerdrExternalLaunchAdapter({
+          localHost: "exodia",
           agentAdapter: new HerdrExternalAgentAdapter({
             herdrExecutable: externalWork.herdrExecutable,
             msshExecutable: externalWork.msshExecutable,
@@ -482,7 +489,7 @@ export async function startServer({
 const DELEGATION_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/u;
 const DELEGATION_REPOSITORY_PATTERN = /^\/[^ -]{0,500}$/u;
 
-function parseDelegationRequest(body: Record<string, unknown>):
+function parseDelegationRequest(body: Record<string, unknown>, agentDefaults?: HostAgentDefaults):
   | { ok: true; value: {
       idempotencyKey: string;
       host: "exodia" | "mac-mini";
@@ -510,9 +517,12 @@ function parseDelegationRequest(body: Record<string, unknown>):
   if (!objective || objective.length > 4_000) {
     return { ok: false, error: "objective must be 1-4000 characters." };
   }
-  const agentKind = typeof body.agent_kind === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(body.agent_kind)
-    ? body.agent_kind
-    : "claude";
+  // An omitted agent resolves to the host's default profile (claude-glm on
+  // exodia, claude on the Mac mini unless configured otherwise).
+  if (body.agent_kind !== undefined && !isAgentProfileName(body.agent_kind)) {
+    return { ok: false, error: `agent_kind must be one of ${AGENT_PROFILE_NAMES.join(", ")}.` };
+  }
+  const agentKind: string = isAgentProfileName(body.agent_kind) ? body.agent_kind : (agentDefaults ?? DEFAULT_HOST_AGENTS)[host];
   const acceptanceCriteria = Array.isArray(body.acceptance_criteria)
     ? body.acceptance_criteria
         .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
@@ -914,7 +924,7 @@ async function handleHttp(
       json(req, res, 400, { status: "invalid_request", error: errorToMessage(error) });
       return;
     }
-    const parse = parseDelegationRequest(body);
+    const parse = parseDelegationRequest(body, options.config.externalWork?.agentDefaults);
     if (!parse.ok) {
       json(req, res, 400, { status: "invalid_request", error: parse.error });
       return;
