@@ -67,14 +67,12 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
       type: "object",
       additionalProperties: false,
       properties: {
-        message: { type: "string", description: "The complete, concise task, in the user's terms." },
+        message: { type: "string", description: "The complete, concise task in the user's own terms, including any machine or agent they named (Hermes resolves those; never add ones they did not say)." },
         work: {
           type: "string",
           enum: ["delegate", "quick_check"],
           description: "delegate (default): real work (code, fixes, research, anything that changes something) goes to a coding agent. quick_check: a short read-only lookup such as disk space or a status question.",
         },
-        host: { type: "string", enum: ["exodia", "mac-mini"], description: "Only when the user named the machine." },
-        agent: { type: "string", enum: ["claude", "claude-glm", "codex"], description: "Only when the user asked for a specific agent." },
         title: { type: "string", description: "A short user-facing title for the task inbox." },
         recent_voice_context: {
           type: "string",

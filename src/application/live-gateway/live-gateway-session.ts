@@ -1545,18 +1545,11 @@ export class LiveGatewaySession {
         const resourceKeys = this.deps.config.tasks.trustDeclaredReadOnly === true
           ? resourceKeysArg(call)
           : undefined;
-        // Orchestration is the default: Hermes briefs a herdr coding agent.
-        // Stated machine/agent preferences travel with the request.
+        // Orchestration is the default: Hermes briefs a herdr coding agent and
+        // resolves machine and agent from the user's own words (the voice
+        // brain filled optional host/agent fields the user never said).
         const workMode = stringArg(call, "work") === "quick_check" ? "quick" : "orchestrate";
-        const host = optionalStringArg(call, "host");
-        const agent = optionalStringArg(call, "agent");
-        if (host && host !== "exodia" && host !== "mac-mini") throw new Error("host must be exodia or mac-mini.");
-        if (agent && !["claude", "claude-glm", "codex"].includes(agent)) throw new Error("agent must be claude, claude-glm, or codex.");
-        const preferences = [
-          host ? `Requested machine: ${host}.` : "",
-          agent ? `Requested coding agent: ${agent}.` : "",
-        ].filter(Boolean).join(" ");
-        const input = [message, preferences, recentContext ? `Recent voice context:\n${recentContext}` : ""]
+        const input = [message, recentContext ? `Recent voice context:\n${recentContext}` : ""]
           .filter(Boolean).join("\n\n");
         return this.runTaskOperation(() => this.deps.taskSupervisor.submit({
           ownerIdentity: this.sessionKey!,
@@ -1572,7 +1565,7 @@ export class LiveGatewaySession {
           // quick checks run in parallel), so no "queued" promise to repeat.
           spoken_response: workMode === "quick"
             ? "Checking now."
-            : `On it — Hermes will brief ${agent ? `a ${agent} agent` : "a coding agent"}${host ? ` on ${host === "mac-mini" ? "the Mac mini" : host}` : ""} for that.`,
+            : "On it — Hermes will brief a coding agent for that.",
           work: workMode,
           ok: true,
           task_id: task.taskId,
