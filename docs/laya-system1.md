@@ -19,6 +19,31 @@ model card says the base checkpoint "ships over-confident — refit temperature
 on your data first". Our voice-routing questions are zero-shot-like until
 proven otherwise on this user's traffic.
 
+## Phase 1b: re-test and new question set (2026-09-26)
+
+The first 145 shadow turns scored at chance against the brain (route agreement 49%, AUC ≈ 0.4–0.5, median confidence 0.10, and 39% of calls timed out). An offline re-test showed the question framing was the cause, not only the model. The test used the same sidecar on 71 turns hand-labeled from the utterance text, and re-ran the original framing without its timeout.
+
+| Framing | Latency per call | Per-intent AUC |
+| --- | --- | --- |
+| Original: one 4-way `route` choice over a free-text `user: … / recent turns: …` state | ~1.2 s | ≈ 0.5 (chance) |
+| One yes/no question per intent, phrased like LAYA's own presets and naming a field, over `{"utterance": …}` | ~0.48 s | 0.84–0.92 |
+| The same, with the recent conversation added to the state | ~1 s | worse on every intent |
+
+- **Frustration:** a graded `score` question (0 calm … 3 very frustrated) separated frustrated from positive turns perfectly on 13 labeled turns.
+- **Mood:** a one-word `choice` is a weaker, secondary signal. It often reads frustration as "curious".
+
+The live shadow now asks two sidecar calls per turn (the sidecar allows at most four questions each):
+- **mood first:** `small_talk`, `frustration`, `mood`
+- **then intents:** `new_work`, `task_status`, `recall`, `remember`
+
+The state is `{"utterance": …}`. Rows carry `schema: 2`, and `analyze_shadow.py` reports per-intent AUC against the brain's tool calls for them. Typed turns are classified too.
+
+**Where the mood goes:**
+- **Diagnostics overlay:** the latest mood appears as the `mood` row (for example `frustrated · 2.1/3 · 12s`) via `userMood` in `GET /v1/metrics`.
+- **Brain hint:** with `HERMES_LIVE_LAYA_MOOD_STEERING="true"`, a frustrated, stressed, or confused previous message adds a one-line hint to the voice brain's next turn. It is never the current turn, because LAYA answers after the brain has already started.
+
+The routing verdict stands: nothing waits on LAYA.
+
 ## Pieces
 
 | Piece | What it is |
@@ -36,9 +61,10 @@ proven otherwise on this user's traffic.
 | --- | --- | --- |
 | `HERMES_LIVE_LAYA_URL` | unset | Sidecar base URL. **Unset = feature fully inert** (same kill-switch shape as `HERMES_LIVE_TTS_URL`). Must be a loopback HTTP(S) URL. |
 | `HERMES_LIVE_LAYA_SHADOW_ENABLED` | `"true"` | Master switch for logging while piloting. |
-| `HERMES_LIVE_LAYA_TIMEOUT_MS` | `1500` | Hard per-request deadline; slower answers are logged as `timeout`. |
+| `HERMES_LIVE_LAYA_TIMEOUT_MS` | `1500` | Hard deadline for each of the two per-turn calls; slower answers are logged as `timeout`. |
+| `HERMES_LIVE_LAYA_MOOD_STEERING` | unset (off) | Add a one-line hint about a frustrated, stressed, or confused previous message to the voice brain's next turn. |
 
-All three are registered in `MANAGED_CONFIG_KEYS`
+All of them are registered in `MANAGED_CONFIG_KEYS`
 (`src/cli/managed-config.ts`) — unregistered keys crash the gateway at boot,
 so they must only ever be set through the managed config / environment.
 

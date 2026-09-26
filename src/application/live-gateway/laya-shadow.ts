@@ -3,6 +3,7 @@ import { appendFile, mkdir, rename, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AppConfig } from "../../config.js";
 import type { Logger } from "../../logger.js";
+import { FRUSTRATION_LEVELS, MOOD_WORDS, parseLayaMood, type LayaMood } from "./laya-mood.js";
 
 // LAYA System-1 shadow client (docs/laya-system1.md): logs per-turn routing
 // classifications next to the brain's actual tool calls so agreement and
@@ -11,12 +12,8 @@ import type { Logger } from "../../logger.js";
 // or speech path. Every failure (sidecar down, timeout, malformed response)
 // degrades to an "unknown" row in the log, never a thrown error.
 
-/** Hard state budget: LAYA's 512-token window destroys decisions that put the
- * current utterance at the end of a long context, so the utterance always
- * comes first and the recent-turn tail is dropped before anything else. */
+/** Hard state budget for the utterance. LAYA reads a 512-token window. */
 export const LAYA_STATE_BUDGET_CHARS = 1_400;
-/** Recent turns kept in the state, one line each (newest preferred). */
-export const LAYA_STATE_RECENT_TURNS = 6;
 /** Rotate the shadow log once it grows past this. */
 export const LAYA_SHADOW_LOG_MAX_BYTES = 10 * 1024 * 1024;
 /** Answer cache entries (utterance hash → answers), for Phase-2 admission reuse. */
@@ -25,46 +22,61 @@ const MAX_CACHED_ANSWERS = 64;
 const ANSWER_CACHE_TTL_MS = 10 * 60_000;
 /** Pending (not yet outcome-joined) rows; oldest is finalized on overflow. */
 const MAX_PENDING_ROWS = 16;
+/** Row format; 2 = per-intent + mood questions over a structured state. */
+export const LAYA_SHADOW_SCHEMA = 2;
 
 /**
- * The Phase-1 question set (plan §3.1 + §3.2): route classification plus the
- * two cheap noul signals. Three questions keeps the sidecar predict under
- * ~1.5 s on CPU; `route` has 4 options, well under the ≥11-option bucket the
- * laya checkpoint ships unclamped-temperature confidence for.
+ * Question sets, phrased the way LAYA's own presets are (yes/no or graded
+ * questions that name a field of a structured state). The 2026-09-26 offline
+ * re-test on 71 hand-labeled turns: the original single 4-way `route` choice
+ * over a free-text state scored at chance (AUC ~0.5); one noul per intent over
+ * `{"utterance": …}` scored AUC 0.84-0.92 at ~0.5 s per call, and adding the
+ * recent conversation to the state made every intent worse. The sidecar takes
+ * at most 4 questions per call, so mood and intents are two calls — mood
+ * first, since the diagnostics overlay and brain steering want it soonest.
  */
-export const LAYA_SHADOW_QUESTIONS = {
-  route: {
+export const LAYA_MOOD_QUESTIONS = {
+  small_talk: {
+    type: "noul",
+    instructions: "Is `utterance` only a greeting, small talk, thanks, or a short acknowledgement with no request?",
+  },
+  frustration: {
+    type: "score",
+    instructions: "How frustrated does the user sound in `utterance`?",
+    criteria: [...FRUSTRATION_LEVELS],
+  },
+  mood: {
     type: "choice",
-    instructions: "What should the voice agent do with this user turn?",
-    criteria: {
-      answer_directly: "quick conversational reply or acknowledgement, no tools needed",
-      continue_hermes_conversation: "question about memory or persisted chat that needs the Hermes session",
-      start_background_task: "meaningful work (files, terminal, research, code, host checks) that should run as a durable background task",
-      task_control: "asking to list, check, follow up, or stop an existing background task",
-    },
-  },
-  trivial_chat: {
-    type: "noul",
-    instructions: "Is this turn pure small talk or social acknowledgement that needs no work at all?",
-  },
-  read_only: {
-    type: "noul",
-    instructions: "Is the requested work provably read-only (no writes, no git mutations, no deploys, no external messages)?",
+    instructions: "Which word best describes how the user feels in `utterance`?",
+    criteria: { ...MOOD_WORDS },
   },
 } as const;
 
-export interface LayaTurnLine {
-  speaker: "user" | "assistant";
-  text: string;
-}
+export const LAYA_INTENT_QUESTIONS = {
+  new_work: {
+    type: "noul",
+    instructions: "Does the user in `utterance` ask the assistant to do a piece of work, such as running, checking, building, fixing, researching, or starting an agent?",
+  },
+  task_status: {
+    type: "noul",
+    instructions: "Does `utterance` ask about the status, progress, details, or cleanup of tasks that are already running or finished?",
+  },
+  recall: {
+    type: "noul",
+    instructions: "Does `utterance` ask what the assistant knows or remembers about the user or about earlier conversations?",
+  },
+  remember: {
+    type: "noul",
+    instructions: "Does `utterance` state or correct a personal fact (a name, preference, or detail) the assistant should remember?",
+  },
+} as const;
+
+/** Every question asked per turn, as logged in each row. */
+export const LAYA_SHADOW_QUESTIONS = { ...LAYA_MOOD_QUESTIONS, ...LAYA_INTENT_QUESTIONS } as const;
 
 export interface LayaStateInput {
-  /** The finalized user utterance for this turn. Always placed first. */
+  /** The finalized user utterance for this turn. */
   utterance: string;
-  /** Prior turns, oldest → newest; the builder keeps the newest that fit. */
-  recentTurns?: readonly LayaTurnLine[];
-  /** Titles of currently active background tasks (one summary line). */
-  activeTaskTitles?: readonly string[];
   /** Hard character budget; defaults to LAYA_STATE_BUDGET_CHARS. */
   budgetChars?: number;
 }
@@ -74,45 +86,16 @@ export interface LayaState {
   utteranceHash: string;
 }
 
-/** Utterance first, then the newest recent turns (one line each), then one
- * active-task-titles line — all under the hard budget. Overflow drops the
- * recent-turn tail first, then the task line; the utterance is never dropped
- * (only truncated if it alone exceeds the budget). */
+/**
+ * `{"utterance": …}` — the field every question names. The utterance alone
+ * outperformed utterance + recent turns in the re-test; an over-budget
+ * utterance keeps its opening words, where the request usually is.
+ */
 export function buildLayaState(input: LayaStateInput): LayaState {
   const budget = input.budgetChars ?? LAYA_STATE_BUDGET_CHARS;
-  const prefix = "user: ";
-  // The utterance is never dropped — an over-budget utterance is truncated
-  // head-first (the request's opening words carry the routing signal).
-  const utterance = input.utterance.trim().slice(0, Math.max(1, budget - prefix.length));
-  let remaining = budget - prefix.length - utterance.length;
-
-  const keepTurns: string[] = [];
-  const recentTurns = input.recentTurns ?? [];
-  for (let index = recentTurns.length - 1; index >= 0 && keepTurns.length < LAYA_STATE_RECENT_TURNS; index -= 1) {
-    const turn = recentTurns[index]!;
-    const line = `${turn.speaker}: ${turn.text.trim().slice(0, 200)}`;
-    const cost = line.length + 1 + (keepTurns.length === 0 ? 1 + "recent turns:".length : 0);
-    if (cost > remaining) break;
-    keepTurns.push(line);
-    remaining -= cost;
-  }
-
-  const taskTitles = (input.activeTaskTitles ?? []).slice(0, 8).map((title) => title.trim()).filter(Boolean);
-  let taskLine = "";
-  if (taskTitles.length > 0) {
-    const candidate = `active tasks: ${taskTitles.join("; ").slice(0, 240)}`;
-    if (candidate.length + 1 <= remaining) taskLine = candidate;
-  }
-
-  const sections = [`${prefix}${utterance}`];
-  if (keepTurns.length > 0) {
-    sections.push("recent turns:");
-    sections.push(...keepTurns.reverse());
-  }
-  if (taskLine) sections.push(taskLine);
-
+  const utterance = input.utterance.trim().slice(0, Math.max(1, budget));
   return {
-    state: sections.join("\n").slice(0, budget),
+    state: JSON.stringify({ utterance }),
     utteranceHash: utteranceHash(input.utterance),
   };
 }
@@ -129,6 +112,7 @@ export interface LayaShadowToolCall {
 }
 
 export interface LayaShadowRow {
+  schema: typeof LAYA_SHADOW_SCHEMA;
   ts: number;
   sessionId: string;
   utteranceHash: string;
@@ -197,6 +181,13 @@ export class LayaShadowLog {
   }
 }
 
+export interface LayaTurnHooks {
+  /** The user's mood for this turn, as soon as the mood call answers. */
+  onMood?: (mood: LayaMood) => void;
+}
+
+class LayaTimeoutError extends Error {}
+
 export interface LayaShadowRecorderOptions {
   baseUrl: string;
   timeoutMs: number;
@@ -230,17 +221,18 @@ export class LayaShadowRecorder {
    * in the background and updates the pending row (or the answer cache if the
    * row was already finalized). Never throws.
    */
-  noteTurn(sessionId: string, state: LayaState, turnHadSpeech: boolean, questions: Record<string, unknown> = LAYA_SHADOW_QUESTIONS): void {
+  noteTurn(sessionId: string, state: LayaState, turnHadSpeech: boolean, hooks: LayaTurnHooks = {}): void {
     // A previous turn whose outcome never joined (no terminal response event,
     // e.g. provider dropped mid-receipt): finalize it as-is so the row and its
     // LAYA answer are not lost.
     this.finalizeOldestIfFull();
     const row: LayaShadowRow = {
+      schema: LAYA_SHADOW_SCHEMA,
       ts: this.now(),
       sessionId,
       utteranceHash: state.utteranceHash,
       state: state.state,
-      questions,
+      questions: LAYA_SHADOW_QUESTIONS,
       answers: null,
       layaLatencyMs: null,
       cached: false,
@@ -258,38 +250,74 @@ export class LayaShadowRecorder {
       row.answers = cached.answers;
       row.layaLatencyMs = cached.latencyMs;
       row.cached = true;
+      this.reportMood(cached.answers, hooks);
       return;
     }
 
     const started = this.now();
+    let timedOut = false;
+    pendingRow.settleFetch = (async () => {
+      // Mood first: the overlay and brain steering want it soonest.
+      const mood = await this.ask(state.state, LAYA_MOOD_QUESTIONS).catch((error: unknown) => {
+        if (error instanceof LayaTimeoutError) timedOut = true;
+        return undefined;
+      });
+      if (mood) this.reportMood(mood, hooks);
+      const intents = await this.ask(state.state, LAYA_INTENT_QUESTIONS).catch((error: unknown) => {
+        if (error instanceof LayaTimeoutError) timedOut = true;
+        return undefined;
+      });
+      if (!mood && !intents) {
+        if (!pendingRow.outdated) row.timeout = timedOut;
+        return;
+      }
+      const answers = { ...(mood ?? {}), ...(intents ?? {}) };
+      const latencyMs = Math.max(0, this.now() - started);
+      if (mood && intents) this.cacheAnswers(state.utteranceHash, answers, latencyMs);
+      if (!pendingRow.outdated) {
+        row.answers = answers;
+        row.layaLatencyMs = latencyMs;
+        row.timeout = timedOut;
+      }
+    })();
+  }
+
+  /** One sidecar call with its own deadline; rejects with LayaTimeoutError on abort. */
+  private async ask(state: string, questions: Record<string, unknown>): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs);
     timer.unref?.();
-    pendingRow.settleFetch = this.fetchImpl(`${this.options.baseUrl}/decide`, {
-      method: "POST",
-      redirect: "error",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ state: state.state, questions }),
-      signal: controller.signal,
-    }).then(async (response) => {
+    try {
+      const response = await this.fetchImpl(`${this.options.baseUrl}/decide`, {
+        method: "POST",
+        redirect: "error",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ state, questions }),
+        signal: controller.signal,
+      });
       if (!response.ok) throw new Error(`laya sidecar responded ${response.status}`);
       const payload = (await response.json()) as { answers?: Record<string, unknown> };
       if (!payload || typeof payload !== "object" || !payload.answers) {
         throw new Error("laya sidecar response missing answers");
       }
-      const latencyMs = Math.max(0, this.now() - started);
-      this.cacheAnswers(state.utteranceHash, payload.answers, latencyMs);
-      if (!pendingRow.outdated) {
-        row.answers = payload.answers;
-        row.layaLatencyMs = latencyMs;
-      }
-    }).catch(() => {
-      if (!pendingRow.outdated) {
-        // Only a deadline abort counts as a timeout; a refused connection or
-        // malformed response is an "unknown" answer (answers stay null).
-        row.timeout = controller.signal.aborted;
-      }
-    }).finally(() => clearTimeout(timer));
+      return payload.answers;
+    } catch (error) {
+      if (controller.signal.aborted) throw new LayaTimeoutError();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private reportMood(answers: Record<string, unknown>, hooks: LayaTurnHooks): void {
+    if (!hooks.onMood) return;
+    const mood = parseLayaMood(answers, this.now());
+    if (!mood) return;
+    try {
+      hooks.onMood(mood);
+    } catch {
+      // A consumer failure never affects the shadow log.
+    }
   }
 
   /**

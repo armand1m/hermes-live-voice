@@ -39,7 +39,8 @@ import {
 } from "./ports/realtime-model.port.js";
 import { buildSystemInstruction } from "./system-instruction.js";
 import { buildContextDigest } from "./context-digest.js";
-import { buildLayaState, LAYA_SHADOW_QUESTIONS, type LayaShadowRecorder } from "./laya-shadow.js";
+import { buildLayaState, type LayaShadowRecorder } from "./laya-shadow.js";
+import { moodHint, type LayaMood } from "./laya-mood.js";
 import { SpeechTimingTracker, type SpeechTimingMetrics } from "./speech-timing.js";
 import { FillerSpeaker, type FillerEmit } from "./filler-speaker.js";
 import { deferredAnswerSpeech } from "./deferred-answer-speech.js";
@@ -307,8 +308,8 @@ export class LiveGatewaySession {
   // LAYA shadow pilot (docs/laya-system1.md): recent-transcript ring, active
   // task titles, and the current turn's brain outcome accumulator. Log-only;
   // nothing here may gate, rewrite, or delay a reply, task, or speech path.
-  private readonly shadowRecentTurns: Array<{ speaker: "user" | "assistant"; text: string }> = [];
-  private readonly shadowActiveTasks = new Map<string, string>();
+  /** The user's latest mood as LAYA read it (diagnostics + optional brain hint). */
+  private layaMood?: LayaMood;
   private shadowTurnToolResults: Array<{ name: string; executionMode?: string; ok: boolean }> = [];
   private shadowTurnTaskAccepted: boolean | null = null;
   private lastTurnHadSpeech = true;
@@ -483,9 +484,7 @@ export class LiveGatewaySession {
           ...(digest.text ? [digest.text] : []),
         ].join("\n\n"),
         availableTools,
-        ...(this.deps.knowledge && this.deps.config.knowledge?.turnContext === true
-          ? { contextForTurn: (userText: string) => turnContextBlock(this.deps.knowledge!.search(userText, { limit: 6 }), userText) }
-          : {}),
+        ...(this.turnContextProvider() ? { contextForTurn: this.turnContextProvider()! } : {}),
         safetyIdentifier: safetyIdentifierForSessionKey(this.sessionKey),
         callbacks: {
           onOpen: () => {
@@ -648,9 +647,6 @@ export class LiveGatewaySession {
         ...(this.protocolVersion >= 4 ? { conversation: this.conversation } : {}),
       });
       const initialSnapshotReason = initialTasks.length > 0 ? "reconnect" : "initial";
-      for (const record of activeTasks) {
-        if (!isTaskNotificationState(record.status)) this.shadowActiveTasks.set(record.taskId, record.title);
-      }
       if (projectedInitialTasks.length === 0) {
         this.send({
           type: "task.snapshot",
@@ -920,6 +916,7 @@ export class LiveGatewaySession {
         this.userSpeaking = false;
         this.lastTurnHadSpeech = false;
         this.speechTiming.noteTextInput(Date.now());
+        this.noteLayaShadowTurn(message.text);
         // Riva never echoes typed text as a user final: record it here.
         this.reflectionTranscript.add("user", message.text);
         await this.forwardRealtimeClientInput("text", () => this.liveSession!.sendText(message.text), true);
@@ -2480,10 +2477,10 @@ export class LiveGatewaySession {
         this.speechTiming.noteUserFinal(Date.now(), this.lastTurnHadSpeech);
         this.userSpeaking = false;
         this.scheduleNotificationFlush();
-        this.noteLayaShadowTurn(event.text);
+        // Typed turns reach LAYA at input (Riva never echoes them).
+        if (this.lastTurnHadSpeech) this.noteLayaShadowTurn(event.text);
       } else if (event.final && event.speaker !== "system") {
         this.reflectionTranscript.add("assistant", event.text);
-        this.recordShadowTurn(event.speaker ?? "assistant", event.text);
       }
       this.send({
         type: "transcript.delta",
@@ -2582,21 +2579,36 @@ export class LiveGatewaySession {
     this.flushLayaShadowOutcome();
     const shadow = this.deps.layaShadow;
     if (shadow) {
-      const built = buildLayaState({
-        utterance,
-        recentTurns: this.shadowRecentTurns,
-        activeTaskTitles: [...this.shadowActiveTasks.values()],
+      shadow.noteTurn(this.id, buildLayaState({ utterance }), this.lastTurnHadSpeech, {
+        onMood: (mood) => {
+          if (!this.closing) this.layaMood = mood;
+        },
       });
-      shadow.noteTurn(this.id, built, this.lastTurnHadSpeech, LAYA_SHADOW_QUESTIONS);
     }
-    this.recordShadowTurn("user", utterance);
   }
 
-  private recordShadowTurn(speaker: "user" | "assistant", text: string): void {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    this.shadowRecentTurns.push({ speaker, text: trimmed.slice(0, 400) });
-    if (this.shadowRecentTurns.length > 12) this.shadowRecentTurns.shift();
+  /**
+   * Per-turn reference context for the brain: strong knowledge matches and,
+   * with mood steering on, a hint from the user's previous message (LAYA
+   * answers after the brain starts, so the current message cannot steer its
+   * own reply). Undefined when neither is enabled.
+   */
+  private turnContextProvider(): ((userText: string) => string | undefined) | undefined {
+    const knowledge = this.deps.config.knowledge?.turnContext === true ? this.deps.knowledge : undefined;
+    const steering = this.deps.config.laya?.moodSteering === true && this.deps.layaShadow !== undefined;
+    if (!knowledge && !steering) return undefined;
+    return (userText) => {
+      const parts = [
+        steering ? moodHint(this.layaMood, Date.now()) : undefined,
+        knowledge ? turnContextBlock(knowledge.search(userText, { limit: 6 }), userText) : undefined,
+      ].filter((part): part is string => Boolean(part));
+      return parts.length ? parts.join("\n") : undefined;
+    };
+  }
+
+  /** Latest LAYA mood reading for diagnostics, with its age. */
+  layaMoodSnapshot(now = Date.now()): (LayaMood & { ageMs: number }) | undefined {
+    return this.layaMood ? { ...this.layaMood, ageMs: Math.max(0, now - this.layaMood.at) } : undefined;
   }
 
   /** Join the brain's tool calls for the turn into the pending shadow row. */
@@ -2626,10 +2638,6 @@ export class LiveGatewaySession {
   }
 
   private dispatchTaskRecord(record: TaskRecord): void {
-    if (this.deps.layaShadow) {
-      if (isTaskNotificationState(record.status)) this.shadowActiveTasks.delete(record.taskId);
-      else this.shadowActiveTasks.set(record.taskId, record.title);
-    }
     const latestType = record.events.at(-1)?.type;
     const notificationMetadataOnly = latestType === "notification.announced"
       || latestType === "notification.acknowledged";

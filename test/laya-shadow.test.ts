@@ -9,6 +9,8 @@ import { MANAGED_CONFIG_KEYS } from "../src/cli/managed-config.js";
 import {
   buildLayaState,
   defaultLayaShadowLogPath,
+  LAYA_INTENT_QUESTIONS,
+  LAYA_MOOD_QUESTIONS,
   LAYA_SHADOW_QUESTIONS,
   LayaShadowLog,
   LayaShadowRecorder,
@@ -42,60 +44,23 @@ async function startSidecar(handler: (body: string, send: (payload: unknown, sta
 }
 
 describe("buildLayaState", () => {
-  it("places the utterance first, then recent turns, then active tasks", () => {
-    const built = buildLayaState({
-      utterance: "rebuild the dashboard",
-      recentTurns: [
-        { speaker: "assistant", text: "Started the disk check task." },
-        { speaker: "user", text: "thanks" },
-      ],
-      activeTaskTitles: ["check exodia disk usage"],
-    });
-    const lines = built.state.split("\n");
-    expect(lines[0]).toBe("user: rebuild the dashboard");
-    expect(built.state.indexOf("Started the disk check task.")).toBeGreaterThan(built.state.indexOf("rebuild the dashboard"));
-    expect(built.state).toContain("active tasks: check exodia disk usage");
+  it("builds the structured state every question names", () => {
+    const built = buildLayaState({ utterance: "  check my tasks  " });
+    expect(JSON.parse(built.state)).toEqual({ utterance: "check my tasks" });
     expect(built.utteranceHash).toMatch(/^sha256:[0-9a-f]{64}$/u);
   });
 
-  it("enforces the hard budget: drops the recent-turn tail first, never the utterance", () => {
-    const utterance = "please rebuild the dashboard and redeploy it after the current task finishes";
-    const recentTurns = Array.from({ length: 12 }, (_, index) => ({
-      speaker: "user" as const,
-      text: `older turn number ${index} with some detail to fill the budget`,
-    }));
-    const built = buildLayaState({ utterance, recentTurns, activeTaskTitles: ["task"] });
-    expect(built.state.length).toBeLessThanOrEqual(LAYA_STATE_BUDGET_CHARS);
-    expect(built.state).toContain(utterance);
-    // The oldest turns are the tail that gets dropped; the newest survive.
-    expect(built.state).toContain("older turn number 11");
-    expect(built.state).not.toContain("older turn number 0");
+  it("keeps the opening words of an over-budget utterance", () => {
+    const long = `rebuild the dashboard ${"x".repeat(LAYA_STATE_BUDGET_CHARS * 2)}`;
+    const parsed = JSON.parse(buildLayaState({ utterance: long }).state) as { utterance: string };
+    expect(parsed.utterance.length).toBe(LAYA_STATE_BUDGET_CHARS);
+    expect(parsed.utterance.startsWith("rebuild the dashboard")).toBe(true);
   });
 
-  it("drops the active-task line before recent turns when space is tight", () => {
-    const utterance = "x".repeat(1_200);
-    const built = buildLayaState({
-      utterance,
-      recentTurns: [{ speaker: "assistant", text: "r".repeat(160) }],
-      activeTaskTitles: ["a task title"],
-    });
-    expect(built.state.length).toBeLessThanOrEqual(LAYA_STATE_BUDGET_CHARS);
-    expect(built.state).toContain("rrrr");
-    expect(built.state).not.toContain("active tasks:");
-  });
-
-  it("truncates an over-budget utterance head-first rather than dropping it", () => {
-    const built = buildLayaState({ utterance: "y".repeat(5_000), recentTurns: [], activeTaskTitles: [] });
-    expect(built.state.length).toBeLessThanOrEqual(LAYA_STATE_BUDGET_CHARS);
-    expect(built.state.startsWith("user: yyyy")).toBe(true);
-    // Hash covers the full finalized text, not the truncated state copy.
-    expect(built.utteranceHash).toBe(buildLayaState({ utterance: "y".repeat(5_000) }).utteranceHash);
-    expect(built.utteranceHash).not.toBe(buildLayaState({ utterance: "y".repeat(4_999) }).utteranceHash);
-  });
-
-  it("builds a minimal state from an utterance alone", () => {
-    const built = buildLayaState({ utterance: "hey", recentTurns: [], activeTaskTitles: [] });
-    expect(built.state).toBe("user: hey");
+  it("asks mood and intents in LAYA's preset style, each set within the sidecar's 4-question limit", () => {
+    expect(Object.keys(LAYA_MOOD_QUESTIONS)).toEqual(["small_talk", "frustration", "mood"]);
+    expect(Object.keys(LAYA_INTENT_QUESTIONS)).toEqual(["new_work", "task_status", "recall", "remember"]);
+    for (const question of Object.values(LAYA_SHADOW_QUESTIONS)) expect(question.instructions).toContain("`utterance`");
   });
 });
 
@@ -141,7 +106,7 @@ describe("LayaShadowRecorder", () => {
     servers.push(sidecar.server);
     const { recorder, logPath } = recorderFor(sidecar.url, 60);
 
-    const state = buildLayaState({ utterance: "hello there", recentTurns: [], activeTaskTitles: [] });
+    const state = buildLayaState({ utterance: "hello there" });
     const started = performance.now();
     expect(recorder.noteTurn("session-a", state, true)).toBeUndefined();
     expect(performance.now() - started).toBeLessThan(25);
@@ -162,7 +127,7 @@ describe("LayaShadowRecorder", () => {
   it("writes a sidecar-down row without throwing", async () => {
     // A port with no listener: the connection is refused, not timed out.
     const { recorder, logPath } = recorderFor("http://127.0.0.1:1", 100);
-    const state = buildLayaState({ utterance: "anyone home", recentTurns: [], activeTaskTitles: [] });
+    const state = buildLayaState({ utterance: "anyone home" });
     expect(() => recorder.noteTurn("session-b", state, false)).not.toThrow();
     await sleep(80);
     recorder.noteOutcome("session-b", [], null);
@@ -174,16 +139,26 @@ describe("LayaShadowRecorder", () => {
   });
 
   it("joins answers and brain outcome into one finalized row", async () => {
-    const answers = { route: { type: "choice", choice: "start_background_task", confidence: 0.9 } };
+    const moodAnswers = {
+      small_talk: { type: "noul", noul: 0.1 },
+      frustration: { type: "score", score: 2.2 },
+      mood: { type: "choice", choice: "frustrated", confidence: 0.6 },
+    };
+    const intentAnswers = { new_work: { type: "noul", noul: 0.9 } };
+    const asked: unknown[] = [];
     const sidecar = await startSidecar((body, send) => {
-      expect(JSON.parse(body).questions).toEqual(LAYA_SHADOW_QUESTIONS);
-      send({ answers, latency_ms: 512 });
+      const request = JSON.parse(body) as { state: string; questions: unknown };
+      asked.push(request.questions);
+      expect(JSON.parse(request.state)).toEqual({ utterance: "rebuild the dashboard please" });
+      send({ answers: asked.length === 1 ? moodAnswers : intentAnswers, latency_ms: 512 });
     });
+    const answers = { ...moodAnswers, ...intentAnswers };
     servers.push(sidecar.server);
     const { recorder, logPath } = recorderFor(sidecar.url);
 
-    const state = buildLayaState({ utterance: "rebuild the dashboard please", recentTurns: [], activeTaskTitles: [] });
-    recorder.noteTurn("session-c", state, true);
+    const state = buildLayaState({ utterance: "rebuild the dashboard please" });
+    const moods: unknown[] = [];
+    recorder.noteTurn("session-c", state, true, { onMood: (mood) => moods.push(mood) });
     await sleep(80);
     recorder.noteOutcome("session-c", [{ name: "start_background_task", executionMode: "exclusive" }], true);
     // A duplicate outcome join must not write a second row.
@@ -200,6 +175,10 @@ describe("LayaShadowRecorder", () => {
     expect(brain.toolCalls).toEqual([{ name: "start_background_task", executionMode: "exclusive" }]);
     expect(brain.taskAccepted).toBe(true);
     expect(rows[0]!.questions).toEqual(LAYA_SHADOW_QUESTIONS);
+    expect(rows[0]!.schema).toBe(2);
+    // Mood first, then intents; the session hears the mood as soon as it lands.
+    expect(asked).toEqual([LAYA_MOOD_QUESTIONS, LAYA_INTENT_QUESTIONS]);
+    expect(moods).toEqual([expect.objectContaining({ frustration: 2.2, frustrationLabel: "clearly annoyed", mood: "frustrated" })]);
   });
 
   it("serves repeated utterances from the answer cache without a second request", async () => {
@@ -212,7 +191,7 @@ describe("LayaShadowRecorder", () => {
     servers.push(sidecar.server);
     const { recorder, logPath } = recorderFor(sidecar.url);
 
-    const state = buildLayaState({ utterance: "thanks", recentTurns: [], activeTaskTitles: [] });
+    const state = buildLayaState({ utterance: "thanks" });
     recorder.noteTurn("session-d", state, true);
     await sleep(80);
     recorder.noteOutcome("session-d", [], null);
@@ -221,7 +200,8 @@ describe("LayaShadowRecorder", () => {
     recorder.noteOutcome("session-d", [], null);
     await sleep(25);
 
-    expect(requests).toBe(1);
+    // Mood + intents for the first turn; the repeat is served from cache.
+    expect(requests).toBe(2);
     const rows = await readRows(logPath);
     expect(rows).toHaveLength(2);
     expect(rows[0]!.cached).toBe(false);
@@ -236,12 +216,13 @@ describe("LayaShadowRecorder", () => {
     servers.push(sidecar.server);
     const { recorder, logPath } = recorderFor(sidecar.url, 2_000);
 
-    recorder.noteTurn("session-f", buildLayaState({ utterance: "list my tasks", recentTurns: [], activeTaskTitles: [] }), true);
+    recorder.noteTurn("session-f", buildLayaState({ utterance: "list my tasks" }), true);
     // Outcome lands before the sidecar answers: the row must still carry it.
     recorder.noteOutcome("session-f", [{ name: "list_background_tasks" }], null);
     await sleep(40);
     await expect(readFile(logPath, "utf8")).rejects.toThrowError();
-    await sleep(200);
+    // Two sequential 120 ms sidecar calls (mood, then intents).
+    await sleep(400);
     const rows = await readRows(logPath);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.answers).toEqual(answers);
@@ -252,7 +233,7 @@ describe("LayaShadowRecorder", () => {
     const sidecar = await startSidecar((_body, send) => send({ answers: {} }));
     servers.push(sidecar.server);
     const { recorder, logPath } = recorderFor(sidecar.url);
-    recorder.noteTurn("session-e", buildLayaState({ utterance: "bye", recentTurns: [], activeTaskTitles: [] }), true);
+    recorder.noteTurn("session-e", buildLayaState({ utterance: "bye" }), true);
     await sleep(80);
     recorder.close("session-e");
     await sleep(25);
@@ -267,8 +248,6 @@ describe("LayaShadowRecorder", () => {
     for (let index = 0; index < 8; index += 1) {
       recorder.noteTurn(`session-r${index}`, buildLayaState({
         utterance: `utterance number ${index} ${"z".repeat(200)}`,
-        recentTurns: [],
-        activeTaskTitles: [],
       }), true);
       await sleep(40);
       recorder.close(`session-r${index}`);
@@ -547,18 +526,68 @@ describe("live gateway session shadow hooks", () => {
 
     const rows = (await readFile(logPath, "utf8")).split("\n").filter((line) => line.trim())
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(requests).toBe(2);
+    // Two turns × (mood call + intent call).
+    expect(requests).toBe(4);
     expect(rows).toHaveLength(2);
     expect(rows[0]!.brain).toMatchObject({ toolCalls: [], taskAccepted: null, turnHadSpeech: true });
     expect(rows[0]!.answers).toEqual(answers);
-    const rowState = rows[1]!.state as string;
-    expect(rowState).toContain("user: please rebuild the dashboard");
-    // The turn-1 exchange is now recent context, after the utterance.
-    expect(rowState.indexOf("what's up?")).toBeGreaterThan(rowState.indexOf("rebuild the dashboard"));
+    expect(JSON.parse(rows[1]!.state as string)).toEqual({ utterance: "please rebuild the dashboard" });
     expect(rows[1]!.brain).toMatchObject({
       toolCalls: [{ name: "start_background_task", executionMode: "exclusive" }],
       taskAccepted: true,
     });
+  });
+
+  it("keeps the user's latest mood and, with steering on, hints the brain on the next turn", async () => {
+    const sidecar = await startSidecar((body, send) => {
+      const { questions } = JSON.parse(body) as { questions: Record<string, unknown> };
+      send({
+        answers: "frustration" in questions
+          ? {
+            small_talk: { type: "noul", noul: 0.05 },
+            frustration: { type: "score", score: 2.4 },
+            mood: { type: "choice", choice: "frustrated", confidence: 0.55 },
+          }
+          : { new_work: { type: "noul", noul: 0.2 } },
+      });
+    });
+    openServers.push(sidecar.server);
+    const config = loadConfig({
+      HERMES_LIVE_PROVIDER: "mock",
+      HERMES_LIVE_CONTEXT_DIGEST: "false",
+      HERMES_LIVE_LAYA_URL: sidecar.url,
+      HERMES_LIVE_LAYA_TIMEOUT_MS: "2000",
+      HERMES_LIVE_LAYA_MOOD_STEERING: "true",
+    });
+    const { session, adapter } = await startShadowSession(config);
+    const contextForTurn = adapter.session!.params.contextForTurn!;
+    expect(contextForTurn("anything")).toBeUndefined();
+
+    adapter.emit({ type: "text", text: "you got it wrong again, that's not what I asked", speaker: "user", final: true });
+    for (let attempt = 0; attempt < 40 && !session.layaMoodSnapshot(); attempt += 1) await sleep(10);
+    expect(session.layaMoodSnapshot()).toMatchObject({ mood: "frustrated", frustration: 2.4, frustrationLabel: "clearly annoyed" });
+    // The next turn's brain request carries the hint about the previous message.
+    expect(contextForTurn("fine, try again")).toContain("sounded frustrated (2.4 of 3)");
+    await session.close();
+  });
+
+  it("does not hint the brain unless mood steering is enabled", async () => {
+    const sidecar = await startSidecar((_body, send) => send({
+      answers: { frustration: { type: "score", score: 2.9 }, mood: { type: "choice", choice: "frustrated", confidence: 0.9 } },
+    }));
+    openServers.push(sidecar.server);
+    const config = loadConfig({
+      HERMES_LIVE_PROVIDER: "mock",
+      HERMES_LIVE_CONTEXT_DIGEST: "false",
+      HERMES_LIVE_LAYA_URL: sidecar.url,
+    });
+    const { session, adapter } = await startShadowSession(config);
+    expect(adapter.session!.params.contextForTurn).toBeUndefined();
+    adapter.emit({ type: "text", text: "this is broken again", speaker: "user", final: true });
+    for (let attempt = 0; attempt < 40 && !session.layaMoodSnapshot(); attempt += 1) await sleep(10);
+    // Still measured for the diagnostics overlay.
+    expect(session.layaMoodSnapshot()?.mood).toBe("frustrated");
+    await session.close();
   });
 
   it("is fully inert when HERMES_LIVE_LAYA_URL is unset", async () => {

@@ -786,7 +786,11 @@ async function handleHttp(
     const silenceWait: StagePercentiles = { p50Ms: null, p95Ms: null };
     let gateStops = 0;
     let gateResumes = 0;
+    // LAYA's read of the user's most recent message, across live sessions.
+    let userMood: ReturnType<LiveGatewaySession["layaMoodSnapshot"]>;
     for (const session of options.sessions) {
+      const mood = session.layaMoodSnapshot();
+      if (mood && (!userMood || mood.at > userMood.at)) userMood = mood;
       const audio = session.audioDeliveryMetrics();
       if (audio.lastOutputMsAgo !== null) {
         lastAudioOutputMsAgo = lastAudioOutputMsAgo === null
@@ -843,6 +847,7 @@ async function handleHttp(
       silenceWait,
       gateStops,
       gateResumes,
+      userMood: userMood ?? null,
       voiceStackCpuPct: processMetrics.voiceStackCpuPct,
       voiceStackPid: processMetrics.voiceStackPid,
       eventLagMs: processMetrics.eventLagMs,

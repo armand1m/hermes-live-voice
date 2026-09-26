@@ -252,6 +252,50 @@ def latency_summary(rows: list[dict]) -> dict:
     }
 
 
+# Schema-2 rows (per-intent nouls + mood over {"utterance": ...}): which brain
+# tool calls count as each intent having been acted on.
+INTENT_TOOLS = {
+    "new_work": {"start_background_task", "follow_up_background_task", "watch_external_agent"},
+    "task_status": {"list_background_tasks", "get_background_task", "stop_background_task",
+                    "archive_background_task", "resolve_delegated_task", "list_external_watches"},
+    "recall": {"search_past_chats"},
+    "remember": {"remember"},
+}
+
+
+def auc(pairs: list[tuple[float, int]]) -> float | None:
+    positives = [score for score, label in pairs if label]
+    negatives = [score for score, label in pairs if not label]
+    if not positives or not negatives:
+        return None
+    wins = sum((p > n) + 0.5 * (p == n) for p in positives for n in negatives)
+    return wins / (len(positives) * len(negatives))
+
+
+def intent_report(rows: list[dict]) -> dict:
+    """Per-intent AUC of LAYA's noul against the brain's tool calls, plus mood spread."""
+    v2 = [row for row in rows if row.get("schema") == 2 and row.get("answers") and row.get("brain")]
+    report: dict = {"rows": len(v2), "intents": {}, "moods": {}, "frustration_levels": {}}
+    for intent, tools in INTENT_TOOLS.items():
+        pairs = []
+        for row in v2:
+            answer = row["answers"].get(intent)
+            if not isinstance(answer, dict) or not isinstance(answer.get("noul"), (int, float)):
+                continue
+            used = {call.get("name") for call in row["brain"].get("toolCalls", [])}
+            pairs.append((float(answer["noul"]), int(bool(used & tools))))
+        report["intents"][intent] = {"n": len(pairs), "brain_positive": sum(label for _, label in pairs), "auc": auc(pairs)}
+    for row in v2:
+        mood = (row["answers"].get("mood") or {}).get("choice")
+        if isinstance(mood, str):
+            report["moods"][mood] = report["moods"].get(mood, 0) + 1
+        score = (row["answers"].get("frustration") or {}).get("score")
+        if isinstance(score, (int, float)):
+            level = str(min(3, max(0, round(score))))
+            report["frustration_levels"][level] = report["frustration_levels"].get(level, 0) + 1
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG, help=f"shadow turns.jsonl (default {DEFAULT_LOG})")
@@ -277,6 +321,7 @@ def main() -> int:
         "calibration": calibration(rows, labels),
         "read_only_precision": read_only_precision(rows, labels),
         "latency": latency_summary(rows),
+        "intents_v2": intent_report(rows),
     }
 
     print(f"LAYA shadow report — {args.log}")
@@ -313,6 +358,14 @@ def main() -> int:
               f"(cached {latency['cached']}, timeouts {latency['timeouts']}, unknown answers {latency['unknown_answers']})")
     else:
         print(f"\nLatency: no fresh /decide answers yet (cached {latency['cached']}, timeouts {latency['timeouts']})")
+    v2 = report["intents_v2"]
+    print(f"\nSchema-2 turns (per-intent + mood questions): {v2['rows']}")
+    for intent, entry in v2["intents"].items():
+        value = f"{entry['auc']:.2f}" if entry["auc"] is not None else "—"
+        print(f"  {intent:<12} AUC vs brain tools {value:>5}  (n={entry['n']}, brain acted on it {entry['brain_positive']})")
+    if v2["moods"]:
+        print("  moods: " + ", ".join(f"{mood} {count}" for mood, count in sorted(v2["moods"].items(), key=lambda item: -item[1])))
+        print("  frustration levels (0 calm .. 3 very): " + ", ".join(f"{level}: {count}" for level, count in sorted(v2["frustration_levels"].items())))
     print("\nGo/no-go (plan §5): route agreement >= 90% at conf >= 0.85 covering >= 50% of turns, "
           "read-only precision >= 98% at P >= 0.95, ECE <= 0.10 after refit.")
 

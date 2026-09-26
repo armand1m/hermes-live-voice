@@ -101,6 +101,21 @@ export class RollingNumbers {
  *
  * @returns {{ verdict: "server"|"client"|"transport"|"nominal"|"sparse", reason: string }}
  */
+/** Past this age the reading no longer describes the user (matches the gateway). */
+const MOOD_FRESH_MS = 3 * 60_000;
+
+/**
+ * One diagnostics line for LAYA's read of the user's last message:
+ * "frustrated · 2.1/3 · 12s". Stale readings are marked; absent ones dash.
+ */
+export function formatUserMood(mood) {
+  if (!mood || typeof mood.mood !== "string" || !Number.isFinite(mood.frustration)) return "—";
+  const age = Number.isFinite(mood.ageMs) ? mood.ageMs : 0;
+  const ageText = age < 60_000 ? `${Math.round(age / 1_000)}s` : `${Math.round(age / 60_000)}m`;
+  const line = `${mood.mood} · ${mood.frustration.toFixed(1)}/3 · ${ageText}`;
+  return age > MOOD_FRESH_MS ? `(${line})` : line;
+}
+
 export function computeVerdict(input) {
   const t = VERDICT_THRESHOLDS;
   const cores = input.cores && input.cores > 0 ? input.cores : 1;
@@ -374,7 +389,7 @@ export function createDiagnosticsOverlay(options = {}) {
   const grid = document.createElement("div");
   grid.className = "diag-grid";
   const rows = {};
-  for (const key of ["brain", "lat", "jit", "stall", "fps", "gw", "stack", "load", "ago", "sgap", "tool", "ann"]) {
+  for (const key of ["brain", "mood", "lat", "eot", "jit", "stall", "fps", "gw", "stack", "load", "ago", "sgap", "tool", "ann"]) {
     const label = document.createElement("span");
     label.className = "diag-k";
     label.textContent = key;
@@ -503,6 +518,11 @@ export function createDiagnosticsOverlay(options = {}) {
     setText(rows.sgap, fmtMs(serverFresh ? server.gatewayAudioGapP95Ms : null));
     setText(rows.tool, `${fmtMs(serverFresh ? server.toolSpeechP50Ms : null)} / ${fmtMs(serverFresh ? server.toolSpeechP95Ms : null)}`);
     setText(rows.ann, `${fmtMs(serverFresh ? server.announcementDelayP50Ms : null)} / ${fmtMs(serverFresh ? server.announcementDelayP95Ms : null)}`);
+    // LAYA's read of the user's last message, and the silence each turn end waited.
+    setText(rows.mood, serverFresh ? formatUserMood(server.userMood) : "—");
+    setText(rows.eot, serverFresh && server.silenceWait
+      ? `${fmtMs(server.silenceWait.p50Ms)} / ${fmtMs(server.silenceWait.p95Ms)}`
+      : "—");
   }
 
   // --- timers, paused while the tab is hidden ------------------------------

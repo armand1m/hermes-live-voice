@@ -167,6 +167,7 @@ const EnvSchema = z.object({
   /** Shadow-mode logging only while piloting; unset URL disables it entirely. */
   HERMES_LIVE_LAYA_SHADOW_ENABLED: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_LAYA_TIMEOUT_MS: z.coerce.number().int().min(250).max(10_000).default(1_500),
+  HERMES_LIVE_LAYA_MOOD_STEERING: z.enum(["1", "true", "yes", "on", "0", "false", "no", "off"]).optional(),
   HERMES_LIVE_LOCAL_ALLOW_REMOTE: z.string().optional(),
   HERMES_LIVE_LOCAL_OWNS_TURN_ROUTING: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
@@ -367,6 +368,8 @@ export interface AppConfig {
     /** Shadow logging on/off (logs only; never gates behavior). */
     shadowEnabled: boolean;
     timeoutMs: number;
+    /** Tell the voice brain when the user's previous message sounded frustrated, stressed, or confused. */
+    moodSteering?: boolean;
   };
   gemini: {
     apiKey?: string;
@@ -497,6 +500,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       shadowEnabled: parsed.HERMES_LIVE_LAYA_SHADOW_ENABLED === undefined
         || ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_LAYA_SHADOW_ENABLED),
       timeoutMs: parsed.HERMES_LIVE_LAYA_TIMEOUT_MS,
+      moodSteering: parsed.HERMES_LIVE_LAYA_MOOD_STEERING !== undefined
+        && ["1", "true", "yes", "on"].includes(parsed.HERMES_LIVE_LAYA_MOOD_STEERING),
     },
     gemini: {
       ...(geminiApiKey ? { apiKey: geminiApiKey } : {}),
