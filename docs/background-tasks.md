@@ -56,7 +56,36 @@ Tasks are scoped to a hashed owner identity derived from the server-owned Hermes
 
 By default, `session.start.profileId` and `userLabel` are ignored. All clients using the same gateway defaults therefore share one owner inbox. `HERMES_LIVE_TRUST_CLIENT_IDENTITY=true` lets trusted clients select a scope; it is not authentication or multi-tenant isolation. See [Security](security.md#identity-and-authorization).
 
+## Orchestration: Hermes Briefs Coding Agents
+
+Voice tasks carry a work mode.
+
+**`orchestrate` (the default).** The Hermes run is a planner, not the worker. Its instructions tell it to:
+
+- resolve the machine (exodia or the Mac mini) and the repository from the user's words and its memory and skills;
+- choose the coding agent;
+- write a self-contained brief with acceptance criteria;
+- call `hermes_delegate_work` with the task id as both `task_id` and idempotency key.
+
+The gateway then launches the agent through herdr (labeled workspace, agent start, brief), verifies it, registers a watch linked to the task, and moves the task into the delegated phase. The Hermes run ends within seconds. From then on the gateway monitors the agent and speaks state changes. The user closes the task with `resolve_delegated_task` after checking the work.
+
+**`quick`.** A short read-only lookup that Hermes answers itself, without starting agents.
+
+**Agents.** Each profile runs with its kind's unattended flag:
+
+| Profile | Runs as | Unattended flag | Notes |
+| --- | --- | --- | --- |
+| `claude-glm` | `claude` | `--dangerously-skip-permissions` | Local only. The z.ai provider environment is sourced from `~/.local/bin/claude-glm` inside the pane. |
+| `claude` | `claude` | `--dangerously-skip-permissions` | |
+| `codex` | `codex` | `--dangerously-bypass-approvals-and-sandbox` | |
+
+Defaults are set per host with `HERMES_LIVE_DELEGATION_AGENTS` (default `exodia=claude-glm,mac-mini=claude`). An agent the user asks for by name overrides the default.
+
+Claude Code still shows its folder-trust dialog in repositories it has not trusted, so pre-trust delegation repositories.
+
 ## Admission And Parallelism
+
+Orchestration and quick tasks are short Hermes runs that change nothing themselves, so they are admitted side by side up to `maxConcurrent`. Only explicitly declared resource keys conflict. Tasks created before work modes keep the exclusive behavior described below.
 
 The scheduler is bounded by `HERMES_LIVE_MAX_CONCURRENT_TASKS` and `HERMES_LIVE_MAX_QUEUED_TASKS`.
 
