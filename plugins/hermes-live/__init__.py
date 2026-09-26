@@ -38,6 +38,13 @@ def register(ctx: Any) -> None:
         handler=tools.gateway_status,
         description="Inspect the configured hermes-live realtime voice gateway.",
     )
+    ctx.register_tool(
+        name="hermes_delegate_work",
+        toolset="hermes-live",
+        schema=schemas.HERMES_DELEGATE_WORK,
+        handler=tools.hermes_delegate_work,
+        description="Hand work to a monitored herdr coding agent on exodia or the Mac mini.",
+    )
 
     if hasattr(ctx, "register_command"):
         ctx.register_command(

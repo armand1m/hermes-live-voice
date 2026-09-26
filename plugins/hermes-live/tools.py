@@ -609,7 +609,9 @@ def hermes_delegate_work(args: dict[str, Any], **_kwargs: Any) -> str:
     task_id = args.get("task_id")
     if task_id is not None and not isinstance(task_id, str):
         return _dump_result({"success": False, "error": {"code": "invalid_request", "message": "task_id must be a string."}})
-    agent_kind = args.get("agent_kind") if isinstance(args.get("agent_kind"), str) else "claude"
+    # Omitted: the gateway picks the host's default agent (claude-glm on
+    # exodia, claude on the Mac mini unless configured otherwise).
+    agent_kind = args.get("agent_kind") if isinstance(args.get("agent_kind"), str) else None
 
     result = _post_json(
         gateway_url,
@@ -620,7 +622,7 @@ def hermes_delegate_work(args: dict[str, Any], **_kwargs: Any) -> str:
             "host": host,
             "repository": repository[:512],
             "objective": objective[:4000],
-            "agent_kind": agent_kind,
+            **({"agent_kind": agent_kind} if agent_kind else {}),
             **({"acceptance_criteria": [item[:500] for item in acceptance[:8]]} if acceptance else {}),
             **({"task_id": task_id} if task_id else {}),
         },

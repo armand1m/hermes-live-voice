@@ -62,12 +62,19 @@ const HERMES_LIVE_TOOL_DEFINITIONS = [
   {
     name: "start_background_task",
     description:
-      "Delegate meaningful work to Hermes Agent as a durable background task. Returns quickly; the user may keep talking or disconnect while the task continues.",
+      "Hand work to Hermes as a durable background task. By default Hermes acts as the orchestrator: it briefs a coding agent (claude-glm on exodia, claude on the Mac mini) that does the work, and the gateway monitors that agent. Short read-only lookups can be quick checks Hermes answers itself. Returns immediately; the user may keep talking or disconnect.",
     parametersJsonSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        message: { type: "string", description: "The complete, concise task Hermes should perform." },
+        message: { type: "string", description: "The complete, concise task, in the user's terms." },
+        work: {
+          type: "string",
+          enum: ["delegate", "quick_check"],
+          description: "delegate (default): real work (code, fixes, research, anything that changes something) goes to a coding agent. quick_check: a short read-only lookup such as disk space or a status question.",
+        },
+        host: { type: "string", enum: ["exodia", "mac-mini"], description: "Only when the user named the machine." },
+        agent: { type: "string", enum: ["claude", "claude-glm", "codex"], description: "Only when the user asked for a specific agent." },
         title: { type: "string", description: "A short user-facing title for the task inbox." },
         recent_voice_context: {
           type: "string",
@@ -339,7 +346,7 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<LiveToolName, string> = {
   continue_hermes_conversation: "Continue the selected saved Hermes chat for one short turn.",
   search_past_chats: "Search past chats, finished tasks, skills, and memory; deep: true for full history.",
   remember: "Store a durable user fact in Hermes memory.",
-  start_background_task: "Start durable Hermes work while the user keeps talking or disconnects.",
+  start_background_task: "Hand work to Hermes: delegate (default) briefs a coding agent; quick_check answers read-only.",
   list_background_tasks: "List active and recent tasks with their exact ids.",
   get_background_task: "Get one task's exact status or retained result.",
   follow_up_background_task: "Start new durable work from one finished task.",

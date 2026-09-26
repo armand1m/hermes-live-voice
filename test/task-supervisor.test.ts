@@ -278,6 +278,35 @@ describe("TaskSupervisor", () => {
     await supervisor.close();
   });
 
+  it("runs orchestration and quick checks side by side, each with its own brief", async () => {
+    const store = new MemoryTaskStore();
+    const hermes = new HermesHarness();
+    // No trust flag: legacy exclusive tasks would queue behind each other.
+    const supervisor = new TaskSupervisor({ store, hermes, maxConcurrent: 3 });
+    await supervisor.initialize();
+    supervisor.registerOwner("alice", "session-a");
+    const submit = (input: string, workMode?: "orchestrate" | "quick") => supervisor.submit({
+      ownerIdentity: "alice", sessionKey: "session-a", input, ...(workMode ? { workMode } : {}),
+    });
+    const orchestrated = await submit("Fix the amp sim image upload bug", "orchestrate");
+    const quick = await submit("How much disk space is free on exodia?", "quick");
+    await waitFor(async () => (await store.load(orchestrated.taskId))?.status === "running"
+      && (await store.load(quick.taskId))?.status === "running");
+
+    const briefFor = (input: string) => hermes.startCalls.find((call) => call.input === input)?.instructions ?? "";
+    expect(briefFor("Fix the amp sim image upload bug")).toContain(`orchestrator for background task ${orchestrated.taskId}`);
+    expect(briefFor("Fix the amp sim image upload bug")).toContain(`task_id "${orchestrated.taskId}"`);
+    expect(briefFor("Fix the amp sim image upload bug")).toContain("claude-glm on exodia and claude on mac-mini");
+    expect(briefFor("How much disk space is free on exodia?")).toContain("read-only");
+    expect(briefFor("How much disk space is free on exodia?")).not.toContain("hermes_delegate_work");
+
+    // A legacy task (no work mode) keeps the old exclusive behavior.
+    const legacy = await submit("Old-style task");
+    await delay(80);
+    expect((await store.load(legacy.taskId))?.status).toBe("queued");
+    await supervisor.close();
+  });
+
   it("holds a delegated task's explicit resources but never the shared default key", async () => {
     const store = new MemoryTaskStore();
     const hermes = new HermesHarness();

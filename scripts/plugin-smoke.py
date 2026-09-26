@@ -44,7 +44,12 @@ def main() -> None:
     ctx = FakeHermesPluginContext()
     plugin.register(ctx)
 
-    tool = one(ctx.tools, "tool")
+    names = sorted(entry["name"] for entry in ctx.tools)
+    assert_equal(names, ["hermes_delegate_work", "hermes_live_status"], "registered tool names")
+    delegate = next(entry for entry in ctx.tools if entry["name"] == "hermes_delegate_work")
+    assert_equal(delegate["schema"]["name"], "hermes_delegate_work", "delegate tool schema name")
+    assert_equal(delegate["toolset"], "hermes-live", "delegate toolset")
+    tool = next(entry for entry in ctx.tools if entry["name"] == "hermes_live_status")
     assert_equal(tool["name"], "hermes_live_status", "registered tool name")
     assert_equal(tool["toolset"], "hermes-live", "registered toolset")
     assert_equal(tool["schema"]["name"], "hermes_live_status", "tool schema name")

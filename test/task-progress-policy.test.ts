@@ -14,13 +14,21 @@ const running = (record = queued(), now = 2_000) =>
   transitionTask(transitionTask(record, "dispatching", { now }), "running", { now: now + 1, runId: "run_1" });
 
 describe("task progress policy", () => {
-  it("announces the start of a task the session saw queued, once", () => {
+  it("announces the start of a task that waited in the queue, once", () => {
     const tracking = startTaskProgressTracking(queued(), 1_000);
-    const started = running();
-    expect(nextTaskProgressAnnouncement(started, tracking, 3_000, MILESTONE)).toEqual({
+    const started = running(queued(), 60_000);
+    expect(nextTaskProgressAnnouncement(started, tracking, 60_002, MILESTONE)).toEqual({
       taskId: started.taskId, message: "Deploy test fix has started.",
     });
-    expect(nextTaskProgressAnnouncement(started, tracking, 3_500, MILESTONE)).toBeUndefined();
+    expect(nextTaskProgressAnnouncement(started, tracking, 60_500, MILESTONE)).toBeUndefined();
+  });
+
+  it("stays silent when a task starts right after its receipt", () => {
+    // Regression: the receipt followed by "has started" seconds later was padding.
+    const tracking = startTaskProgressTracking(queued(), 1_000);
+    const started = running(queued(), 2_000);
+    expect(nextTaskProgressAnnouncement(started, tracking, 3_000, MILESTONE)).toBeUndefined();
+    expect(nextTaskProgressAnnouncement(started, tracking, 30_000, MILESTONE)).toBeUndefined();
   });
 
   it("never announces a start for a task that was already running when first seen", () => {

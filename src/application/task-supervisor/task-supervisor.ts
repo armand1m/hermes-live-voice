@@ -11,6 +11,8 @@ import type {
   HermesRunsPort,
 } from "../live-gateway/ports/hermes-runs.port.js";
 import type { TaskStorePort } from "./ports/task-store.port.js";
+import { workModeInstructions } from "./work-mode-instructions.js";
+import type { HostAgentDefaults } from "../../domain/external-work/agent-profiles.js";
 import {
   DEFAULT_TASK_RESOURCE_KEY,
   MAX_TASK_OUTPUT_CHARS,
@@ -93,6 +95,8 @@ export interface TaskSupervisorOptions {
   activityCoalesceMs?: number;
   observationPersistMs?: number;
   runInstructions?: string;
+  /** Default coding agent per host, named in orchestration briefs. */
+  agentDefaults?: HostAgentDefaults;
   now?: () => number;
   scheduler?: TaskSupervisorScheduler;
   onError?: (error: unknown) => void;
@@ -135,6 +139,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
   private readonly activityCoalesceMs: number;
   private readonly observationPersistMs: number;
   private readonly runInstructions?: string;
+  private readonly agentDefaults?: HostAgentDefaults;
   private readonly now: () => number;
   private readonly scheduler: TaskSupervisorScheduler;
   private readonly onError?: (error: unknown) => void;
@@ -188,6 +193,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
     this.observationPersistMs = positiveInteger(options.observationPersistMs ?? OBSERVATION_PERSIST_MS, "observationPersistMs");
     if (this.retryMaxMs < this.retryBaseMs) throw new Error("retryMaxMs must be at least retryBaseMs.");
     this.runInstructions = options.runInstructions;
+    this.agentDefaults = options.agentDefaults;
     this.now = options.now ?? Date.now;
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.onError = options.onError;
@@ -271,6 +277,7 @@ export class TaskSupervisor implements TaskSupervisorPort {
         executionMode: this.trustDeclaredReadOnly ? input.executionMode : "exclusive",
         resourceKeys: this.trustDeclaredReadOnly ? input.resourceKeys : undefined,
         originConversationId: input.originConversationId,
+        ...(input.workMode ? { workMode: input.workMode } : {}),
         now: this.nextCreationTimestamp(),
       });
       if (created.ownerId !== ownerId) throw new Error("Task owner registration mismatch.");
@@ -866,11 +873,15 @@ export class TaskSupervisor implements TaskSupervisorPort {
     }
     let started: Awaited<ReturnType<HermesRunsPort["startRun"]>>;
     try {
+      // Operator instructions first, then the work mode's (orchestrate: plan
+      // and delegate to a herdr agent; quick: answer read-only, directly).
+      const instructions = [this.runInstructions, workModeInstructions(task, this.agentDefaults)]
+        .filter((part): part is string => Boolean(part)).join("\n\n");
       started = await this.hermes.startRun({
         input: task.input,
         sessionId: task.hermesSessionId,
         sessionKey,
-        ...(this.runInstructions ? { instructions: this.runInstructions } : {}),
+        ...(instructions ? { instructions } : {}),
       }, this.abortController.signal);
     } catch (error) {
       await this.handleDispatchStartFailure(task, error);
@@ -1599,6 +1610,13 @@ function canAdmit(
   if (resourceHolders.some((record) =>
     record.status === "delegated" && sharesExplicitResource(candidate.resourceKeys, record.resourceKeys))) {
     return false;
+  }
+  // Orchestration and quick checks are short Hermes runs that change nothing
+  // themselves (the delegated agent does the work), so they run side by side
+  // up to maxConcurrent instead of queueing behind each other. Explicitly
+  // named resources still conflict.
+  if (candidate.workMode !== undefined) {
+    return !resourceHolders.some((record) => sharesExplicitResource(candidate.resourceKeys, record.resourceKeys));
   }
   if (activeCount === 0) return true;
   // The policy flag also governs records created by an older release or a

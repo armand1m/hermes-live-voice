@@ -80,6 +80,15 @@ export type TaskExecutionMode = z.infer<typeof TaskExecutionModeSchema>;
 export const TaskKindSchema = z.enum(["background", "follow_up"]);
 export type TaskKind = z.infer<typeof TaskKindSchema>;
 
+/**
+ * How Hermes handles a task. `orchestrate`: Hermes plans the work and hands it
+ * to a herdr coding agent (it does not do the work itself). `quick`: a short
+ * read-only check Hermes answers directly. Absent on records from before
+ * orchestration (Hermes executed everything itself).
+ */
+export const TaskWorkModeSchema = z.enum(["orchestrate", "quick"]);
+export type TaskWorkMode = z.infer<typeof TaskWorkModeSchema>;
+
 export const TaskEventTypeSchema = z.enum([
   ...TaskStatusSchema.options,
   "progress",
@@ -131,6 +140,7 @@ export const TaskRecordSchema = z.object({
   taskId: TaskIdSchema,
   ownerId: TaskOwnerIdSchema,
   kind: TaskKindSchema.optional(),
+  workMode: TaskWorkModeSchema.optional(),
   parentTaskId: TaskIdSchema.optional(),
   rootTaskId: TaskIdSchema.optional(),
   originConversationId: TaskHermesSessionIdSchema.optional(),
@@ -307,6 +317,7 @@ export interface CreateTaskRecordInput {
   parentTaskId?: string;
   rootTaskId?: string;
   originConversationId?: string;
+  workMode?: TaskWorkMode;
 }
 
 /** Implicit key for tasks that name no resources: shared by every such task. */
@@ -354,6 +365,7 @@ export function createTaskRecord(input: CreateTaskRecordInput): TaskRecord {
     ...(input.originConversationId
       ? { originConversationId: TaskHermesSessionIdSchema.parse(input.originConversationId) }
       : {}),
+    ...(input.workMode ? { workMode: TaskWorkModeSchema.parse(input.workMode) } : {}),
     input: taskInput,
     title,
     hermesSessionId: hermesSessionIdForTask(taskId),

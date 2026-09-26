@@ -140,6 +140,7 @@ export async function startServer({
     maxQueued: config.tasks.maxQueued,
     pollIntervalMs: config.tasks.pollIntervalMs,
     ...(config.hermes.instructions ? { runInstructions: config.hermes.instructions } : {}),
+    ...(config.externalWork?.agentDefaults ? { agentDefaults: config.externalWork.agentDefaults } : {}),
     onError: (error) => logger.error("background task supervisor error", { error: errorToMessage(error) }),
   });
   // External-work monitor (plan §B): inert unless HERMES_LIVE_EXTERNAL_WORK_ENABLED.

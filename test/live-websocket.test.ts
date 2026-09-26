@@ -746,7 +746,7 @@ describe("live gateway WebSocket", () => {
       status: "queued",
       message: expect.stringContaining("keep talking"),
       spoken_response:
-        "Your task is queued. I’ll report when execution starts; you can keep talking.",
+        "On it — Hermes will brief a coding agent for that.",
     });
     expect(Object.keys(receipt.response)[0]).toBe("spoken_response");
     await waitUntil(() => hermes.startCalls.length === 1);
@@ -772,7 +772,9 @@ describe("live gateway WebSocket", () => {
       .toMatchObject({ taskId: receipt.response.task_id });
   });
 
-  it("speaks when a queued task starts running (progress announcements)", async () => {
+  it("does not follow a receipt with a start announcement when the task starts right away", async () => {
+    // Regression: "Your task is queued… I'll report when execution starts"
+    // followed seconds later by "X has started" was two lines of padding.
     const start = deferred<StartRunResult>();
     const hermes = new HermesHarness();
     hermes.startBehavior = async () => start.promise;
@@ -789,16 +791,12 @@ describe("live gateway WebSocket", () => {
     provider.emit({ type: "response", status: "started", responseId: "turn_progress" });
     const receipt = await provider.latest.toolResponses.wait((entry) => entry.call.id === taskCall.id);
     provider.emit({ type: "response", status: "completed", responseId: "turn_progress" });
-    expect(receipt.response).toMatchObject({ status: "queued" });
+    expect(receipt.response).toMatchObject({ work: "orchestrate", spoken_response: "On it — Hermes will brief a coding agent for that." });
 
     start.resolve({ runId: "run_progress", status: "queued" });
     await client.messages.wait("task.started", (message) => message.taskId === receipt.response.task_id);
-    await waitUntil(() => provider.latest.notifications.items.some(
-      (notice) => notice.announcement === "Release audit has started.",
-    ), 3_000);
-    // Spoken exactly once.
-    await delay(200);
-    expect(provider.latest.notifications.items.filter((notice) => notice.announcement?.includes("has started"))).toHaveLength(1);
+    await delay(400);
+    expect(provider.latest.notificationCalls.some((notice) => notice.announcement?.includes("has started"))).toBe(false);
   });
 
   it("stays silent about task starts when progress announcements are off", async () => {

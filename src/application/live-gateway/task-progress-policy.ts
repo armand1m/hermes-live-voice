@@ -7,6 +7,12 @@ import type { TaskRecord } from "../../domain/tasks/index.js";
 
 /** Minimum spacing between spoken updates for one task. */
 export const DEFAULT_PROGRESS_MILESTONE_MS = 4 * 60_000;
+/**
+ * A task that starts sooner than this after it was created just started —
+ * saying so right after the receipt is padding. Only a task that really
+ * waited in line gets a "has started" line.
+ */
+export const START_ANNOUNCE_MIN_WAIT_MS = 10_000;
 
 export interface TaskProgressTracking {
   /** The session saw this task waiting in the queue (its receipt promised a start report). */
@@ -52,7 +58,7 @@ export function nextTaskProgressAnnouncement(
   if (record.status !== "running") return undefined;
   const title = spokenTitle(record);
 
-  if (tracking.sawQueued && !tracking.startAnnounced) {
+  if (tracking.sawQueued && !tracking.startAnnounced && now - record.createdAt >= START_ANNOUNCE_MIN_WAIT_MS) {
     tracking.startAnnounced = true;
     tracking.lastSpokenAt = now;
     tracking.lastSpokenSequence = latestProgress(record)?.sequence ?? tracking.lastSpokenSequence;

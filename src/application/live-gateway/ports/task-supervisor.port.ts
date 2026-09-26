@@ -1,4 +1,4 @@
-import type { TaskDelegation, TaskExecutionMode, TaskRecord } from "../../../domain/tasks/index.js";
+import type { TaskDelegation, TaskExecutionMode, TaskRecord, TaskWorkMode } from "../../../domain/tasks/index.js";
 
 export interface SubmitBackgroundTaskInput {
   ownerIdentity: string;
@@ -9,6 +9,8 @@ export interface SubmitBackgroundTaskInput {
   resourceKeys?: readonly string[];
   delegation?: TaskDelegation;
   originConversationId?: string;
+  /** orchestrate: Hermes briefs a herdr agent; quick: a read-only check Hermes answers. */
+  workMode?: TaskWorkMode;
 }
 
 export interface FollowUpBackgroundTaskInput {
